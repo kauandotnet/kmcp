@@ -1,0 +1,70 @@
+{
+	"name": "kmcp",
+	"version": "0.1.0-alpha.0",
+	"description": "A TypeScript 7 authoring and control-plane toolkit for the official MCP SDK v2.",
+	"license": "BSD-3-Clause",
+	"type": "module",
+	"sideEffects": false,
+	"engines": {
+		"node": ">=22.13.0"
+	},
+	"packageManager": "pnpm@11.20.0",
+	"files": [
+		"dist",
+		"src",
+		"README.md",
+		"ARCHITECTURE.md",
+		"LICENSE"
+	],
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./server": {
+			"types": "./dist/server.d.ts",
+			"import": "./dist/server.js"
+		},
+		"./client": {
+			"types": "./dist/client.d.ts",
+			"import": "./dist/client.js"
+		},
+		"./hub": {
+			"types": "./dist/hub.d.ts",
+			"import": "./dist/hub.js"
+		},
+		"./node": {
+			"types": "./dist/node.d.ts",
+			"import": "./dist/node.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"typecheck": "tsc -p tsconfig.json",
+		"test": "tsc -p tsconfig.test.json && node --test .test-dist/test/*.test.js",
+		"format:check": "prettier --check .",
+		"format": "prettier --write .",
+		"publint": "publint --strict",
+		"check": "pnpm run typecheck && pnpm run test && pnpm run build && pnpm run publint && pnpm run format:check"
+	},
+	"peerDependencies": {
+		"@modelcontextprotocol/client": "^2.0.0",
+		"@modelcontextprotocol/node": "^2.0.0",
+		"@modelcontextprotocol/server": "^2.0.0"
+	},
+	"peerDependenciesMeta": {
+		"@modelcontextprotocol/node": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@modelcontextprotocol/client": "2.0.0",
+		"@modelcontextprotocol/node": "2.0.0",
+		"@modelcontextprotocol/server": "2.0.0",
+		"@types/node": "26.1.2",
+		"prettier": "3.9.6",
+		"publint": "0.3.23",
+		"typescript": "7.0.2"
+	}
+}
