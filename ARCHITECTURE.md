@@ -8,12 +8,15 @@ authoring, lifecycle, discovery, and control-plane abstractions stand on their o
 The library keeps protocol mechanics and control-plane mechanics separate:
 
 ```text
-authoring definitions ──> fresh official McpServer instances ──> HTTP / stdio adapters
-
+authoring definitions ──> transforms ──> fresh official McpServer instances ──> HTTP / stdio adapters
+                                              ▲
 transport factory ──> official Client ──> connection manager ──> partial catalog
                                                 │
-                                                └──────────────> hub read model / routing
+                                                └──────────────> hub read model / routing ──> gateway
 ```
+
+The library targets protocol revision 2026-07-28 (`MCP_MODERN_PROTOCOL_VERSION`); the 2025 era is
+served from the same definitions through the SDK's stateless legacy fallback and tested alongside.
 
 ## Canonical object model
 
@@ -49,7 +52,16 @@ diagnostic projections—not a substitute for an authorized, redacted, bounded p
 - Modern version negotiation is explicit. `kmcp` chooses `auto` by default but preserves the full
   official options as an escape hatch.
 - Server authentication and arbitrary-upstream admission security are not invented by the SDK and
-  are not silently claimed by this package.
+  are not silently claimed by this package. Verifiers are SDK `OAuthTokenVerifier`s, the gate is the
+  SDK's `requireBearerAuth` composed with the well-known documents, and every default is fail-closed
+  (`anonymous` has no default; routable binds require a gate or an explicit opt-out).
+- Re-export policy: `kmcp/server` and `kmcp/client` re-export the curated SDK authoring and client
+  sets so application code imports one package; the SDK's `LATEST_PROTOCOL_VERSION` (the latest
+  _legacy_ revision) is deliberately not part of it.
+- Two SDK gaps are bridged in one place each and covered by tests: `Client.callTool` output
+  validation rejects a raw `input_required` result, so the manager sends `allowInputRequired` calls
+  through the schema-less request path; the SDK's completion lookup only sees Zod `completable()`
+  fields, so definitions with `complete` maps install kmcp's own `completion/complete` handler.
 
 ## Connection lifecycle invariants
 
@@ -72,6 +84,16 @@ The manager guarantees:
 The present implementation is process-local. Durable desired state and cross-process ownership must
 not be inferred from these guarantees.
 
+## Auth model
+
+Capability `auth` is admission at materialization: `definition.admit(context)` evaluates every check
+against `context.authInfo` and `instantiate()` installs exactly the admitted set, so a denied
+capability is absent from lists and answers "not found" with zero request-time code. Capability
+kinds are pre-declared from the unfiltered definition so an empty admitted set yields empty lists,
+never `-32601`. The HTTP gate is the only `authInfo` producer; `withMcpAuth` discards
+caller-supplied `authInfo`. Clients receive opaque OAuth reasons; detailed causes go to `onerror` /
+`onCapabilityDenied`.
+
 ## Catalog model
 
 Tools, resources, templates, and prompts are discovered independently. Each section is one of:
@@ -87,27 +109,24 @@ whose value is `undefined` are omitted with JSON semantics, while invalid array 
 symbols, exotic prototypes, and cycles are rejected. Fingerprints are stable change detectors, not
 cryptographic integrity proofs.
 
-## Hub model
+## Hub and gateway model
 
 A hub is a class containing a safe ID, labels, and unique connection/namespace members. Tool and
-prompt routes are reversible (`namespace.sourceName`) and dispatch through the managed generation.
-Resources require an explicit namespace because arbitrary resource URIs cannot be safely rewritten
-without a protocol gateway policy.
+prompt routes are reversible (`namespace.sourceName`), resource routes are `namespace:uri`, and
+every route dispatches through the managed generation and catalog fingerprint. Template-expanded
+reads are matched against the member's listed templates with the SDK `UriTemplate`.
 
-The current hub is intentionally a diagnostic read-model and routing kernel. Its aggregate catalog
-contains descriptor routes for tools, prompts, static resources, and resource templates. Passing a
-descriptor to an executable route rejects stale panel work; string routes deliberately resolve the
-current catalog. A route is admitted only while its exact discovered item, generation, and catalog
-fingerprint are current. It does not advertise itself as a downstream MCP server. A real gateway
-must add:
+`kmcp/gateway` serves a hub as one downstream MCP server and satisfies the prerequisites a real
+gateway needs:
 
-- mandatory fail-closed execution policy;
-- request-time immutable topology snapshots;
-- collision-safe tool, prompt, resource, and template projection;
-- auth-principal-partitioned discovery caches;
-- complete candidate topology preparation and atomic publication;
-- notification, subscription, completion, and input-required routing only when end-to-end support
-  exists.
+| Prerequisite                         | Mechanism                                                                                                                                                                                                                                                                         |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Request-time immutable topology      | Every request materializes a server from one hub catalog snapshot (`McpGatewayDefinition.current()`), rebuilt only when the topology key changes.                                                                                                                                 |
+| Fail-closed execution policy         | Handlers resolve the projected name against the current route index at call time; a removed route fails closed, a live one dispatches through the hub's generation/fingerprint fence.                                                                                             |
+| Collision-safe projection            | `namespace.name` validated against the SDK tool-name grammar; resources `namespaced` (reversible `ns:uri`, requires a scheme-safe namespace) or `passthrough` (a URI listed by two members drops both). Unprojectable routes are reported in `snapshot().dropped`, never renamed. |
+| Principal-partitioned discovery      | `policy.authorize` is capability `auth`; downstream `authInfo` is never forwarded upstream, upstream connections carry their own credentials and cache partitions.                                                                                                                |
+| Atomic publication                   | A new hub snapshot is a new projection; `gateway.start()` diffs sections and pushes `list_changed` to live HTTP handlers and reconciles pinned instances (stdio) in place.                                                                                                        |
+| Routing only with end-to-end support | MRTR rounds (`inputResponses`, `requestState`, downstream client capabilities) are relayed verbatim; completions forwarded when the upstream advertises them; logging and resource-update subscriptions are not forwarded.                                                        |
 
 ## Path to a durable panel/control plane
 
@@ -125,3 +144,14 @@ The next extraction should introduce ports rather than add framework state to th
 
 HTTP frameworks, a CLI, or a web panel should be adapters over these contracts—not part of the
 protocol/control-plane kernel.
+
+## Known gaps
+
+- Cursor pagination, list-level middleware and protocol-level tool errors all require ownership of
+  the SDK `tools/list` / `tools/call` handlers, which `McpServer` does not delegate; revisit when
+  the SDK adds page sizes or a protocol-error passthrough.
+- The modern event bus fans `resourceUpdated(uri)` out to every subscription regardless of
+  principal; per-principal visibility does not extend to update notifications, so the gateway does
+  not forward them (phase 2 must gate `resourceSubscriptions` per principal).
+- Legacy per-request HTTP serving cannot deliver server-to-client requests (no client capability
+  view); modern clients get the full MRTR path, 2025 clients over stdio get the SDK's legacy shim.

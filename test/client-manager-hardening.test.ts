@@ -120,8 +120,8 @@ test("catalog identity is generation-bound and public operations enforce stale-w
 		expectedCatalogFingerprint: secondCatalog.fingerprint,
 	};
 	await manager.callTool("alpha", "echo", {}, { signal: operationSignal }, control);
-	await manager.getPrompt("alpha", "welcome", undefined, operationSignal, control);
-	await manager.readResource("alpha", "status://current", operationSignal, control);
+	await manager.getPrompt("alpha", "welcome", undefined, { signal: operationSignal }, control);
+	await manager.readResource("alpha", "status://current", { signal: operationSignal }, control);
 	assert.equal(callToolSignal, operationSignal);
 	assert.equal(getPromptSignal, operationSignal);
 	assert.equal(readResourceSignal, operationSignal);

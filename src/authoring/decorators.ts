@@ -20,6 +20,7 @@ import {
 	McpResourceDefinition,
 	type McpResourceOptions,
 	McpResourceTemplateDefinition,
+	type McpResourceTemplateOptions,
 	McpToolDefinition,
 	type McpToolHandler,
 	type McpToolResult,
@@ -138,9 +139,9 @@ export function McpResource<const Name extends string, const Uri extends string>
 }
 
 export function McpResourceTemplate<const Name extends string>(
-	options: McpResourceOptions & {
+	options: McpResourceTemplateOptions & {
 		readonly name: Name;
-		readonly template: ResourceTemplate;
+		readonly template: ResourceTemplate | string;
 	},
 ) {
 	return function <This extends object>(
@@ -192,17 +193,24 @@ export function capabilitiesOf(instance: object): readonly AnyMcpCapabilityDefin
 }
 
 export function serverFrom(instance: object): McpServerDefinition {
-	const constructor = Object.getPrototypeOf(instance)?.constructor as unknown;
-	if (typeof constructor !== "function") {
-		throw missingDecoratorMetadata();
-	}
-	const options = serverOptions.get(constructor);
+	const options = decoratedServerOptions(instance);
 	if (options === undefined) throw missingDecoratorMetadata();
 	const { serverInfo, capabilities = [], ...definitionOptions } = options;
 	return new McpServerDefinition(serverInfo, {
 		...definitionOptions,
 		capabilities: [...capabilities, ...capabilitiesOf(instance)],
 	});
+}
+
+/** Walks the prototype chain so subclasses of a decorated app class inherit its server options. */
+function decoratedServerOptions(instance: object): McpServerAppOptions | undefined {
+	let constructor: unknown = Object.getPrototypeOf(instance)?.constructor;
+	while (typeof constructor === "function") {
+		const options = serverOptions.get(constructor);
+		if (options !== undefined) return options;
+		constructor = Object.getPrototypeOf(constructor);
+	}
+	return undefined;
 }
 
 function appendRecipe(instance: object, recipe: CapabilityRecipe): void {

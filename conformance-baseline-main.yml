@@ -1,0 +1,25 @@
+# MCP conformance baseline for the NIGHTLY run only
+# (`.github/workflows/conformance-nightly.yml`, unpinned
+# `npx --yes github:modelcontextprotocol/conformance … --suite all`).
+#
+# Kept separate from `conformance-baseline.yml` on purpose: the nightly runs the tool's git main
+# against the `all` suite (active + pending), so it sees scenarios the pinned `active` gate never
+# runs, and its scenario set changes without a version bump. The nightly is informational — it is
+# allowed to go red and is not a merge gate.
+#
+# Seeded from a real `--suite all` run against `test/conformance/server-fixture.ts` on 2026-08-28
+# with @modelcontextprotocol/conformance 0.1.16 (34 checks pass, 4 fail, 2 scenarios warn).
+# Same reading rules as the pinned baseline: FAILURE *or* WARNING counts as failing, and a listed
+# scenario that starts passing is itself a failure — prune entries as they burn down.
+
+server:
+  # One root cause: the official `createMcpHandler` has no sessionful 2025-era mode
+  # (`legacy: 'stateless' | 'reject'`), so a per-request legacy instance holds no client
+  # capabilities and the SDK's legacy multi-round-trip shim refuses every server-to-client leg.
+  - tools-call-sampling # legacy stateless serving cannot deliver `sampling/createMessage`
+  - tools-call-elicitation # legacy stateless serving cannot deliver `elicitation/create`
+  - elicitation-sep1034-defaults # same, for the SEP-1034 defaults schema
+  - elicitation-sep1330-enums # same, for the SEP-1330 enum variants
+  # SEP-1699 SHOULDs the stateless legacy leg does not implement (WARNING, never FAILURE).
+  - server-sse-polling # no `mcp-session-id`, no SSE priming event, no `retry:` field
+  - server-sse-multiple-streams # no `mcp-session-id` on the stateless legacy leg

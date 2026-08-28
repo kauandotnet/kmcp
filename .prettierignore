@@ -2,3 +2,5 @@ node_modules
 dist
 .test-dist
 pnpm-lock.yaml
+references/
+.test-dist-*

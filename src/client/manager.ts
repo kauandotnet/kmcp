@@ -1,12 +1,34 @@
-import type {
-	CallToolRequestOptions,
-	CallToolResult,
-	Client,
-	GetPromptResult,
-	ProtocolEra,
-	ReadResourceResult,
-	ServerCapabilities,
-	Transport,
+import {
+	type CacheableRequestOptions,
+	type CallToolRequestOptions,
+	type CallToolResult,
+	type Client,
+	type CompleteRequest,
+	type CompleteResult,
+	type ContentBlock,
+	type DiscoverResult,
+	type GetPromptResult,
+	type Implementation,
+	InsufficientScopeError,
+	type ListChangedHandlers,
+	type ListPromptsResult,
+	type ListResourceTemplatesResult,
+	type ListResourcesResult,
+	type ListToolsResult,
+	LOG_LEVEL_META_KEY,
+	type LoggingLevel,
+	type McpSubscription,
+	MissingRequiredClientCapabilityError,
+	type ProtocolEra,
+	ProtocolError,
+	type ReadResourceResult,
+	type RequestOptions,
+	SdkError,
+	type ServerCapabilities,
+	type SubscriptionFilter,
+	type Transport,
+	UnauthorizedError,
+	UnsupportedProtocolVersionError,
 } from "@modelcontextprotocol/client";
 
 import { KMCP_ERROR_CODES, KmcpError, errorCode } from "../errors.ts";
@@ -18,11 +40,33 @@ import {
 	waitForCaller,
 	type MaybePromise,
 } from "../internal/value.ts";
-import type { McpCatalogSection, McpCatalogSnapshot } from "./catalog.ts";
+import type { McpCatalogCapability, McpCatalogSection, McpCatalogSnapshot } from "./catalog.ts";
 import { McpClientSession, McpConnectionDefinition, createOfficialClient } from "./connection.ts";
 
 export type McpConnectionPhase =
-	"connecting" | "degraded" | "draining" | "failed" | "offline" | "online" | "quarantined";
+	| "authorizing"
+	| "connecting"
+	| "degraded"
+	| "draining"
+	| "failed"
+	| "offline"
+	| "online"
+	| "quarantined";
+
+/** A classification of the last failure that is richer than `errorCode` (which only names kmcp codes). */
+export interface McpErrorDetail {
+	readonly kind: "kmcp" | "oauth" | "protocol" | "sdk" | "unknown";
+	readonly code: string | number;
+}
+
+export interface McpWatchSnapshot {
+	/** Whether list-change notifications are being delivered for this generation. */
+	readonly active: boolean;
+	readonly honoredSections: readonly McpCatalogCapability[];
+	readonly unhonoredSections: readonly McpCatalogCapability[];
+	readonly reason?: "not-advertised" | "not-configured" | "refresh-cap" | "unsupported-era";
+	readonly refreshes: number;
+}
 
 export interface McpConnectionSnapshot<Id extends string = string> {
 	readonly id: Id;
@@ -34,9 +78,15 @@ export interface McpConnectionSnapshot<Id extends string = string> {
 	readonly connectedAt?: string;
 	readonly protocolVersion?: string;
 	readonly protocolEra?: ProtocolEra;
-	readonly serverInfo?: Readonly<{ name: string; version: string }>;
+	/** Self-reported by the upstream and untrusted; a modern anonymous server may have none. */
+	readonly serverInfo?: Readonly<Implementation>;
+	/** Free-form, model-facing text from the upstream (length-capped, untrusted). */
+	readonly instructions?: string;
 	readonly capabilities?: ServerCapabilities;
+	readonly logLevel?: LoggingLevel;
 	readonly errorCode?: string;
+	readonly errorDetail?: McpErrorDetail;
+	readonly watch?: McpWatchSnapshot;
 	readonly catalog?: McpCatalogSnapshot;
 }
 
@@ -50,6 +100,7 @@ export interface McpConnectionManagerSnapshot<Id extends string = string> {
 export type McpConnectionEventType =
 	| "catalog.failed"
 	| "catalog.refreshed"
+	| "connection.authorization.required"
 	| "connection.registered"
 	| "connection.removed"
 	| "connection.state.changed";
@@ -74,6 +125,8 @@ export interface McpConnectionManagerOptions {
 	readonly maxCatalogStringBytes?: number;
 	readonly maxCatalogNodes?: number;
 	readonly maxCatalogPropertiesPerObject?: number;
+	/** Maximum `instructions` length retained in snapshots. Default: 16 KiB. */
+	readonly maxInstructionsLength?: number;
 	readonly now?: () => number;
 	readonly onListenerError?: (error: unknown, event: McpConnectionEvent) => MaybePromise<void>;
 }
@@ -84,6 +137,72 @@ export interface McpConnectionOperationControl {
 	readonly expectedCatalogFingerprint?: string;
 }
 
+/** Caller-supplied `_meta` for the request params (trace context, custom keys). Merged with the log-level stamp. */
+export interface McpMetaOptions {
+	readonly meta?: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * A multi-round-trip retry round to forward verbatim (a gateway relaying a downstream client's
+ * `inputResponses` / `requestState` to the upstream that requested them).
+ */
+export interface McpMrtrForwardOptions {
+	readonly inputResponses?: Readonly<Record<string, unknown>>;
+	readonly requestState?: string;
+}
+
+export type McpCallToolOptions = CallToolRequestOptions & McpMetaOptions & McpMrtrForwardOptions;
+export type McpReadOptions = CacheableRequestOptions & McpMetaOptions;
+export type McpRequestOptionsWithMeta = RequestOptions & McpMetaOptions;
+
+export interface McpConnectAllOptions {
+	/** Disconnect the connections that succeeded when any connect fails, and rethrow. */
+	readonly atomic?: boolean;
+	readonly signal?: AbortSignal;
+}
+
+export interface McpPingResult {
+	readonly era: ProtocolEra;
+	readonly roundTripMs: number;
+}
+
+/** Thrown by `throwIfToolError` for an `isError: true` tool result; carries the error content. */
+export class McpToolCallError extends KmcpError {
+	readonly content: readonly ContentBlock[];
+
+	constructor(content: readonly ContentBlock[], message = "The tool reported an error.") {
+		super(KMCP_ERROR_CODES.TOOL_CALL_FAILED, message);
+		this.name = "McpToolCallError";
+		this.content = Object.freeze([...content]);
+	}
+}
+
+/** Unwraps a `CallToolResult`, throwing `McpToolCallError` when the tool reported an error. */
+export function throwIfToolError(result: CallToolResult): CallToolResult {
+	if (result.isError === true) {
+		const text = result.content
+			.filter((block): block is Extract<ContentBlock, { type: "text" }> => block.type === "text")
+			.map((block) => block.text)
+			.join("\n");
+		throw new McpToolCallError(result.content, text.length > 0 ? text : undefined);
+	}
+	return result;
+}
+
+interface PendingAuthorization {
+	readonly transport: Transport;
+	readonly client: Client;
+}
+
+interface AutoRefreshState {
+	count: number;
+	lastAt: number;
+	timer?: ReturnType<typeof setTimeout>;
+	inFlight: boolean;
+	pending: boolean;
+	capped: boolean;
+}
+
 interface ManagedConnection<Id extends string> {
 	readonly definition: McpConnectionDefinition<Id>;
 	phase: McpConnectionPhase;
@@ -92,6 +211,7 @@ interface ManagedConnection<Id extends string> {
 	lastTransitionAt: string;
 	connectedAt?: string;
 	errorCode?: string;
+	errorDetail?: McpErrorDetail;
 	catalog?: McpCatalogSnapshot;
 	catalogRevision: number;
 	session?: McpClientSession<Id>;
@@ -99,6 +219,11 @@ interface ManagedConnection<Id extends string> {
 	disconnectTask?: Promise<McpConnectionSnapshot<Id>>;
 	removeTask?: Promise<void>;
 	quarantinedCleanup?: () => Promise<void>;
+	pendingAuthorization?: PendingAuthorization;
+	discover?: DiscoverResult;
+	logLevel?: LoggingLevel;
+	listen?: McpSubscription;
+	autoRefresh?: AutoRefreshState;
 	readonly drainWaiters: Set<() => void>;
 }
 
@@ -112,11 +237,19 @@ interface McpCatalogBounds {
 	readonly maxPropertiesPerObject: number;
 }
 
+const CATALOG_SECTIONS: readonly McpCatalogCapability[] = Object.freeze([
+	"tools",
+	"prompts",
+	"resources",
+	"resourceTemplates",
+]);
+
 export class McpConnectionManager<Id extends string = string> implements AsyncDisposable {
 	readonly #entries = new Map<Id, ManagedConnection<Id>>();
 	readonly #listeners = new Set<McpConnectionListener<Id>>();
 	readonly #maxConnections: number;
 	readonly #catalogBounds: McpCatalogBounds;
+	readonly #maxInstructionsLength: number;
 	readonly #now: () => number;
 	readonly #onListenerError:
 		((error: unknown, event: McpConnectionEvent<Id>) => MaybePromise<void>) | undefined;
@@ -148,6 +281,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				"maxCatalogPropertiesPerObject",
 			),
 		});
+		this.#maxInstructionsLength = positiveInteger(
+			options.maxInstructionsLength ?? 16 * 1024,
+			"maxInstructionsLength",
+		);
 		this.#now = safeClock(options.now ?? Date.now);
 		this.#onListenerError = options.onListenerError;
 	}
@@ -171,6 +308,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			catalogRevision: 0,
 			lastTransitionAt: isoTimestamp(this.#now),
 			drainWaiters: new Set(),
+			...(definition.logLevel === undefined ? {} : { logLevel: definition.logLevel }),
 		};
 		this.#entries.set(definition.id, entry);
 		this.#publish("connection.registered", entry);
@@ -210,6 +348,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				`Connection '${id}' is quarantined after a cleanup failure.`,
 			);
 		}
+		if (entry.phase === "authorizing") {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.CONNECTION_AUTHORIZING,
+				`Connection '${id}' is waiting for OAuth authorization; call completeAuthorization().`,
+			);
+		}
 		if (entry.removeTask !== undefined) {
 			throw new KmcpError(
 				KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE,
@@ -247,6 +391,32 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return waitForCaller(task, signal);
 	}
 
+	/** Connects several connections concurrently; with `atomic`, any failure rolls the others back. */
+	async connectAll(
+		ids: readonly Id[],
+		options: McpConnectAllOptions = {},
+	): Promise<readonly McpConnectionSnapshot<Id>[]> {
+		this.#assertOpen();
+		const results = await Promise.allSettled(ids.map((id) => this.connect(id, options.signal)));
+		const failures = results.filter((result) => result.status === "rejected");
+		if (failures.length === 0) {
+			return results.map(
+				(result) => (result as PromiseFulfilledResult<McpConnectionSnapshot<Id>>).value,
+			);
+		}
+		if (options.atomic === true) {
+			await Promise.allSettled(
+				ids
+					.filter((_, index) => results[index]?.status === "fulfilled")
+					.map((id) => this.disconnect(id)),
+			);
+		}
+		throw new AggregateError(
+			failures.map((failure) => failure.reason),
+			`${failures.length} of ${ids.length} connections failed to connect.`,
+		);
+	}
+
 	disconnect(id: Id): Promise<McpConnectionSnapshot<Id>> {
 		const entry = this.#entry(id);
 		if (entry.disconnectTask !== undefined) return entry.disconnectTask;
@@ -268,6 +438,48 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			},
 		);
 		return task;
+	}
+
+	/**
+	 * Completes an interactive OAuth round for a connection parked in the `authorizing` phase:
+	 * hands the authorization callback parameters to the SAME transport that raised the challenge
+	 * (the SDK requires that), releases it, and reconnects with the freshly stored tokens.
+	 */
+	async completeAuthorization(
+		id: Id,
+		callbackParams: URLSearchParams,
+	): Promise<McpConnectionSnapshot<Id>> {
+		this.#assertOpen();
+		const entry = this.#entry(id);
+		const pending = entry.pendingAuthorization;
+		if (entry.phase !== "authorizing" || pending === undefined) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE,
+				`Connection '${id}' is not waiting for authorization.`,
+			);
+		}
+		const transport = pending.transport as Transport & {
+			finishAuth?: (params: URLSearchParams) => Promise<void>;
+		};
+		if (typeof transport.finishAuth !== "function") {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.OPERATION_FAILED,
+				`The transport of '${id}' cannot finish an authorization flow.`,
+			);
+		}
+		try {
+			await transport.finishAuth(callbackParams);
+		} catch (error) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.CONNECTION_CONNECT_FAILED,
+				`Authorization of '${id}' could not be completed.`,
+				{ cause: error },
+			);
+		} finally {
+			await this.#releasePendingAuthorization(entry);
+		}
+		this.#transition(entry, "offline");
+		return this.connect(id);
 	}
 
 	async withClient<Result>(
@@ -305,12 +517,27 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		id: Id,
 		name: string,
 		arguments_: Readonly<Record<string, unknown>> = {},
-		options?: CallToolRequestOptions,
+		options?: McpCallToolOptions,
 		control?: McpConnectionOperationControl,
 	): Promise<CallToolResult> {
 		return this.withClient(
 			id,
-			(client) => client.callTool({ name, arguments: { ...arguments_ } }, options),
+			(client) => {
+				const params = this.#params(
+					id,
+					forwardMrtrCallToolParams(name, arguments_, options),
+					options,
+				);
+				const requestOptions = this.#requestOptions(id, "tool", options);
+				// `Client.callTool` validates the result against the tool's advertised outputSchema
+				// and rejects a raw `input_required` result ("did not return structured content";
+				// SDK client `index.mjs`, callTool output validation). A caller that opted into
+				// receiving those results therefore goes through the schema-less request path.
+				if (requestOptions.allowInputRequired === true) {
+					return client.request({ method: "tools/call", params }, requestOptions);
+				}
+				return client.callTool(params, requestOptions);
+			},
 			options?.signal,
 			control,
 		);
@@ -319,17 +546,17 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	readResource(
 		id: Id,
 		uri: string,
-		signal?: AbortSignal,
+		options?: McpReadOptions,
 		control?: McpConnectionOperationControl,
 	): Promise<ReadResourceResult> {
 		return this.withClient(
 			id,
 			(client) =>
-				client.readResource(
-					{ uri },
-					{ ...(signal === undefined ? {} : { signal }), cacheMode: "use" },
-				),
-			signal,
+				client.readResource(this.#params(id, { uri }, options), {
+					cacheMode: "use",
+					...this.#requestOptions(id, "resource", options),
+				}),
+			options?.signal,
 			control,
 		);
 	}
@@ -338,27 +565,167 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		id: Id,
 		name: string,
 		arguments_: Readonly<Record<string, string>> | undefined,
-		signal?: AbortSignal,
+		options?: McpRequestOptionsWithMeta,
 		control?: McpConnectionOperationControl,
 	): Promise<GetPromptResult> {
 		return this.withClient(
 			id,
 			(client) =>
 				client.getPrompt(
-					{ name, ...(arguments_ === undefined ? {} : { arguments: { ...arguments_ } }) },
-					signal === undefined ? undefined : { signal },
+					this.#params(
+						id,
+						{ name, ...(arguments_ === undefined ? {} : { arguments: { ...arguments_ } }) },
+						options,
+					),
+					this.#requestOptions(id, "prompt", options),
 				),
-			signal,
+			options?.signal,
 			control,
 		);
 	}
 
-	async refreshCatalog(
+	/** `completion/complete` for a prompt argument or resource-template variable. */
+	complete(
+		id: Id,
+		params: CompleteRequest["params"],
+		options?: McpRequestOptionsWithMeta,
+		control?: McpConnectionOperationControl,
+	): Promise<CompleteResult> {
+		return this.withClient(
+			id,
+			async (client) => {
+				const result = await client.complete(
+					this.#params(id, params, options),
+					this.#requestOptions(id, "request", options),
+				);
+				return boundedCompletion(result);
+			},
+			options?.signal,
+			control,
+		);
+	}
+
+	listTools(
+		id: Id,
+		options?: McpReadOptions,
+		control?: McpConnectionOperationControl,
+	): Promise<ListToolsResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				client.listTools(
+					this.#params(id, {}, options),
+					this.#requestOptions(id, "request", options),
+				),
+			options?.signal,
+			control,
+		);
+	}
+
+	listResources(
+		id: Id,
+		options?: McpReadOptions,
+		control?: McpConnectionOperationControl,
+	): Promise<ListResourcesResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				client.listResources(
+					this.#params(id, {}, options),
+					this.#requestOptions(id, "request", options),
+				),
+			options?.signal,
+			control,
+		);
+	}
+
+	listResourceTemplates(
+		id: Id,
+		options?: McpReadOptions,
+		control?: McpConnectionOperationControl,
+	): Promise<ListResourceTemplatesResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				client.listResourceTemplates(
+					this.#params(id, {}, options),
+					this.#requestOptions(id, "request", options),
+				),
+			options?.signal,
+			control,
+		);
+	}
+
+	listPrompts(
+		id: Id,
+		options?: McpReadOptions,
+		control?: McpConnectionOperationControl,
+	): Promise<ListPromptsResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				client.listPrompts(
+					this.#params(id, {}, options),
+					this.#requestOptions(id, "request", options),
+				),
+			options?.signal,
+			control,
+		);
+	}
+
+	/** Liveness: `server/discover` on the modern era, `ping` on the legacy era. */
+	ping(id: Id, signal?: AbortSignal): Promise<McpPingResult> {
+		return this.withClient(
+			id,
+			async (client) => {
+				const era = client.getProtocolEra() ?? "legacy";
+				const started = performance.now();
+				const options = this.#requestOptions(
+					id,
+					"request",
+					signal === undefined ? undefined : { signal },
+				);
+				if (era === "modern") await client.discover(options);
+				else await client.ping(options);
+				return Object.freeze({ era, roundTripMs: performance.now() - started });
+			},
+			signal,
+		);
+	}
+
+	/**
+	 * Sets the upstream log level: `logging/setLevel` on a legacy connection; on the modern era the
+	 * level is stamped into every subsequent request's `_meta` (the RPC no longer exists).
+	 */
+	async setLogLevel(id: Id, level: LoggingLevel, signal?: AbortSignal): Promise<void> {
+		const entry = this.#entry(id);
+		entry.logLevel = level;
+		await this.withClient(
+			id,
+			async (client) => {
+				if (client.getProtocolEra() !== "modern") {
+					await client.setLoggingLevel(level, signal === undefined ? undefined : { signal });
+				}
+			},
+			signal,
+		);
+		this.#publish("connection.state.changed", entry);
+	}
+
+	refreshCatalog(
 		id: Id,
 		signal?: AbortSignal,
 		control?: McpConnectionOperationControl,
 	): Promise<McpCatalogSnapshot> {
-		const entry = this.#entry(id);
+		return this.#performRefresh(this.#entry(id), signal, control);
+	}
+
+	async #performRefresh(
+		entry: ManagedConnection<Id>,
+		signal?: AbortSignal,
+		control?: McpConnectionOperationControl,
+	): Promise<McpCatalogSnapshot> {
+		const id = entry.definition.id;
 		let admittedSession: McpClientSession<Id> | undefined;
 		let admittedGeneration: number | undefined;
 		let admittedCatalogRevision: number | undefined;
@@ -373,16 +740,14 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					const catalogRevision = admittedCatalogRevision;
 					const capabilities = client.getServerCapabilities();
 					const previous = entry.catalog?.generation === generation ? entry.catalog : undefined;
+					const listOptions = {
+						...this.#requestOptions(id, "request", signal === undefined ? undefined : { signal }),
+						cacheMode: "refresh" as const,
+					};
 					const discoveries = await Promise.allSettled([
 						discoverSection(
 							capabilities?.tools !== undefined,
-							() =>
-								client
-									.listTools(undefined, {
-										...(signal === undefined ? {} : { signal }),
-										cacheMode: "refresh",
-									})
-									.then((v) => v.tools),
+							() => client.listTools(this.#params(id, {}), listOptions).then((v) => v.tools),
 							previous?.tools,
 							this.#catalogBounds,
 							signal,
@@ -390,12 +755,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 						discoverSection(
 							capabilities?.resources !== undefined,
 							() =>
-								client
-									.listResources(undefined, {
-										...(signal === undefined ? {} : { signal }),
-										cacheMode: "refresh",
-									})
-									.then((v) => v.resources),
+								client.listResources(this.#params(id, {}), listOptions).then((v) => v.resources),
 							previous?.resources,
 							this.#catalogBounds,
 							signal,
@@ -404,10 +764,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 							capabilities?.resources !== undefined,
 							() =>
 								client
-									.listResourceTemplates(undefined, {
-										...(signal === undefined ? {} : { signal }),
-										cacheMode: "refresh",
-									})
+									.listResourceTemplates(this.#params(id, {}), listOptions)
 									.then((v) => v.resourceTemplates),
 							previous?.resourceTemplates,
 							this.#catalogBounds,
@@ -415,13 +772,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 						),
 						discoverSection(
 							capabilities?.prompts !== undefined,
-							() =>
-								client
-									.listPrompts(undefined, {
-										...(signal === undefined ? {} : { signal }),
-										cacheMode: "refresh",
-									})
-									.then((v) => v.prompts),
+							() => client.listPrompts(this.#params(id, {}), listOptions).then((v) => v.prompts),
 							previous?.prompts,
 							this.#catalogBounds,
 							signal,
@@ -479,6 +830,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					entry.catalog = catalog;
 					entry.catalogRevision += 1;
 					delete entry.errorCode;
+					delete entry.errorDetail;
 					const degraded = [tools, resources, resourceTemplates, prompts].some(
 						(section) => section.status === "failed" || section.status === "stale",
 					);
@@ -502,6 +854,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				entry.disconnectTask === undefined
 			) {
 				entry.errorCode = errorCode(error);
+				entry.errorDetail = describeError(error);
 				this.#transition(entry, "degraded");
 				this.#publish("catalog.failed", entry);
 			}
@@ -544,34 +897,119 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.close();
 	}
 
+	#params<Params extends Record<string, unknown>>(
+		id: Id,
+		params: Params,
+		options?: McpMetaOptions,
+	): Params & { _meta?: Record<string, unknown> } {
+		const entry = this.#entries.get(id);
+		const stampLevel =
+			entry?.logLevel !== undefined && entry.session?.client.getProtocolEra() === "modern"
+				? { [LOG_LEVEL_META_KEY]: entry.logLevel }
+				: {};
+		const meta = { ...stampLevel, ...options?.meta };
+		return Object.keys(meta).length === 0 ? params : { ...params, _meta: meta };
+	}
+
+	#requestOptions<Options extends RequestOptions>(
+		id: Id,
+		scope: "prompt" | "request" | "resource" | "tool",
+		options: (Options & McpMetaOptions) | undefined,
+	): Options {
+		const defaults = this.#entries.get(id)?.definition.defaults ?? {};
+		const scoped =
+			scope === "tool"
+				? defaults.toolTimeoutMs
+				: scope === "resource"
+					? defaults.resourceTimeoutMs
+					: scope === "prompt"
+						? defaults.promptTimeoutMs
+						: undefined;
+		const timeout = options?.timeout ?? scoped ?? defaults.timeoutMs;
+		const {
+			meta: _meta,
+			inputResponses: _inputResponses,
+			requestState: _requestState,
+			...rest
+		} = (options ?? {}) as Options & McpMetaOptions & McpMrtrForwardOptions;
+		void _meta;
+		void _inputResponses;
+		void _requestState;
+		return {
+			...(rest as Options),
+			...(timeout === undefined ? {} : { timeout }),
+			...(options?.resetTimeoutOnProgress === undefined &&
+			defaults.resetTimeoutOnProgress !== undefined
+				? { resetTimeoutOnProgress: defaults.resetTimeoutOnProgress }
+				: {}),
+			...(options?.maxTotalTimeout === undefined && defaults.maxTotalTimeoutMs !== undefined
+				? { maxTotalTimeout: defaults.maxTotalTimeoutMs }
+				: {}),
+			...(options?.onprogress === undefined && defaults.onprogress !== undefined
+				? { onprogress: defaults.onprogress }
+				: {}),
+		};
+	}
+
 	async #performConnect(entry: ManagedConnection<Id>): Promise<McpConnectionSnapshot<Id>> {
 		if (entry.activeOperations > 0) await this.#waitUntilDrained(entry);
 		this.#transition(entry, "connecting");
 		let transport: Transport | undefined;
 		let session: McpClientSession<Id> | undefined;
+		const definition = entry.definition;
 		try {
-			transport = await entry.definition.openTransport();
-			const client = createOfficialClient(entry.definition);
-			session = new McpClientSession(entry.definition.id, client);
+			transport = await definition.openTransport();
+			let liveSession: McpClientSession<Id> | undefined;
+			const listChanged = this.#listChangedHandlers(entry, () => liveSession);
+			const client = createOfficialClient(
+				definition,
+				listChanged === undefined ? {} : { listChanged },
+			);
+			session = new McpClientSession(definition.id, client);
+			liveSession = session;
 			client.onclose = () => {
 				if (entry.session === session && entry.phase !== "draining" && entry.phase !== "offline") {
 					delete entry.session;
 					delete entry.connectedAt;
 					entry.errorCode = KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE;
+					delete entry.errorDetail;
 					this.#transition(entry, "failed");
 				}
 			};
-			await client.connect(transport, entry.definition.connectOptions);
+			await client.connect(transport, this.#connectOptions(entry));
 			const generation = nextGeneration(this.#generationSequence);
 			this.#generationSequence = generation;
 			entry.session = session;
 			entry.generation = generation;
 			delete entry.catalog;
+			delete entry.autoRefresh;
 			entry.connectedAt = isoTimestamp(this.#now);
 			delete entry.errorCode;
+			delete entry.errorDetail;
+			const discover = client.getDiscoverResult();
+			if (discover !== undefined) entry.discover = discover;
+			else delete entry.discover;
+			await this.#repairListen(entry, session);
 			this.#transition(entry, "online");
 			return this.#snapshotEntry(entry);
 		} catch (error) {
+			if (
+				transport !== undefined &&
+				session !== undefined &&
+				definition.interactiveOAuth &&
+				error instanceof UnauthorizedError
+			) {
+				entry.pendingAuthorization = { transport, client: session.client };
+				entry.errorCode = KMCP_ERROR_CODES.CONNECTION_AUTHORIZING;
+				entry.errorDetail = describeError(error);
+				this.#transition(entry, "authorizing");
+				this.#publish("connection.authorization.required", entry);
+				throw new KmcpError(
+					KMCP_ERROR_CODES.CONNECTION_AUTHORIZING,
+					`Connection '${definition.id}' requires OAuth authorization; complete it with completeAuthorization().`,
+					{ cause: error },
+				);
+			}
 			const cleanup = cleanupAfterFailedConnect(session, transport);
 			if (cleanup !== undefined) {
 				try {
@@ -579,10 +1017,11 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				} catch (cleanupError) {
 					entry.quarantinedCleanup = cleanup;
 					entry.errorCode = KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED;
+					entry.errorDetail = describeError(error);
 					this.#transition(entry, "quarantined");
 					throw new KmcpError(
 						KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED,
-						`Failed to clean up the unsuccessful connection '${entry.definition.id}'.`,
+						`Failed to clean up the unsuccessful connection '${definition.id}'.`,
 						{
 							cause: new AggregateError([error, cleanupError], "Connect and cleanup both failed."),
 						},
@@ -590,12 +1029,118 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				}
 			}
 			entry.errorCode = KMCP_ERROR_CODES.CONNECTION_CONNECT_FAILED;
+			entry.errorDetail = describeError(error);
 			this.#transition(entry, "failed");
 			throw new KmcpError(
 				KMCP_ERROR_CODES.CONNECTION_CONNECT_FAILED,
-				`Failed to connect '${entry.definition.id}'.`,
+				`Failed to connect '${definition.id}'.`,
 				{ cause: error },
 			);
+		}
+	}
+
+	#connectOptions(entry: ManagedConnection<Id>) {
+		const base = entry.definition.connectOptions;
+		if (base?.prior !== undefined || entry.discover === undefined) return base;
+		// Reuse the previous modern verdict to skip the probe (same manager, same credentials).
+		return { ...base, prior: { kind: "modern" as const, discover: entry.discover } };
+	}
+
+	/**
+	 * Manager-owned `ClientOptions.listChanged` handlers: `autoRefresh: false` (kmcp performs its own
+	 * bounded, fingerprinted refresh) and fenced on the session so a notification arriving after a
+	 * reconnect can never restamp a stale catalog.
+	 */
+	#listChangedHandlers(
+		entry: ManagedConnection<Id>,
+		session: () => McpClientSession<Id> | undefined,
+	): ListChangedHandlers | undefined {
+		if (entry.definition.autoRefreshCatalog === undefined) return undefined;
+		const policy = entry.definition.autoRefreshCatalog;
+		const onChanged = () => this.#scheduleAutoRefresh(entry, session());
+		const handler = {
+			autoRefresh: false as const,
+			onChanged,
+			...(policy.debounceMs === undefined ? {} : { debounceMs: policy.debounceMs }),
+		};
+		return { tools: handler, prompts: handler, resources: handler };
+	}
+
+	#scheduleAutoRefresh(
+		entry: ManagedConnection<Id>,
+		session: McpClientSession<Id> | undefined,
+	): void {
+		const policy = entry.definition.autoRefreshCatalog;
+		if (policy === undefined || session === undefined || entry.session !== session) return;
+		if (!isUsable(entry) || entry.disconnectTask !== undefined || this.#closed) return;
+		const state = (entry.autoRefresh ??= {
+			count: 0,
+			lastAt: 0,
+			inFlight: false,
+			pending: false,
+			capped: false,
+		});
+		if (state.capped) return;
+		if (state.count >= policy.maxRefreshesPerGeneration) {
+			state.capped = true;
+			entry.errorCode = KMCP_ERROR_CODES.CATALOG_STALE;
+			entry.errorDetail = { kind: "kmcp", code: KMCP_ERROR_CODES.CATALOG_STALE };
+			this.#transition(entry, "degraded");
+			this.#publish("catalog.failed", entry);
+			return;
+		}
+		if (state.inFlight) {
+			// Single-flight: one refresh at a time per connection; a change observed meanwhile
+			// schedules exactly one follow-up once the running refresh settles.
+			state.pending = true;
+			return;
+		}
+		if (state.timer !== undefined) return;
+		const wait = Math.max(0, state.lastAt + policy.minIntervalMs - this.#now());
+		const timer = setTimeout(() => {
+			delete state.timer;
+			if (entry.session !== session || !isUsable(entry) || entry.autoRefresh !== state) return;
+			state.lastAt = this.#now();
+			state.count += 1;
+			state.inFlight = true;
+			void this.refreshCatalog(entry.definition.id)
+				.catch(() => undefined)
+				.finally(() => {
+					state.inFlight = false;
+					if (state.pending) {
+						state.pending = false;
+						this.#scheduleAutoRefresh(entry, session);
+					}
+				});
+		}, wait);
+		timer.unref?.();
+		state.timer = timer;
+	}
+
+	/**
+	 * A connect that adopted a `prior` verdict registers the list-changed handlers but does not
+	 * open the modern `subscriptions/listen` stream; open it here so auto-refresh keeps working.
+	 */
+	async #repairListen(entry: ManagedConnection<Id>, session: McpClientSession<Id>): Promise<void> {
+		const client = session.client;
+		if (
+			entry.definition.autoRefreshCatalog === undefined ||
+			client.getProtocolEra() !== "modern" ||
+			client.autoOpenedSubscription !== undefined
+		) {
+			return;
+		}
+		const capabilities = client.getServerCapabilities();
+		const filter: SubscriptionFilter = {
+			...(capabilities?.tools?.listChanged === true ? { toolsListChanged: true } : {}),
+			...(capabilities?.prompts?.listChanged === true ? { promptsListChanged: true } : {}),
+			...(capabilities?.resources?.listChanged === true ? { resourcesListChanged: true } : {}),
+		};
+		if (Object.keys(filter).length === 0) return;
+		try {
+			entry.listen = await client.listen(filter);
+		} catch {
+			delete entry.listen;
 		}
 	}
 
@@ -606,8 +1151,24 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		this.#publish("connection.removed", entry);
 	}
 
+	async #releasePendingAuthorization(entry: ManagedConnection<Id>): Promise<void> {
+		const pending = entry.pendingAuthorization;
+		if (pending === undefined) return;
+		delete entry.pendingAuthorization;
+		await pending.client.close().catch(() => undefined);
+		await pending.transport.close().catch(() => undefined);
+	}
+
 	async #performDisconnect(entry: ManagedConnection<Id>): Promise<McpConnectionSnapshot<Id>> {
 		if (entry.connectTask !== undefined) await entry.connectTask.catch(() => undefined);
+		if (entry.pendingAuthorization !== undefined) {
+			this.#transition(entry, "draining");
+			await this.#releasePendingAuthorization(entry);
+			delete entry.errorCode;
+			delete entry.errorDetail;
+			this.#transition(entry, "offline");
+			return this.#snapshotEntry(entry);
+		}
 		const quarantinedCleanup = entry.quarantinedCleanup;
 		if (quarantinedCleanup !== undefined) {
 			this.#transition(entry, "draining");
@@ -615,10 +1176,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				await quarantinedCleanup();
 				delete entry.quarantinedCleanup;
 				delete entry.errorCode;
+				delete entry.errorDetail;
 				this.#transition(entry, "offline");
 				return this.#snapshotEntry(entry);
 			} catch (error) {
 				entry.errorCode = KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED;
+				entry.errorDetail = describeError(error);
 				this.#transition(entry, "quarantined");
 				throw new KmcpError(
 					KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED,
@@ -634,21 +1197,29 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				await this.#waitUntilDrained(entry);
 			}
 			delete entry.errorCode;
+			delete entry.errorDetail;
 			this.#transition(entry, "offline");
 			return this.#snapshotEntry(entry);
 		}
 
 		this.#transition(entry, "draining");
 		await this.#waitUntilDrained(entry);
+		this.#cancelAutoRefresh(entry);
 		try {
+			// Close subscriptions before the client so kmcp's own teardown reads as 'local'.
+			await entry.listen?.close().catch(() => undefined);
+			delete entry.listen;
+			await session.client.autoOpenedSubscription?.close().catch(() => undefined);
 			await session.close();
 			delete entry.session;
 			delete entry.connectedAt;
 			delete entry.errorCode;
+			delete entry.errorDetail;
 			this.#transition(entry, "offline");
 			return this.#snapshotEntry(entry);
 		} catch (error) {
 			entry.errorCode = KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED;
+			entry.errorDetail = describeError(error);
 			this.#transition(entry, "quarantined");
 			throw new KmcpError(
 				KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED,
@@ -656,6 +1227,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				{ cause: error },
 			);
 		}
+	}
+
+	#cancelAutoRefresh(entry: ManagedConnection<Id>): void {
+		const timer = entry.autoRefresh?.timer;
+		if (timer !== undefined) clearTimeout(timer);
+		delete entry.autoRefresh;
 	}
 
 	#waitUntilDrained(entry: ManagedConnection<Id>): Promise<void> {
@@ -717,6 +1294,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			delete entry.catalog;
 			entry.catalogRevision += 1;
 		}
+		if (phase !== "online" && phase !== "degraded") this.#cancelAutoRefresh(entry);
 		entry.phase = phase;
 		entry.lastTransitionAt = isoTimestamp(this.#now);
 		this.#publish("connection.state.changed", entry);
@@ -755,6 +1333,8 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		const protocolVersion = client?.getNegotiatedProtocolVersion();
 		const protocolEra = client?.getProtocolEra();
 		const capabilities = client?.getServerCapabilities();
+		const instructions = client?.getInstructions();
+		const watch = client === undefined ? undefined : this.#watchSnapshot(entry, client);
 		return Object.freeze({
 			id: entry.definition.id,
 			label: entry.definition.label,
@@ -766,9 +1346,69 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			...(protocolVersion === undefined ? {} : { protocolVersion }),
 			...(protocolEra === undefined ? {} : { protocolEra }),
 			...(serverInfo === undefined ? {} : { serverInfo: immutableClone(serverInfo) }),
+			...(instructions === undefined
+				? {}
+				: { instructions: instructions.slice(0, this.#maxInstructionsLength) }),
 			...(capabilities === undefined ? {} : { capabilities: immutableClone(capabilities) }),
+			...(entry.logLevel === undefined ? {} : { logLevel: entry.logLevel }),
 			...(entry.errorCode === undefined ? {} : { errorCode: entry.errorCode }),
+			...(entry.errorDetail === undefined ? {} : { errorDetail: entry.errorDetail }),
+			...(watch === undefined ? {} : { watch }),
 			...(entry.catalog === undefined ? {} : { catalog: entry.catalog }),
+		});
+	}
+
+	#watchSnapshot(entry: ManagedConnection<Id>, client: Client): McpWatchSnapshot {
+		const refreshes = entry.autoRefresh?.count ?? 0;
+		const configured = entry.definition.autoRefreshCatalog !== undefined;
+		const base = { refreshes };
+		if (!configured) {
+			return Object.freeze({
+				...base,
+				active: false,
+				honoredSections: [],
+				unhonoredSections: [],
+				reason: "not-configured" as const,
+			});
+		}
+		const capabilities = client.getServerCapabilities();
+		const advertised: McpCatalogCapability[] = [];
+		if (capabilities?.tools?.listChanged === true) advertised.push("tools");
+		if (capabilities?.prompts?.listChanged === true) advertised.push("prompts");
+		if (capabilities?.resources?.listChanged === true)
+			advertised.push("resources", "resourceTemplates");
+		const era = client.getProtocolEra();
+		let honored: readonly McpCatalogCapability[];
+		if (era === "modern") {
+			const filter = (client.autoOpenedSubscription ?? entry.listen)?.honoredFilter;
+			honored =
+				filter === undefined
+					? []
+					: [
+							...(filter.toolsListChanged === true ? (["tools"] as const) : []),
+							...(filter.promptsListChanged === true ? (["prompts"] as const) : []),
+							...(filter.resourcesListChanged === true
+								? (["resources", "resourceTemplates"] as const)
+								: []),
+						];
+		} else {
+			honored = advertised;
+		}
+		const unhonored = CATALOG_SECTIONS.filter((section) => !honored.includes(section));
+		const reason =
+			entry.autoRefresh?.capped === true
+				? ("refresh-cap" as const)
+				: honored.length === 0
+					? advertised.length === 0
+						? ("not-advertised" as const)
+						: ("unsupported-era" as const)
+					: undefined;
+		return Object.freeze({
+			...base,
+			active: honored.length > 0 && entry.autoRefresh?.capped !== true,
+			honoredSections: Object.freeze([...honored]),
+			unhonoredSections: Object.freeze(unhonored),
+			...(reason === undefined ? {} : { reason }),
 		});
 	}
 
@@ -799,6 +1439,54 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			);
 		}
 	}
+}
+
+/** Classifies an error (walking `cause`) into a stable kind/code pair for snapshots. */
+export function describeError(error: unknown): McpErrorDetail {
+	let current: unknown = error;
+	for (let depth = 0; depth < 8 && current !== undefined && current !== null; depth += 1) {
+		if (current instanceof KmcpError) {
+			if (
+				current.code !== KMCP_ERROR_CODES.CONNECTION_CONNECT_FAILED &&
+				current.code !== KMCP_ERROR_CODES.OPERATION_FAILED
+			) {
+				return { kind: "kmcp", code: current.code };
+			}
+		} else if (current instanceof UnauthorizedError) {
+			return { kind: "oauth", code: "unauthorized" };
+		} else if (current instanceof InsufficientScopeError) {
+			return { kind: "oauth", code: "insufficient_scope" };
+		} else if (current instanceof UnsupportedProtocolVersionError) {
+			return { kind: "protocol", code: "unsupported_protocol_version" };
+		} else if (current instanceof MissingRequiredClientCapabilityError) {
+			return { kind: "protocol", code: "missing_required_client_capability" };
+		} else if (current instanceof SdkError) {
+			return { kind: "sdk", code: current.code };
+		} else if (current instanceof ProtocolError) {
+			return { kind: "protocol", code: current.code };
+		}
+		current = current instanceof Error ? current.cause : undefined;
+	}
+	if (error instanceof KmcpError) return { kind: "kmcp", code: error.code };
+	return { kind: "unknown", code: error instanceof Error ? error.name : typeof error };
+}
+
+function boundedCompletion(result: CompleteResult): CompleteResult {
+	const values = result.completion.values
+		.filter((value): value is string => typeof value === "string")
+		.slice(0, 100)
+		.map((value) => value.slice(0, 4096));
+	return {
+		...result,
+		completion: {
+			...result.completion,
+			values,
+			...(typeof result.completion.total === "number" ? { total: result.completion.total } : {}),
+			...(typeof result.completion.hasMore === "boolean"
+				? { hasMore: result.completion.hasMore }
+				: {}),
+		},
+	};
 }
 
 async function discoverSection<Item>(
@@ -870,7 +1558,8 @@ const DEFAULT_CATALOG_BOUNDS: McpCatalogBounds = Object.freeze({
 
 const UTF8_ENCODER = new TextEncoder();
 
-function cloneCatalogItems<Item>(
+/** Bounded, detached, deeply frozen JSON normalization shared by catalogs and other upstream-controlled values. */
+export function cloneCatalogItems<Item>(
 	loaded: readonly Item[],
 	bounds: McpCatalogBounds,
 ): { readonly items: readonly Item[]; readonly byteSize: number; readonly nodeCount: number } {
@@ -1128,4 +1817,22 @@ function nextGeneration(current: number): number {
 		throw new RangeError("MCP connection generation space is exhausted.");
 	}
 	return current + 1;
+}
+
+/**
+ * Builds `tools/call` params for a forwarded multi-round-trip round. The public
+ * `CallToolRequest['params']` type is `{ name, arguments, _meta }`, but the 2026-07-28 wire codec
+ * accepts `inputResponses` and `requestState` on the request at runtime (SDK `src-*.mjs`, the
+ * `tools/call` params codec) and the server seam exposes them through `ctx.mcpReq`. This is the
+ * one place kmcp relies on that; `test/gateway.test.ts` fails loudly if a future SDK strips them.
+ */
+function forwardMrtrCallToolParams(
+	name: string,
+	arguments_: Readonly<Record<string, unknown>>,
+	options: McpMrtrForwardOptions | undefined,
+): { name: string; arguments: Record<string, unknown> } {
+	const params: Record<string, unknown> = { name, arguments: { ...arguments_ } };
+	if (options?.inputResponses !== undefined) params.inputResponses = { ...options.inputResponses };
+	if (options?.requestState !== undefined) params.requestState = options.requestState;
+	return params as { name: string; arguments: Record<string, unknown> };
 }

@@ -1,22 +1,26 @@
-import type {
-	CallToolRequestOptions,
-	CallToolResult,
-	GetPromptResult,
-	Prompt,
-	ReadResourceResult,
-	Resource,
-	ResourceTemplateType,
-	Tool,
+import {
+	type CallToolResult,
+	type CompleteResult,
+	type GetPromptResult,
+	type Prompt,
+	type ReadResourceResult,
+	type Resource,
+	type ResourceTemplateType,
+	type Tool,
+	UriTemplate,
 } from "@modelcontextprotocol/client";
 
 import { KMCP_ERROR_CODES, KmcpError, errorCode } from "../errors.ts";
 import { assertNonEmpty, immutableClone, type MaybePromise } from "../internal/value.ts";
 import type { McpCatalogSnapshot } from "../client/catalog.ts";
 import type {
+	McpCallToolOptions,
 	McpConnectionEvent,
 	McpConnectionManagerSnapshot,
 	McpConnectionOperationControl,
 	McpConnectionSnapshot,
+	McpReadOptions,
+	McpRequestOptionsWithMeta,
 } from "../client/manager.ts";
 import { McpConnectionManager } from "../client/manager.ts";
 
@@ -265,19 +269,19 @@ export class McpHubManager<
 		id: HubId,
 		route: string,
 		arguments_?: Readonly<Record<string, unknown>>,
-		options?: CallToolRequestOptions,
+		options?: McpCallToolOptions,
 	): Promise<CallToolResult>;
 	callTool(
 		id: HubId,
 		route: McpHubToolRoute<ConnectionId>,
 		arguments_?: Readonly<Record<string, unknown>>,
-		options?: CallToolRequestOptions,
+		options?: McpCallToolOptions,
 	): Promise<CallToolResult>;
 	callTool(
 		id: HubId,
 		route: McpHubToolRoute<ConnectionId> | string,
 		arguments_: Readonly<Record<string, unknown>> = {},
-		options?: CallToolRequestOptions,
+		options?: McpCallToolOptions,
 	): Promise<CallToolResult> {
 		this.#assertOpen();
 		throwIfAborted(options?.signal);
@@ -313,22 +317,22 @@ export class McpHubManager<
 		id: HubId,
 		route: string,
 		arguments_: Readonly<Record<string, string>> | undefined,
-		signal?: AbortSignal,
+		options?: McpRequestOptionsWithMeta,
 	): Promise<GetPromptResult>;
 	getPrompt(
 		id: HubId,
 		route: McpHubPromptRoute<ConnectionId>,
 		arguments_: Readonly<Record<string, string>> | undefined,
-		signal?: AbortSignal,
+		options?: McpRequestOptionsWithMeta,
 	): Promise<GetPromptResult>;
 	getPrompt(
 		id: HubId,
 		route: McpHubPromptRoute<ConnectionId> | string,
 		arguments_: Readonly<Record<string, string>> | undefined,
-		signal?: AbortSignal,
+		options?: McpRequestOptionsWithMeta,
 	): Promise<GetPromptResult> {
 		this.#assertOpen();
-		throwIfAborted(signal);
+		throwIfAborted(options?.signal);
 		const routeName = typeof route === "string" ? route : route.route;
 		const match = resolveRoute(this.#hub(id), routeName);
 		const identity = this.#catalogIdentity(match.connectionId, "prompts");
@@ -352,41 +356,46 @@ export class McpHubManager<
 			match.connectionId,
 			match.sourceName,
 			arguments_,
-			signal,
+			options,
 			identity.control,
 		);
 	}
 
+	/**
+	 * Reads a resource through a namespace. The URI may be a listed static resource or an
+	 * expansion of one of the member's listed resource templates (matched with the SDK
+	 * `UriTemplate`); both are fenced on the member's current catalog generation.
+	 */
 	readResource(
 		id: HubId,
 		namespace: string,
 		uri: string,
-		signal?: AbortSignal,
+		options?: McpReadOptions,
 	): Promise<ReadResourceResult>;
 	readResource(
 		id: HubId,
 		route: McpHubResourceRoute<ConnectionId>,
-		signal?: AbortSignal,
+		options?: McpReadOptions,
 	): Promise<ReadResourceResult>;
 	readResource(
 		id: HubId,
 		routeOrNamespace: McpHubResourceRoute<ConnectionId> | string,
-		uriOrSignal?: AbortSignal | string,
-		signal?: AbortSignal,
+		uriOrOptions?: McpReadOptions | string,
+		options?: McpReadOptions,
 	): Promise<ReadResourceResult> {
 		this.#assertOpen();
 		if (typeof routeOrNamespace === "string") {
-			if (typeof uriOrSignal !== "string") throw new TypeError("resource URI must be a string.");
-			throwIfAborted(signal);
-			return this.#readResource(id, routeOrNamespace, uriOrSignal, signal);
+			if (typeof uriOrOptions !== "string") throw new TypeError("resource URI must be a string.");
+			throwIfAborted(options?.signal);
+			return this.#readResource(id, routeOrNamespace, uriOrOptions, options);
 		}
-		if (typeof uriOrSignal === "string") throw new TypeError("signal must be an AbortSignal.");
-		throwIfAborted(uriOrSignal);
+		if (typeof uriOrOptions === "string") throw new TypeError("options must be an object.");
+		throwIfAborted(uriOrOptions?.signal);
 		return this.#readResource(
 			id,
 			routeOrNamespace.namespace,
 			routeOrNamespace.sourceUri,
-			uriOrSignal,
+			uriOrOptions,
 			routeOrNamespace,
 		);
 	}
@@ -395,19 +404,31 @@ export class McpHubManager<
 		id: HubId,
 		namespace: string,
 		uri: string,
-		signal?: AbortSignal,
+		options?: McpReadOptions,
 		route?: McpHubResourceRoute<ConnectionId>,
 	): Promise<ReadResourceResult> {
 		const definition = this.#hub(id);
 		const member = definition.members.find((candidate) => candidate.namespace === namespace);
-		if (member === undefined) throw unknownRoute(`${namespace}:${uri}`);
+		const routeName = `${namespace}:${uri}`;
+		if (member === undefined) throw unknownRoute(routeName);
 		const identity = this.#catalogIdentity(member.connectionId, "resources");
+		if (identity === undefined) throw unknownRoute(routeName);
 		const resource = findExactlyOne(
-			identity?.catalog.resources.items ?? [],
+			identity.catalog.resources.items,
 			(candidate) => candidate.uri === uri,
 		);
-		const routeName = `${namespace}:${uri}`;
-		if (identity === undefined || resource === undefined) throw unknownRoute(routeName);
+		if (resource === undefined) {
+			if (route !== undefined) throw unknownRoute(routeName);
+			const templates = this.#catalogIdentity(member.connectionId, "resourceTemplates");
+			if (
+				templates === undefined ||
+				templates.catalog !== identity.catalog ||
+				!matchesAnyTemplate(templates.catalog.resourceTemplates.items, uri)
+			) {
+				throw unknownRoute(routeName);
+			}
+			return this.#connections.readResource(member.connectionId, uri, options, identity.control);
+		}
 		if (
 			route !== undefined &&
 			(route.route !== routeName ||
@@ -421,7 +442,65 @@ export class McpHubManager<
 		) {
 			throw unknownRoute(routeName);
 		}
-		return this.#connections.readResource(member.connectionId, uri, signal, identity.control);
+		return this.#connections.readResource(member.connectionId, uri, options, identity.control);
+	}
+
+	/**
+	 * `completion/complete` for a prompt argument (`ns.prompt`) or a resource-template variable
+	 * (`ns:template`) of a hub member. Results are bounded by the connection manager.
+	 */
+	complete(
+		id: HubId,
+		route: McpHubPromptRoute<ConnectionId> | McpHubResourceTemplateRoute<ConnectionId> | string,
+		argument: { readonly name: string; readonly value: string },
+		context?: { readonly arguments?: Readonly<Record<string, string>> },
+		options?: McpRequestOptionsWithMeta,
+	): Promise<CompleteResult> {
+		this.#assertOpen();
+		throwIfAborted(options?.signal);
+		const definition = this.#hub(id);
+		const routeName = typeof route === "string" ? route : route.route;
+		const target = resolveCompletionRoute(definition, routeName);
+		const identity = this.#catalogIdentity(
+			target.connectionId,
+			target.kind === "prompt" ? "prompts" : "resourceTemplates",
+		);
+		if (identity === undefined) throw unknownRoute(routeName);
+		if (
+			typeof route !== "string" &&
+			(route.connectionId !== target.connectionId ||
+				route.generation !== identity.catalog.generation ||
+				route.catalogFingerprint !== identity.catalog.fingerprint)
+		) {
+			throw unknownRoute(routeName);
+		}
+		const ref =
+			target.kind === "prompt"
+				? findExactlyOne(
+						identity.catalog.prompts.items,
+						(candidate) => candidate.name === target.source,
+					) === undefined
+					? undefined
+					: ({ type: "ref/prompt", name: target.source } as const)
+				: findExactlyOne(
+							identity.catalog.resourceTemplates.items,
+							(candidate) => candidate.uriTemplate === target.source,
+					  ) === undefined
+					? undefined
+					: ({ type: "ref/resource", uri: target.source } as const);
+		if (ref === undefined) throw unknownRoute(routeName);
+		return this.#connections.complete(
+			target.connectionId,
+			{
+				ref,
+				argument: { name: argument.name, value: argument.value },
+				...(context?.arguments === undefined
+					? {}
+					: { context: { arguments: { ...context.arguments } } }),
+			},
+			options,
+			identity.control,
+		);
 	}
 
 	state(id: HubId): McpHubSnapshot<HubId, ConnectionId> {
@@ -632,7 +711,7 @@ export class McpHubManager<
 
 	#catalogIdentity(
 		connectionId: ConnectionId,
-		section: "prompts" | "resources" | "tools",
+		section: "prompts" | "resourceTemplates" | "resources" | "tools",
 	):
 		| {
 				readonly catalog: McpCatalogSnapshot;
@@ -716,6 +795,46 @@ function resolveRoute<HubId extends string, ConnectionId extends string>(
 		}
 	}
 	throw unknownRoute(route);
+}
+
+function resolveCompletionRoute<HubId extends string, ConnectionId extends string>(
+	hub: McpHubDefinition<HubId, ConnectionId>,
+	route: string,
+): {
+	readonly kind: "prompt" | "resourceTemplate";
+	readonly connectionId: ConnectionId;
+	readonly source: string;
+} {
+	for (const member of hub.members) {
+		const promptPrefix = `${member.namespace}.`;
+		const templatePrefix = `${member.namespace}:`;
+		if (route.startsWith(templatePrefix) && route.length > templatePrefix.length) {
+			return Object.freeze({
+				kind: "resourceTemplate",
+				connectionId: member.connectionId,
+				source: route.slice(templatePrefix.length),
+			});
+		}
+		if (route.startsWith(promptPrefix) && route.length > promptPrefix.length) {
+			return Object.freeze({
+				kind: "prompt",
+				connectionId: member.connectionId,
+				source: route.slice(promptPrefix.length),
+			});
+		}
+	}
+	throw unknownRoute(route);
+}
+
+function matchesAnyTemplate(templates: readonly ResourceTemplateType[], uri: string): boolean {
+	for (const template of uniquelyIdentified(templates, (item) => item.uriTemplate)) {
+		try {
+			if (new UriTemplate(template.uriTemplate).match(uri) !== null) return true;
+		} catch {
+			// An unparsable upstream template never matches.
+		}
+	}
+	return false;
 }
 
 function findExactlyOne<Item>(

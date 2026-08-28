@@ -22,6 +22,20 @@ class ExternallyUnconstructableCapability extends McpCapabilityDefinition<"tool"
 	override install(_server: McpServer): never {
 		throw new Error("not installable");
 	}
+
+	override withName(): never {
+		throw new Error("not renameable");
+	}
+
+	override withMetadata(): never {
+		throw new Error("not patchable");
+	}
+
+	override readonly handler = undefined;
+
+	override withHandler(): never {
+		throw new Error("not decoratable");
+	}
 }
 
 void ExternallyUnconstructableCapability;
