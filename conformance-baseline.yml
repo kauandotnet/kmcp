@@ -1,0 +1,27 @@
+# MCP conformance baseline — the burn-down list for `pnpm run conformance:server`.
+#
+# Format (parsed by `@modelcontextprotocol/conformance --expected-failures`): an object with
+# `server` / `client` keys, each a list of SCENARIO names. A scenario counts as failing when ANY of
+# its checks is FAILURE *or* WARNING — the pretty per-scenario summary line only counts FAILUREs,
+# so a scenario that prints `✓ 0 passed, 0 failed` can still be a baseline entry (that is exactly
+# `server-sse-multiple-streams` below). A listed scenario that fails => expected (exit 0); a listed
+# scenario that PASSES => stale entry (exit 1, delete it); an unlisted scenario that fails =>
+# regression (exit 1).
+#
+# Recorded from a real run against `test/conformance/server-fixture.ts` on 2026-08-28 with
+# @modelcontextprotocol/conformance 0.1.16, `--suite active` (30 scenarios; 26 pass).
+# Regenerate the observed set by running `pnpm run conformance:server` with this file renamed away.
+
+server:
+  # The next four are one root cause, not four bugs: the official `createMcpHandler` serves 2025-era
+  # traffic only `legacy: 'stateless'` or `legacy: 'reject'` — there is no sessionful legacy mode —
+  # so a per-request legacy instance never saw `initialize`, holds no client capabilities, and the
+  # SDK's legacy multi-round-trip shim refuses every server-to-client leg with
+  # "per-request legacy serving cannot receive server-to-client requests". The fixture's handlers
+  # are correct modern MRTR (`inputRequired(...)` + `acceptedContent`/`inputResponse`) and pass on
+  # the 2026-07-28 wire; conformance 0.1.16 only speaks 2025-11-25.
+  - tools-call-sampling # legacy stateless serving cannot deliver `sampling/createMessage` to the client
+  - tools-call-elicitation # legacy stateless serving cannot deliver `elicitation/create` to the client
+  - elicitation-sep1034-defaults # same: SEP-1034 defaults never reach the client on the 2025 leg
+  - elicitation-sep1330-enums # same: SEP-1330 enum variants never reach the client on the 2025 leg
+  - server-sse-multiple-streams # WARNING (SHOULD): the SDK's stateless legacy leg mints no `mcp-session-id`

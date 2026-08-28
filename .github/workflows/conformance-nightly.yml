@@ -1,0 +1,50 @@
+name: Conformance (nightly, unpinned)
+
+# Early warning for spec/tooling drift: runs the conformance suite's git main — not the pinned
+# release the CI gate uses — over the FULL scenario set (`active` + `pending`), against its own
+# baseline (conformance-baseline-main.yml). It is expected to go red on its own schedule when the
+# working group lands new scenarios; that is the signal, not a regression in this repo. The merge
+# gate stays in ci.yml with the pinned tool.
+
+on:
+  schedule:
+    # 05:00 UTC daily, well clear of the working group's usual merge window.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-nightly
+  cancel-in-progress: true
+
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  conformance:
+    name: conformance @ main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Enable corepack (pnpm 11 from package.json packageManager)
+        run: corepack enable
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # `npx --yes github:modelcontextprotocol/conformance` builds the tool from source, so the run
+      # picks up scenarios that have no npm release yet.
+      - name: Conformance (conformance main, all suite)
+        env:
+          CONFORMANCE_PACKAGE: github:modelcontextprotocol/conformance
+          CONFORMANCE_SUITE: all
+          CONFORMANCE_BASELINE: conformance-baseline-main.yml
+        run: node scripts/conformance-server.mjs

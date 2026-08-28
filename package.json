@@ -37,6 +37,14 @@
 			"types": "./dist/node.d.ts",
 			"import": "./dist/node.js"
 		},
+		"./auth": {
+			"types": "./dist/auth.d.ts",
+			"import": "./dist/auth.js"
+		},
+		"./gateway": {
+			"types": "./dist/gateway.d.ts",
+			"import": "./dist/gateway.js"
+		},
 		"./package.json": "./package.json"
 	},
 	"scripts": {
@@ -46,15 +54,23 @@
 		"format:check": "prettier --check .",
 		"format": "prettier --write .",
 		"publint": "publint --strict",
-		"check": "pnpm run typecheck && pnpm run test && pnpm run build && pnpm run publint && pnpm run format:check"
+		"check": "pnpm run typecheck && pnpm run test && pnpm run build && pnpm run test:dist && pnpm run publint && pnpm run format:check",
+		"test:dist": "node scripts/test-dist.mjs",
+		"conformance:golden": "tsc -p tsconfig.test.json --outDir .test-dist-conformance && node --test \".test-dist-conformance/test/conformance/*.test.js\"",
+		"conformance:server": "node scripts/conformance-server.mjs",
+		"conformance:gateway": "CONFORMANCE_FIXTURE=test/conformance/gateway-fixture.ts CONFORMANCE_BASELINE=conformance-baseline-gateway.yml PORT=39751 node scripts/conformance-server.mjs"
 	},
 	"peerDependencies": {
 		"@modelcontextprotocol/client": "^2.0.0",
 		"@modelcontextprotocol/node": "^2.0.0",
-		"@modelcontextprotocol/server": "^2.0.0"
+		"@modelcontextprotocol/server": "^2.0.0",
+		"jose": "^6.1.3"
 	},
 	"peerDependenciesMeta": {
 		"@modelcontextprotocol/node": {
+			"optional": true
+		},
+		"jose": {
 			"optional": true
 		}
 	},
@@ -63,6 +79,7 @@
 		"@modelcontextprotocol/node": "2.0.0",
 		"@modelcontextprotocol/server": "2.0.0",
 		"@types/node": "26.1.2",
+		"jose": "^6.2.10",
 		"prettier": "3.9.6",
 		"publint": "0.3.23",
 		"typescript": "7.0.2"

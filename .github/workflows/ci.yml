@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Corepack must not stall on the "download pnpm@x.y.z?" prompt in a non-interactive runner.
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  check:
+    name: check (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v5
+
+      # `corepack enable` runs BEFORE setup-node on purpose: setup-node's `cache: pnpm` needs a
+      # `pnpm` binary on PATH to resolve the store path. The version is pinned by the
+      # `packageManager` field in package.json (pnpm 11), so corepack activates exactly that.
+      - name: Enable corepack (pnpm 11 from package.json packageManager)
+        run: corepack enable
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Dist smoke test
+        run: pnpm run test:dist
+
+      - name: publint
+        run: pnpm run publint
+
+      - name: Format check
+        run: pnpm run format:check
+
+      # `pnpm run test` only globs `test/*.test.js`, so the wire goldens under test/conformance/
+      # need their own compile + run. Separate outDir so it never races the main `test` script.
+      - name: Conformance wire goldens
+        run: |
+          pnpm exec tsc -p tsconfig.test.json --outDir .test-dist-conformance
+          node --test ".test-dist-conformance/test/conformance/*.test.js"
+
+      # The gate: the official MCP conformance suite (version pinned in
+      # scripts/conformance-server.mjs) against test/conformance/server-fixture.ts, with
+      # conformance-baseline.yml applied. A new failure and a baselined scenario that starts
+      # passing both fail the job. The fixture boots from TypeScript source via Node's own type
+      # stripping — no build step, no extra dev dependency (verified on Node 22.21 and 24.18).
+      # Invoked directly rather than through `pnpm run conformance:server` so the workflow stands
+      # on its own; the package.json script is the same command for local runs.
+      - name: Conformance (pinned tool, active suite)
+        run: node scripts/conformance-server.mjs
+
+      # The same suite against the everything server projected through a kmcp/gateway (in-process
+      # modern upstream → hub → gateway). Prefixed route names make the fixed-name scenarios
+      # expected failures; see conformance-baseline-gateway.yml.
+      - name: Conformance (pinned tool, gateway fixture)
+        run: pnpm run conformance:gateway

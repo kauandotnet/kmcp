@@ -3,3 +3,4 @@ dist/
 .test-dist/
 *.tgz
 *.tsbuildinfo
+.test-dist-*/

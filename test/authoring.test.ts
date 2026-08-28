@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { McpServer, fromJsonSchema } from "@modelcontextprotocol/server";
 
 import { KMCP_ERROR_CODES, KmcpError } from "../src/errors.ts";
@@ -18,6 +17,7 @@ import {
 	defineTool,
 	serverFrom,
 } from "../src/server.ts";
+import { createTestClient, forEachEra } from "./helpers/in-process.ts";
 
 const greetingInput = fromJsonSchema<{ name: string }>({
 	type: "object",
@@ -26,7 +26,7 @@ const greetingInput = fromJsonSchema<{ name: string }>({
 	additionalProperties: false,
 });
 
-test("functional and builder authoring lower to official SDK v2 classes", async () => {
+forEachEra("functional and builder authoring lower to official SDK v2 classes", async (era) => {
 	const tool = defineTool(
 		"greet",
 		{ description: "Greets someone", inputSchema: greetingInput },
@@ -46,30 +46,28 @@ test("functional and builder authoring lower to official SDK v2 classes", async 
 		.add(resource)
 		.build();
 	assert.ok(definition instanceof McpServerDefinition);
-
-	const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-	const runtime = await definition.instantiate({ era: "legacy" });
+	const runtime = await definition.instantiate({ era });
 	assert.equal(runtime.registrations.length, 3);
-	await runtime.connect(serverTransport);
-	const client = new Client({ name: "test-client", version: "1.0.0" });
-	await client.connect(clientTransport);
-
-	const tools = await client.listTools();
-	assert.deepEqual(
-		tools.tools.map(({ name }) => name),
-		["greet"],
-	);
-	const result = await client.callTool({ name: "greet", arguments: { name: "Ada" } });
-	assert.equal(result.content[0]?.type, "text");
-	if (result.content[0]?.type === "text") assert.equal(result.content[0].text, "Hello Ada");
-	assert.equal((await client.getPrompt({ name: "welcome" })).messages.length, 1);
-	assert.equal(
-		(await client.readResource({ uri: "status://current" })).contents[0]?.uri,
-		"status://current",
-	);
-
-	await client.close();
 	await runtime.close();
+
+	const { client, close } = await createTestClient(definition, { era });
+	try {
+		const tools = await client.listTools();
+		assert.deepEqual(
+			tools.tools.map(({ name }) => name),
+			["greet"],
+		);
+		const result = await client.callTool({ name: "greet", arguments: { name: "Ada" } });
+		assert.equal(result.content[0]?.type, "text");
+		if (result.content[0]?.type === "text") assert.equal(result.content[0].text, "Hello Ada");
+		assert.equal((await client.getPrompt({ name: "welcome" })).messages.length, 1);
+		assert.equal(
+			(await client.readResource({ uri: "status://current" })).contents[0]?.uri,
+			"status://current",
+		);
+	} finally {
+		await close();
+	}
 });
 
 test("standard decorators materialize the same canonical capability classes per instance", () => {
@@ -205,6 +203,20 @@ test("the canonical capability base rejects forged external construction tokens"
 
 		override install(_server: McpServer): never {
 			throw new Error("not installable");
+		}
+
+		override withName(): never {
+			throw new Error("not renameable");
+		}
+
+		override withMetadata(): never {
+			throw new Error("not patchable");
+		}
+
+		override readonly handler = undefined;
+
+		override withHandler(): never {
+			throw new Error("not decoratable");
 		}
 	}
 

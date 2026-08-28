@@ -1,0 +1,28 @@
+# MCP conformance baseline for `pnpm run conformance:gateway` — the everything server served
+# through a `kmcp/gateway` (`test/conformance/gateway-fixture.ts`, passthrough names/resources).
+#
+# Same semantics as conformance-baseline.yml: a listed scenario that fails is expected (exit 0), a
+# listed scenario that PASSES is a stale entry (exit 1, delete it), an unlisted failure is a
+# regression (exit 1). WARNING counts as failing.
+#
+# Recorded from a real run on 2026-08-28 with @modelcontextprotocol/conformance 0.1.16,
+# `--suite active` (30 scenarios; 22 pass). Everything the gateway forwards — every content type,
+# tool errors, progress, completions, static/binary/template resource reads, prompts with
+# arguments/embedded resources/images, dns-rebinding — passes through the projection unchanged.
+
+server:
+  # Same root cause as the four entries in conformance-baseline.yml: the gateway's own downstream
+  # leg is the SDK's per-request stateless legacy serving, which holds no client-capability view
+  # and refuses every server-to-client request the legacy MRTR shim would need. The relay itself is
+  # covered on the 2026-07-28 wire by test/gateway.test.ts (elicitation round-trips end to end).
+  - tools-call-sampling # legacy stateless serving cannot deliver `sampling/createMessage` downstream
+  - tools-call-elicitation # legacy stateless serving cannot deliver `elicitation/create` downstream
+  - elicitation-sep1034-defaults # same root cause
+  - elicitation-sep1330-enums # same root cause
+  # Deliberate gateway boundaries (documented in README "Gateway"): logging and resource-update
+  # subscriptions are not forwarded, so the gateway advertises neither.
+  - logging-set-level # gateway declares no `logging` capability (SEP-2577 deprecates it)
+  - tools-call-with-logging # upstream log notifications are not relayed downstream
+  - resources-subscribe # gateway advertises `resources.subscribe: false` (phase 2)
+  - resources-unsubscribe # same
+  - server-sse-multiple-streams # WARNING (SHOULD): the SDK's stateless legacy leg mints no `mcp-session-id`
