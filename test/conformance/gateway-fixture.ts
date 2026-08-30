@@ -21,13 +21,24 @@ import {
 	localhostHostValidation,
 	localhostOriginValidation,
 } from "../../src/node.ts";
-import { definition } from "./everything-server.ts";
+import { changeNotifier, definition } from "./everything-server.ts";
+
+/** The upstream serves in-process; capture its handler so the trigger tools can publish. */
+const upstream: typeof definition = {
+	handler(options) {
+		const handler = definition.handler(options);
+		changeNotifier.tools = () => handler.notify.toolsChanged();
+		changeNotifier.prompts = () => handler.notify.promptsChanged();
+		return handler;
+	},
+	instantiate: definition.instantiate.bind(definition),
+} as typeof definition;
 
 const manager = new McpConnectionManager<"up">();
 manager.register(
 	inProcessConnection({
 		id: "up",
-		definition,
+		definition: upstream,
 		era: "modern",
 		autoRefreshCatalog: { debounceMs: 0, minIntervalMs: 0 },
 	}),

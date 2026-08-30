@@ -34,6 +34,7 @@ import {
 	errorResult,
 	fromJsonSchema,
 	imageContent,
+	clientIdentity,
 	inputRequired,
 	inputResponse,
 	jsonResult,
@@ -45,6 +46,7 @@ import {
 	toolResult,
 	userMessage,
 	type CallToolResult,
+	type InputRequest,
 	type InputRequiredResult,
 	type ServerContext,
 } from "../../src/server.ts";
@@ -66,7 +68,10 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * server is required to have (spec: basic/patterns/mrtr, server requirements 4–5). The key is
  * per-process because one process serves every round of a flow here.
  */
-const requestStateCodec = createRequestStateCodec<{ readonly tool: string }>({
+const requestStateCodec = createRequestStateCodec<{
+	readonly tool: string;
+	readonly round?: number;
+}>({
 	key: new Uint8Array(32).fill(7),
 });
 
@@ -365,16 +370,36 @@ const jsonSchema2020Tool = defineTool(
 	"json_schema_2020_12_tool",
 	{
 		description: "Tool with JSON Schema 2020-12 features",
-		inputSchema: fromJsonSchema<{ name?: string; address?: { street?: string; city?: string } }>({
+		// The canonical SEP-1613/SEP-2106 fixture: `$schema`, `$defs` with `$anchor`, `$ref`,
+		// top-level `allOf` with a nested `anyOf`, sibling `if`/`then`/`else`, and
+		// `additionalProperties: false` — all advertised verbatim by `fromJsonSchema`.
+		inputSchema: fromJsonSchema<{
+			name?: string;
+			address?: { street?: string; city?: string };
+			contactMethod?: "email" | "phone";
+			phone?: string;
+			email?: string;
+		}>({
 			$schema: "https://json-schema.org/draft/2020-12/schema",
 			type: "object",
 			$defs: {
 				address: {
+					$anchor: "addressDef",
 					type: "object",
 					properties: { street: { type: "string" }, city: { type: "string" } },
 				},
 			},
-			properties: { name: { type: "string" }, address: { $ref: "#/$defs/address" } },
+			properties: {
+				name: { type: "string" },
+				address: { $ref: "#/$defs/address" },
+				contactMethod: { type: "string", enum: ["phone", "email"] },
+				phone: { type: "string" },
+				email: { type: "string" },
+			},
+			allOf: [{ anyOf: [{ required: ["phone"] }, { required: ["email"] }] }],
+			if: { properties: { contactMethod: { const: "phone" } }, required: ["contactMethod"] },
+			then: { required: ["phone"] },
+			else: { required: ["email"] },
 			additionalProperties: false,
 		}),
 	},
@@ -556,6 +581,416 @@ const imagePrompt = definePrompt(
 // The definition
 // =============================================================================================
 
+// =============================================================================================
+// 2026-07-28 scenarios — SEP-2322 input-required results (input-required-result-*)
+// =============================================================================================
+
+/** Validated `user_name` elicitation gate shared by the A1-family scenarios. */
+function elicitName(message: string): InputRequiredResult {
+	return inputRequired({
+		inputRequests: {
+			// The scenario asserts this literal key.
+			user_name: inputRequired.elicit({
+				message,
+				requestedSchema: {
+					type: "object",
+					properties: { name: { type: "string", description: "Your name" } },
+					required: ["name"],
+				},
+			}),
+		},
+	});
+}
+
+// input-required-result-basic-elicitation / -result-type / -missing-input-response /
+// -ignore-extra-params / -validate-input all drive this one tool. Contract points: the
+// inputRequests key is literally `user_name`; completion is gated on a VALID accepted response
+// under that key (an unknown key or a malformed value re-requests via a fresh
+// InputRequiredResult); no requestState is minted, so retries arrive without one.
+const irElicitation = defineTool(
+	"test_input_required_result_elicitation",
+	{ description: "Requests the user name via an embedded elicitation and greets them." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const content = acceptedContent<{ name?: unknown }>(ctx.mcpReq.inputResponses, "user_name");
+		if (content === undefined || typeof content.name !== "string") {
+			return elicitName("What is your name?");
+		}
+		return toolResult(textContent(`Hello, ${content.name}!`));
+	},
+);
+
+// input-required-result-basic-sampling — the key name is scenario-arbitrary.
+const irSampling = defineTool(
+	"test_input_required_result_sampling",
+	{ description: "Requests one LLM completion via an embedded sampling request." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const view = inputResponse(ctx.mcpReq.inputResponses, "sample_request");
+		if (view.kind !== "sampling") {
+			return inputRequired({
+				inputRequests: {
+					sample_request: inputRequired.createMessage({
+						messages: [
+							{ role: "user", content: { type: "text", text: "What is the capital of France?" } },
+						],
+						maxTokens: 100,
+					}),
+				},
+			});
+		}
+		const raw: unknown = view.result.content;
+		const blocks: readonly unknown[] = Array.isArray(raw) ? raw : [raw];
+		const text = blocks.map((block) => (isTextBlock(block) ? block.text : "")).join("");
+		return toolResult(textContent(`Sampled: ${text}`));
+	},
+);
+
+// input-required-result-basic-list-roots
+const irListRoots = defineTool(
+	"test_input_required_result_list_roots",
+	{ description: "Requests the client's roots via an embedded roots/list request." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const view = inputResponse(ctx.mcpReq.inputResponses, "roots_request");
+		if (view.kind !== "roots") {
+			return inputRequired({
+				inputRequests: { roots_request: inputRequired.listRoots() },
+			});
+		}
+		const uris = view.roots.map((root) => root.uri).join(", ");
+		return toolResult(textContent(`Roots: ${uris}`));
+	},
+);
+
+// input-required-result-request-state — the round MUST carry a string requestState; it is
+// minted (and later verified) by the fixture's HMAC codec.
+const irRequestState = defineTool(
+	"test_input_required_result_request_state",
+	{ description: "Round-trips integrity-protected request state with a confirmation." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const content = acceptedContent<{ ok?: unknown }>(ctx.mcpReq.inputResponses, "confirm");
+		if (content === undefined) {
+			return inputRequired({
+				inputRequests: {
+					confirm: inputRequired.elicit({
+						message: "Proceed?",
+						requestedSchema: {
+							type: "object",
+							properties: { ok: { type: "boolean" } },
+							required: ["ok"],
+						},
+					}),
+				},
+				requestState: await requestStateCodec.mint(
+					{ tool: "test_input_required_result_request_state" },
+					ctx,
+				),
+			});
+		}
+		return toolResult(textContent(`state-ok: confirmed=${String(content.ok)}`));
+	},
+);
+
+// input-required-result-multiple-input-requests — one round carrying all three request kinds
+// plus requestState; any-of completion once the responses arrive.
+const irMultipleInputs = defineTool(
+	"test_input_required_result_multiple_inputs",
+	{ description: "Requests elicitation, sampling, and roots in a single round." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const name = acceptedContent<{ name?: unknown }>(ctx.mcpReq.inputResponses, "user_name");
+		const sample = inputResponse(ctx.mcpReq.inputResponses, "greeting");
+		const roots = inputResponse(ctx.mcpReq.inputResponses, "client_roots");
+		if (name === undefined && sample.kind === "missing" && roots.kind === "missing") {
+			return inputRequired({
+				inputRequests: {
+					user_name: inputRequired.elicit({
+						message: "Name?",
+						requestedSchema: {
+							type: "object",
+							properties: { name: { type: "string" } },
+							required: ["name"],
+						},
+					}),
+					greeting: inputRequired.createMessage({
+						messages: [{ role: "user", content: { type: "text", text: "Say hello." } }],
+						maxTokens: 50,
+					}),
+					client_roots: inputRequired.listRoots(),
+				},
+				requestState: await requestStateCodec.mint(
+					{ tool: "test_input_required_result_multiple_inputs" },
+					ctx,
+				),
+			});
+		}
+		return toolResult(textContent("All inputs received."));
+	},
+);
+
+// input-required-result-multi-round — three rounds; the state changes every round (the round
+// number is inside the signed payload) and the final round completes.
+const irMultiRound = defineTool(
+	"test_input_required_result_multi_round",
+	{ description: "Collects input over two sequential rounds before completing." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const state = ctx.mcpReq.requestState<{ tool?: string; round?: number }>();
+		const round = state?.round ?? 0;
+		if (round === 0) {
+			return inputRequired({
+				inputRequests: {
+					step1: inputRequired.elicit({
+						message: "Step 1: your name?",
+						requestedSchema: {
+							type: "object",
+							properties: { name: { type: "string" } },
+							required: ["name"],
+						},
+					}),
+				},
+				requestState: await requestStateCodec.mint(
+					{ tool: "test_input_required_result_multi_round", round: 1 },
+					ctx,
+				),
+			});
+		}
+		if (round === 1) {
+			return inputRequired({
+				inputRequests: {
+					step2: inputRequired.elicit({
+						message: "Step 2: favourite colour?",
+						requestedSchema: {
+							type: "object",
+							properties: { color: { type: "string" } },
+							required: ["color"],
+						},
+					}),
+				},
+				requestState: await requestStateCodec.mint(
+					{ tool: "test_input_required_result_multi_round", round: 2 },
+					ctx,
+				),
+			});
+		}
+		return toolResult(textContent("Multi-round flow complete."));
+	},
+);
+
+// input-required-result-tampered-state — the codec's `verify` hook (ServerOptions.requestState)
+// rejects the tampered string before re-entry; the seam answers with a JSON-RPC error, which is
+// exactly what the scenario requires. The handler itself never sees the tampered round.
+const irTamperedState = defineTool(
+	"test_input_required_result_tampered_state",
+	{ description: "Round-trips signed state; tampered state is rejected at the seam." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const content = acceptedContent<{ ok?: unknown }>(ctx.mcpReq.inputResponses, "confirm");
+		if (content === undefined) {
+			return inputRequired({
+				inputRequests: {
+					confirm: inputRequired.elicit({
+						message: "Confirm?",
+						requestedSchema: {
+							type: "object",
+							properties: { ok: { type: "boolean" } },
+							required: ["ok"],
+						},
+					}),
+				},
+				requestState: await requestStateCodec.mint(
+					{ tool: "test_input_required_result_tampered_state" },
+					ctx,
+				),
+			});
+		}
+		return toolResult(textContent("State verified."));
+	},
+);
+
+// input-required-result-capability-check — only request kinds the CLIENT DECLARED (per-request
+// `_meta` envelope) are embedded; with `{ sampling: {} }` the round is sampling-only.
+const irCapabilities = defineTool(
+	"test_input_required_result_capabilities",
+	{ description: "Embeds only the input requests the client's declared capabilities allow." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const elicited = acceptedContent<Record<string, unknown>>(
+			ctx.mcpReq.inputResponses,
+			"elicit_input",
+		);
+		const sampled = inputResponse(ctx.mcpReq.inputResponses, "sample_input");
+		if (elicited !== undefined || sampled.kind === "sampling") {
+			return toolResult(textContent("Capability-scoped inputs received."));
+		}
+		const capabilities = clientIdentity(ctx).clientCapabilities ?? {};
+		const requests: Record<string, InputRequest> = {};
+		if (capabilities.elicitation !== undefined) {
+			requests["elicit_input"] = inputRequired.elicit({
+				message: "Provide input",
+				requestedSchema: {
+					type: "object",
+					properties: { value: { type: "string" } },
+					required: ["value"],
+				},
+			});
+		}
+		if (capabilities.sampling !== undefined) {
+			requests["sample_input"] = inputRequired.createMessage({
+				messages: [{ role: "user", content: { type: "text", text: "Say hi." } }],
+				maxTokens: 50,
+			});
+		}
+		if (Object.keys(requests).length === 0) {
+			return toolResult(textContent("The client declared no input capabilities."));
+		}
+		return inputRequired({
+			inputRequests: requests,
+			requestState: await requestStateCodec.mint(
+				{ tool: "test_input_required_result_capabilities" },
+				ctx,
+			),
+		});
+	},
+);
+
+// input-required-result-non-tool-request — MRTR on `prompts/get`.
+const irPrompt = definePrompt(
+	"test_input_required_result_prompt",
+	{ description: "A prompt that elicits context before rendering." },
+	async (ctx) => {
+		const content = acceptedContent<{ context?: unknown }>(
+			ctx.mcpReq.inputResponses,
+			"user_context",
+		);
+		if (content === undefined || typeof content.context !== "string") {
+			return inputRequired({
+				inputRequests: {
+					user_context: inputRequired.elicit({
+						message: "What context should the prompt use?",
+						requestedSchema: {
+							type: "object",
+							properties: { context: { type: "string" } },
+							required: ["context"],
+						},
+					}),
+				},
+			});
+		}
+		return promptResult(userMessage(`Prompt with context: ${content.context}`));
+	},
+);
+
+// =============================================================================================
+// 2026-07-28 scenarios — SEP-2575 server-stateless probes
+// =============================================================================================
+
+// server-stateless (sep-2575-server-rejects-undeclared-capability): the handler embeds a
+// sampling request; when the request's declared client capabilities lack `sampling`, the SDK
+// seam answers -32021 with the required-capabilities data — the handler result never leaves.
+const statelessMissingCapability = defineTool(
+	"test_missing_capability",
+	{ description: "Requires the sampling capability; rejected for clients that lack it." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const view = inputResponse(ctx.mcpReq.inputResponses, "sample");
+		if (view.kind !== "sampling") {
+			return inputRequired({
+				inputRequests: {
+					sample: inputRequired.createMessage({
+						messages: [{ role: "user", content: { type: "text", text: "Ping." } }],
+						maxTokens: 10,
+					}),
+				},
+			});
+		}
+		return toolResult(textContent("Sampled."));
+	},
+);
+
+// server-stateless (sep-2575-http-server-no-independent-requests-on-stream): the response
+// stream must carry the InputRequiredResult, never a pushed `elicitation/create` request.
+const statelessStreamingElicitation = defineTool(
+	"test_streaming_elicitation",
+	{ description: "Elicits via an input_required result — never a pushed server request." },
+	async (ctx): Promise<CallToolResult | InputRequiredResult> => {
+		const content = acceptedContent<{ answer?: unknown }>(ctx.mcpReq.inputResponses, "answer");
+		if (content === undefined) {
+			return inputRequired({
+				inputRequests: {
+					answer: inputRequired.elicit({
+						message: "Answer?",
+						requestedSchema: {
+							type: "object",
+							properties: { answer: { type: "string" } },
+							required: ["answer"],
+						},
+					}),
+				},
+			});
+		}
+		return toolResult(textContent("Answered."));
+	},
+);
+
+// server-stateless (sep-2575-server-no-log-without-loglevel): the log call below is suppressed
+// by the SDK unless the request's `_meta` carried a logLevel.
+const statelessLoggingTool = defineTool(
+	"test_logging_tool",
+	{ description: "Logs during execution; silent unless the request opted into logging." },
+	async (ctx) => {
+		const logger = log(ctx);
+		await logger.info("test_logging_tool ran");
+		return toolResult(textContent("Logging tool executed."));
+	},
+);
+
+/**
+ * Change-notification hooks for the SEP-2575 subscription checks. The serving entry wires this
+ * to its live handler (`handleMcp.notify.*`) — a definition alone has no bus to publish to.
+ */
+export const changeNotifier: {
+	tools?: () => unknown;
+	prompts?: () => unknown;
+} = {};
+
+// server-stateless triggers: calling these MUST push the matching list_changed notification to
+// every open `subscriptions/listen` stream whose filter asked for it.
+const statelessTriggerToolChange = defineTool(
+	"test_trigger_tool_change",
+	{ description: "Publishes a tools/list_changed event to open listen streams." },
+	async () => {
+		await changeNotifier.tools?.();
+		return toolResult(textContent("Tool list change published."));
+	},
+);
+
+const statelessTriggerPromptChange = defineTool(
+	"test_trigger_prompt_change",
+	{ description: "Publishes a prompts/list_changed event to open listen streams." },
+	async () => {
+		await changeNotifier.prompts?.();
+		return toolResult(textContent("Prompt list change published."));
+	},
+);
+
+// =============================================================================================
+// 2026-07-28 scenarios — SEP-2243 custom header validation
+// =============================================================================================
+
+// http-custom-header-server-validation: `x-mcp-header` is a plain JSON-Schema extension key on
+// the property, advertised verbatim; the SDK's modern inbound seam validates the matching
+// `Mcp-Param-Message` header (base64 wrapper, strict alphabet, header/body equality) and answers
+// 400 / -32020 on mismatch before the handler runs.
+const customHeaderTool = defineTool(
+	"test_custom_header_tool",
+	{
+		description: "Declares an x-mcp-header parameter for SEP-2243 validation.",
+		// `x-mcp-header` is a schema extension keyword the compile-time JSONSchema type does not
+		// know; the cast keeps the literal intact on the wire.
+		inputSchema: fromJsonSchema<{ message: string }>({
+			type: "object",
+			properties: { message: { type: "string", "x-mcp-header": "Message" } },
+			required: ["message"],
+			additionalProperties: false,
+		} as Parameters<typeof fromJsonSchema>[0]),
+	},
+	async ({ message }) => toolResult(textContent(`Message: ${message}`)),
+);
+
 export const definition = defineServer(
 	{ name: "kmcp-everything", version: "1.0.0" },
 	{
@@ -594,6 +1029,21 @@ export const definition = defineServer(
 			argumentsPrompt,
 			embeddedResourcePrompt,
 			imagePrompt,
+			irElicitation,
+			irSampling,
+			irListRoots,
+			irRequestState,
+			irMultipleInputs,
+			irMultiRound,
+			irTamperedState,
+			irCapabilities,
+			irPrompt,
+			statelessMissingCapability,
+			statelessStreamingElicitation,
+			statelessLoggingTool,
+			statelessTriggerToolChange,
+			statelessTriggerPromptChange,
+			customHeaderTool,
 		],
 	},
 );

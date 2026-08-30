@@ -13,12 +13,15 @@ import {
 	localhostHostValidation,
 	localhostOriginValidation,
 } from "../../src/node.ts";
-import { definition } from "./everything-server.ts";
+import { changeNotifier, definition } from "./everything-server.ts";
 
 const port = Number.parseInt(process.env["PORT"] ?? "39750", 10);
 const path = "/mcp";
 
 const handleMcp = createNodeMcpHandler(definition);
+// The SEP-2575 trigger tools publish through the live handler's listen bus.
+changeNotifier.tools = () => handleMcp.notify.toolsChanged();
+changeNotifier.prompts = () => handleMcp.notify.promptsChanged();
 // dns-rebinding-protection: a non-localhost Host/Origin MUST be answered 4xx, a localhost one 2xx.
 const validateHost = localhostHostValidation();
 const validateOrigin = localhostOriginValidation();

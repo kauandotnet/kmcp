@@ -1,25 +1,39 @@
-# MCP conformance baseline for the NIGHTLY run only
-# (`.github/workflows/conformance-nightly.yml`, unpinned
-# `npx --yes github:modelcontextprotocol/conformance … --suite all`).
+# Nightly conformance baseline — `conformance-nightly.yml` runs the UNPINNED tool
+# (github:modelcontextprotocol/conformance) with `--suite all` against
+# test/conformance/server-fixture.ts and applies this file to the first (suite) pass only. The
+# second pass (`--spec-version draft`) runs with NO baseline: it must be fully green, and some
+# scenarios (server-sse-multiple-streams) fail at 2025 semantics but pass at 2026-07-28, so the
+# passes cannot share one expected-failures file.
 #
-# Kept separate from `conformance-baseline.yml` on purpose: the nightly runs the tool's git main
-# against the `all` suite (active + pending), so it sees scenarios the pinned `active` gate never
-# runs, and its scenario set changes without a version bump. The nightly is informational — it is
-# allowed to go red and is not a merge gate.
+# Same semantics as conformance-baseline.yml: listed+failing = expected, listed+passing = stale
+# (exit 1), unlisted failure = regression (exit 1). WARNING counts as failing.
 #
-# Seeded from a real `--suite all` run against `test/conformance/server-fixture.ts` on 2026-08-28
-# with @modelcontextprotocol/conformance 0.1.16 (34 checks pass, 4 fail, 2 scenarios warn).
-# Same reading rules as the pinned baseline: FAILURE *or* WARNING counts as failing, and a listed
-# scenario that starts passing is itself a failure — prune entries as they burn down.
+# Recorded from a real run on 2026-08-29 against tool main. Every 2026-07-28 scenario
+# (input-required-result-*, server-stateless, http-custom-header-server-validation,
+# json-schema-2020-12) passes with zero failed checks.
 
 server:
-  # One root cause: the official `createMcpHandler` has no sessionful 2025-era mode
-  # (`legacy: 'stateless' | 'reject'`), so a per-request legacy instance holds no client
+  # One root cause: the official `createMcpHandler` serves 2025-era traffic per-request
+  # (`legacy: 'stateless'`), so an instance that never saw `initialize` holds no client
   # capabilities and the SDK's legacy multi-round-trip shim refuses every server-to-client leg.
-  - tools-call-sampling # legacy stateless serving cannot deliver `sampling/createMessage`
-  - tools-call-elicitation # legacy stateless serving cannot deliver `elicitation/create`
-  - elicitation-sep1034-defaults # same, for the SEP-1034 defaults schema
-  - elicitation-sep1330-enums # same, for the SEP-1330 enum variants
-  # SEP-1699 SHOULDs the stateless legacy leg does not implement (WARNING, never FAILURE).
-  - server-sse-polling # no `mcp-session-id`, no SSE priming event, no `retry:` field
-  - server-sse-multiple-streams # no `mcp-session-id` on the stateless legacy leg
+  # The same handlers pass the 2026-07-28 `input-required-result-*` scenarios.
+  - tools-call-sampling # legacy stateless serving cannot deliver `sampling/createMessage` to the client
+  - tools-call-elicitation # legacy stateless serving cannot deliver `elicitation/create` to the client
+  - elicitation-sep1034-defaults # same root cause
+  - elicitation-sep1330-enums # same root cause
+  # SDK stateless legacy SSE posture (SHOULD-level WARNINGs): no `mcp-session-id`, no priming
+  # event, no `retry:` field. Both scenarios pass at 2026-07-28 semantics (draft pass).
+  - server-sse-polling # WARNINGs from the SDK's stateless legacy SSE writer (SEP-1699 SHOULDs)
+  - server-sse-multiple-streams # WARNING: the stateless legacy leg mints no `mcp-session-id`
+  # The io.modelcontextprotocol/tasks extension is deliberately not wired: it is legacy-only on
+  # the modern wire (the 2026-07-28 codec strips `execution.taskSupport`/`capabilities.tasks`)
+  # and kmcp targets the modern revision (see ARCHITECTURE.md "Known gaps").
+  - tasks-lifecycle # tasks extension not implemented
+  - tasks-capability-negotiation # tasks extension not implemented
+  - tasks-wire-fields # tasks extension not implemented
+  - tasks-request-state-removal # tasks extension not implemented
+  - tasks-mrtr-input # tasks extension not implemented
+  - tasks-request-headers # tasks extension not implemented
+  - tasks-dispatch-and-envelope # tasks extension not implemented
+  - tasks-required-task-error # tasks extension not implemented
+  - tasks-mrtr-composition # tasks extension not implemented
