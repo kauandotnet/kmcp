@@ -19,6 +19,9 @@
  *   CONFORMANCE_PACKAGE   npx spec of the tool          (default @modelcontextprotocol/conformance@0.1.16)
  *   CONFORMANCE_SUITE     active | all | pending        (default active)
  *   CONFORMANCE_BASELINE  baseline path, repo-relative  (default conformance-baseline.yml)
+ *   CONFORMANCE_BASELINE_DRAFT  baseline for the draft pass (default: none — some scenarios,
+ *                         e.g. server-sse-multiple-streams, fail at 2025 semantics but pass at
+ *                         2026-07-28, so the two passes cannot share one expected-failures file)
  *   PORT                  fixture port                  (default 39750)
  *
  * Notes on the `draft` filter (verified against @modelcontextprotocol/conformance 0.1.16):
@@ -49,6 +52,14 @@ const url = `http://127.0.0.1:${PORT}/mcp`;
 const BOOT_TIMEOUT_MS = 60_000;
 
 const baselineArgs = existsSync(baseline) ? ["--expected-failures", baseline] : [];
+const draftBaseline =
+	process.env.CONFORMANCE_BASELINE_DRAFT === undefined
+		? undefined
+		: join(repoRoot, process.env.CONFORMANCE_BASELINE_DRAFT);
+const draftBaselineArgs =
+	draftBaseline !== undefined && existsSync(draftBaseline)
+		? ["--expected-failures", draftBaseline]
+		: [];
 
 /** Runs one conformance invocation; resolves `true` when it exits non-zero. */
 function runConformance(args) {
@@ -110,9 +121,11 @@ let server;
 let anyFailed = false;
 try {
 	server = await bootFixture();
-	const common = ["server", "--url", url, "--suite", suite, ...baselineArgs];
-	anyFailed = (await runConformance(common)) || anyFailed;
-	anyFailed = (await runConformance([...common, "--spec-version", "draft"])) || anyFailed;
+	const common = ["server", "--url", url, "--suite", suite];
+	anyFailed = (await runConformance([...common, ...baselineArgs])) || anyFailed;
+	anyFailed =
+		(await runConformance([...common, "--spec-version", "draft", ...draftBaselineArgs])) ||
+		anyFailed;
 } catch (error) {
 	console.error(`✗ ${error instanceof Error ? error.message : String(error)}`);
 	anyFailed = true;
