@@ -87,6 +87,10 @@ export interface McpConnectionSnapshot<Id extends string = string> {
 	readonly errorCode?: string;
 	readonly errorDetail?: McpErrorDetail;
 	readonly watch?: McpWatchSnapshot;
+	/** URIs with an active `resources/subscribe` on the current generation (sorted). */
+	readonly subscribedResources?: readonly string[];
+	/** Present when the definition opts into reconnection and a failure has occurred. */
+	readonly reconnect?: Readonly<{ attempts: number; nextAttemptAt?: string }>;
 	readonly catalog?: McpCatalogSnapshot;
 }
 
@@ -101,15 +105,20 @@ export type McpConnectionEventType =
 	| "catalog.failed"
 	| "catalog.refreshed"
 	| "connection.authorization.required"
+	| "connection.reconnect.exhausted"
+	| "connection.reconnect.scheduled"
 	| "connection.registered"
 	| "connection.removed"
-	| "connection.state.changed";
+	| "connection.state.changed"
+	| "resource.updated";
 
 export interface McpConnectionEvent<Id extends string = string> {
 	readonly revision: number;
 	readonly type: McpConnectionEventType;
 	readonly occurredAt: string;
 	readonly connection: McpConnectionSnapshot<Id>;
+	/** Present only on `resource.updated`: the URI the upstream reported as changed. */
+	readonly resource?: Readonly<{ uri: string }>;
 }
 
 export type McpConnectionListener<Id extends string = string> = (
@@ -177,6 +186,34 @@ export class McpToolCallError extends KmcpError {
 	}
 }
 
+/** A `CallToolResult` reduced to its stable, consumer-facing parts. */
+export interface McpParsedToolResult {
+	readonly content: readonly ContentBlock[];
+	readonly structuredContent?: Readonly<Record<string, unknown>>;
+	readonly meta?: Readonly<Record<string, unknown>>;
+	readonly isError: boolean;
+}
+
+export interface McpCallToolParsedOptions extends McpCallToolOptions {
+	/** Throw `McpToolCallError` on an `isError` result. Default: `true`. */
+	readonly raiseOnError?: boolean;
+}
+
+/** Parses a raw `CallToolResult` (optionally raising on `isError`) into `McpParsedToolResult`. */
+export function parseToolResult(result: CallToolResult, raiseOnError = true): McpParsedToolResult {
+	if (raiseOnError) throwIfToolError(result);
+	return Object.freeze({
+		content: Object.freeze([...(result.content ?? [])]),
+		...(result.structuredContent === undefined
+			? {}
+			: { structuredContent: result.structuredContent as Readonly<Record<string, unknown>> }),
+		...(result._meta === undefined
+			? {}
+			: { meta: result._meta as Readonly<Record<string, unknown>> }),
+		isError: result.isError === true,
+	});
+}
+
 /** Unwraps a `CallToolResult`, throwing `McpToolCallError` when the tool reported an error. */
 export function throwIfToolError(result: CallToolResult): CallToolResult {
 	if (result.isError === true) {
@@ -224,7 +261,16 @@ interface ManagedConnection<Id extends string> {
 	logLevel?: LoggingLevel;
 	listen?: McpSubscription;
 	autoRefresh?: AutoRefreshState;
+	subscribedUris?: Set<string>;
+	reconnect?: ReconnectState;
 	readonly drainWaiters: Set<() => void>;
+}
+
+interface ReconnectState {
+	attempts: number;
+	timer?: ReturnType<typeof setTimeout>;
+	lastSuccessAt?: number;
+	nextAttemptAt?: string;
 }
 
 interface McpCatalogBounds {
@@ -540,6 +586,135 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			},
 			options?.signal,
 			control,
+		);
+	}
+
+	/**
+	 * `callTool` with FastMCP-style ergonomics: raises `McpToolCallError` on an `isError` result
+	 * (opt out with `raiseOnError: false`) and returns the stable parsed shape. The SDK client has
+	 * already validated `structuredContent` against the tool's advertised output schema. The raw
+	 * `callTool` stays the relay primitive (gateways forward MRTR rounds through it verbatim).
+	 */
+	async callToolParsed(
+		id: Id,
+		name: string,
+		arguments_: Readonly<Record<string, unknown>> = {},
+		options?: McpCallToolParsedOptions,
+		control?: McpConnectionOperationControl,
+	): Promise<McpParsedToolResult> {
+		if (options?.allowInputRequired === true) {
+			throw new TypeError(
+				"callToolParsed cannot surface input_required results; use callTool with allowInputRequired.",
+			);
+		}
+		const { raiseOnError, ...callOptions } = options ?? {};
+		const result = await this.callTool(id, name, arguments_, callOptions, control);
+		return parseToolResult(result, raiseOnError !== false);
+	}
+
+	/**
+	 * Subscribes to `notifications/resources/updated` for one URI. On the legacy era this is the
+	 * `resources/subscribe` RPC; on 2026-07-28 that method no longer exists, so the subscription
+	 * is expressed by re-opening the `subscriptions/listen` stream with the widened
+	 * `resourceSubscriptions` filter (rolled back on failure). Updates surface as
+	 * `resource.updated` events. Subscriptions are generation-scoped: they do not survive a
+	 * reconnect — re-subscribe when the connection comes back online.
+	 */
+	subscribeResource(
+		id: Id,
+		uri: string,
+		options?: McpRequestOptionsWithMeta,
+		control?: McpConnectionOperationControl,
+	): Promise<void> {
+		if (typeof uri !== "string" || uri.length === 0) {
+			throw new TypeError("uri must be a non-empty string.");
+		}
+		return this.withClient(
+			id,
+			async (client, session) => {
+				const entry = this.#entry(id);
+				if (client.getProtocolEra() === "modern") {
+					// `resources/subscribe` does not exist on 2026-07-28: the subscription is
+					// expressed purely through the `subscriptions/listen` filter.
+					const uris = (entry.subscribedUris ??= new Set());
+					const added = !uris.has(uri);
+					uris.add(uri);
+					try {
+						await this.#relisten(entry, session);
+					} catch (error) {
+						if (added) uris.delete(uri);
+						throw new KmcpError(
+							KMCP_ERROR_CODES.OPERATION_FAILED,
+							`Updates for '${uri}' could not be honored on the modern listen stream.`,
+							{ cause: error },
+						);
+					}
+				} else {
+					await client.subscribeResource(
+						this.#params(id, { uri }, options),
+						this.#requestOptions(id, "request", options),
+					);
+					if (entry.session !== session) return;
+					(entry.subscribedUris ??= new Set()).add(uri);
+				}
+				this.#publish("connection.state.changed", entry);
+			},
+			options?.signal,
+			control,
+		);
+	}
+
+	/** Removes a resource subscription (over-delivery until the narrowed filter lands is possible). */
+	unsubscribeResource(
+		id: Id,
+		uri: string,
+		options?: McpRequestOptionsWithMeta,
+		control?: McpConnectionOperationControl,
+	): Promise<void> {
+		if (typeof uri !== "string" || uri.length === 0) {
+			throw new TypeError("uri must be a non-empty string.");
+		}
+		return this.withClient(
+			id,
+			async (client, session) => {
+				const entry = this.#entry(id);
+				if (client.getProtocolEra() === "modern") {
+					entry.subscribedUris?.delete(uri);
+					// Narrowing is best-effort: failure means over-notification, never silence.
+					await this.#relisten(entry, session).catch(() => undefined);
+				} else {
+					await client.unsubscribeResource(
+						this.#params(id, { uri }, options),
+						this.#requestOptions(id, "request", options),
+					);
+					if (entry.session !== session) return;
+					entry.subscribedUris?.delete(uri);
+				}
+				this.#publish("connection.state.changed", entry);
+			},
+			options?.signal,
+			control,
+		);
+	}
+
+	/**
+	 * Tells the upstream this client's roots changed (`notifications/roots/list_changed`).
+	 * Legacy-era only: the 2026-07-28 wire removed the roots feature (SEP-2577), so a modern
+	 * connection rejects instead of silently dropping the notification.
+	 */
+	notifyRootsChanged(id: Id, signal?: AbortSignal): Promise<void> {
+		return this.withClient(
+			id,
+			async (client) => {
+				if (client.getProtocolEra() === "modern") {
+					throw new KmcpError(
+						KMCP_ERROR_CODES.OPERATION_FAILED,
+						"Roots are a legacy-era feature; the 2026-07-28 wire has no roots/list_changed.",
+					);
+				}
+				await client.sendRootsListChanged();
+			},
+			signal,
 		);
 	}
 
@@ -961,10 +1136,15 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			transport = await definition.openTransport();
 			let liveSession: McpClientSession<Id> | undefined;
 			const listChanged = this.#listChangedHandlers(entry, () => liveSession);
-			const client = createOfficialClient(
-				definition,
-				listChanged === undefined ? {} : { listChanged },
-			);
+			const client = createOfficialClient(definition, {
+				...(listChanged === undefined ? {} : { listChanged }),
+				onResourceUpdated: (notification) => {
+					if (liveSession === undefined || entry.session !== liveSession) return;
+					this.#publish("resource.updated", entry, {
+						resource: Object.freeze({ uri: notification.params.uri }),
+					});
+				},
+			});
 			session = new McpClientSession(definition.id, client);
 			liveSession = session;
 			client.onclose = () => {
@@ -974,6 +1154,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					entry.errorCode = KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE;
 					delete entry.errorDetail;
 					this.#transition(entry, "failed");
+					this.#scheduleReconnect(entry);
 				}
 			};
 			await client.connect(transport, this.#connectOptions(entry));
@@ -983,6 +1164,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			entry.generation = generation;
 			delete entry.catalog;
 			delete entry.autoRefresh;
+			delete entry.subscribedUris;
+			if (entry.reconnect !== undefined) {
+				entry.reconnect.lastSuccessAt = this.#now();
+				if (definition.reconnect?.resetAfterMs === undefined) entry.reconnect.attempts = 0;
+				delete entry.reconnect.nextAttemptAt;
+			}
 			entry.connectedAt = isoTimestamp(this.#now);
 			delete entry.errorCode;
 			delete entry.errorDetail;
@@ -1118,6 +1305,71 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	}
 
 	/**
+	 * Schedules an automatic reconnect after an UNEXPECTED close, per the definition's `reconnect`
+	 * policy. The timer callback re-enters the PUBLIC `connect()` — single-flight dedupe,
+	 * queue-behind-disconnect, removal/quarantine/authorizing rejection, and the fresh-generation
+	 * discipline are all inherited rather than re-implemented. Deliberate lifecycle transitions
+	 * cancel the pending timer at the `#transition` chokepoint.
+	 */
+	#scheduleReconnect(entry: ManagedConnection<Id>): void {
+		const policy = entry.definition.reconnect;
+		if (policy === undefined || this.#closed) return;
+		if (entry.phase !== "failed") return;
+		if (entry.removeTask !== undefined || entry.disconnectTask !== undefined) return;
+		if (entry.pendingAuthorization !== undefined || entry.quarantinedCleanup !== undefined) return;
+		const state = (entry.reconnect ??= { attempts: 0 });
+		if (state.timer !== undefined) return;
+		if (
+			policy.resetAfterMs !== undefined &&
+			state.lastSuccessAt !== undefined &&
+			this.#now() - state.lastSuccessAt >= policy.resetAfterMs
+		) {
+			state.attempts = 0;
+		}
+		if (state.attempts >= policy.maxAttempts) {
+			delete state.nextAttemptAt;
+			this.#publish("connection.reconnect.exhausted", entry);
+			return;
+		}
+		let delay = Math.min(policy.maxMs, policy.initialMs * policy.factor ** state.attempts);
+		if (policy.jitter) delay *= 0.5 + Math.random() * 0.5;
+		state.attempts += 1;
+		state.nextAttemptAt = isoTimestamp(() => this.#now() + delay);
+		const timer = setTimeout(() => {
+			if (entry.reconnect === state) {
+				delete state.timer;
+				delete state.nextAttemptAt;
+			}
+			if (this.#closed || entry.reconnect !== state) return;
+			if (
+				entry.phase !== "failed" ||
+				entry.removeTask !== undefined ||
+				entry.disconnectTask !== undefined
+			) {
+				return;
+			}
+			try {
+				void this.connect(entry.definition.id).then(undefined, () =>
+					this.#scheduleReconnect(entry),
+				);
+			} catch {
+				this.#scheduleReconnect(entry);
+			}
+		}, delay);
+		timer.unref?.();
+		state.timer = timer;
+		this.#publish("connection.reconnect.scheduled", entry);
+	}
+
+	#cancelReconnectTimer(entry: ManagedConnection<Id>): void {
+		const state = entry.reconnect;
+		if (state === undefined) return;
+		if (state.timer !== undefined) clearTimeout(state.timer);
+		delete state.timer;
+		delete state.nextAttemptAt;
+	}
+
+	/**
 	 * A connect that adopted a `prior` verdict registers the list-changed handlers but does not
 	 * open the modern `subscriptions/listen` stream; open it here so auto-refresh keeps working.
 	 */
@@ -1130,18 +1382,54 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		) {
 			return;
 		}
-		const capabilities = client.getServerCapabilities();
-		const filter: SubscriptionFilter = {
-			...(capabilities?.tools?.listChanged === true ? { toolsListChanged: true } : {}),
-			...(capabilities?.prompts?.listChanged === true ? { promptsListChanged: true } : {}),
-			...(capabilities?.resources?.listChanged === true ? { resourcesListChanged: true } : {}),
-		};
-		if (Object.keys(filter).length === 0) return;
+		if (Object.keys(this.#listenFilter(entry, client)).length === 0) return;
 		try {
-			entry.listen = await client.listen(filter);
+			await this.#relisten(entry, session);
 		} catch {
 			delete entry.listen;
 		}
+	}
+
+	#listenFilter(entry: ManagedConnection<Id>, client: Client): SubscriptionFilter {
+		const auto = entry.definition.autoRefreshCatalog !== undefined;
+		const capabilities = client.getServerCapabilities();
+		return {
+			...(auto && capabilities?.tools?.listChanged === true ? { toolsListChanged: true } : {}),
+			...(auto && capabilities?.prompts?.listChanged === true ? { promptsListChanged: true } : {}),
+			...(auto && capabilities?.resources?.listChanged === true
+				? { resourcesListChanged: true }
+				: {}),
+			...(entry.subscribedUris !== undefined && entry.subscribedUris.size > 0
+				? { resourceSubscriptions: [...entry.subscribedUris].sort() }
+				: {}),
+		};
+	}
+
+	/**
+	 * (Re-)opens the manager-owned modern listen stream so its filter matches the current
+	 * list-changed policy plus the subscribed resource URIs (the SDK's bare `resources/subscribe`
+	 * never widens the filter, so a modern subscription delivers nothing without this). The new
+	 * stream opens BEFORE the old one closes — over-delivery in the overlap, never a gap — and
+	 * the SDK's own auto-opened stream is closed so list changes are not double-delivered.
+	 */
+	async #relisten(entry: ManagedConnection<Id>, session: McpClientSession<Id>): Promise<void> {
+		const client = session.client;
+		if (client.getProtocolEra() !== "modern" || entry.session !== session) return;
+		const filter = this.#listenFilter(entry, client);
+		const previous = entry.listen;
+		if (Object.keys(filter).length === 0) {
+			delete entry.listen;
+			await previous?.close().catch(() => undefined);
+			return;
+		}
+		const next = await client.listen(filter);
+		if (entry.session !== session) {
+			await next.close().catch(() => undefined);
+			return;
+		}
+		entry.listen = next;
+		await previous?.close().catch(() => undefined);
+		await client.autoOpenedSubscription?.close().catch(() => undefined);
 	}
 
 	async #performRemove(entry: ManagedConnection<Id>): Promise<void> {
@@ -1209,6 +1497,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			// Close subscriptions before the client so kmcp's own teardown reads as 'local'.
 			await entry.listen?.close().catch(() => undefined);
 			delete entry.listen;
+			delete entry.subscribedUris;
 			await session.client.autoOpenedSubscription?.close().catch(() => undefined);
 			await session.close();
 			delete entry.session;
@@ -1295,18 +1584,24 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			entry.catalogRevision += 1;
 		}
 		if (phase !== "online" && phase !== "degraded") this.#cancelAutoRefresh(entry);
+		if (phase !== "failed") this.#cancelReconnectTimer(entry);
 		entry.phase = phase;
 		entry.lastTransitionAt = isoTimestamp(this.#now);
 		this.#publish("connection.state.changed", entry);
 	}
 
-	#publish(type: McpConnectionEventType, entry: ManagedConnection<Id>): void {
+	#publish(
+		type: McpConnectionEventType,
+		entry: ManagedConnection<Id>,
+		extra: Pick<McpConnectionEvent<Id>, "resource"> = {},
+	): void {
 		this.#revision += 1;
 		const event: McpConnectionEvent<Id> = Object.freeze({
 			revision: this.#revision,
 			type,
 			occurredAt: isoTimestamp(this.#now),
 			connection: this.#snapshotEntry(entry),
+			...(extra.resource === undefined ? {} : { resource: extra.resource }),
 		});
 		for (const listener of this.#listeners) {
 			try {
@@ -1354,6 +1649,19 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			...(entry.errorCode === undefined ? {} : { errorCode: entry.errorCode }),
 			...(entry.errorDetail === undefined ? {} : { errorDetail: entry.errorDetail }),
 			...(watch === undefined ? {} : { watch }),
+			...(entry.subscribedUris === undefined || entry.subscribedUris.size === 0
+				? {}
+				: { subscribedResources: Object.freeze([...entry.subscribedUris].sort()) }),
+			...(entry.reconnect === undefined || entry.definition.reconnect === undefined
+				? {}
+				: {
+						reconnect: Object.freeze({
+							attempts: entry.reconnect.attempts,
+							...(entry.reconnect.nextAttemptAt === undefined
+								? {}
+								: { nextAttemptAt: entry.reconnect.nextAttemptAt }),
+						}),
+					}),
 			...(entry.catalog === undefined ? {} : { catalog: entry.catalog }),
 		});
 	}
@@ -1380,7 +1688,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		const era = client.getProtocolEra();
 		let honored: readonly McpCatalogCapability[];
 		if (era === "modern") {
-			const filter = (client.autoOpenedSubscription ?? entry.listen)?.honoredFilter;
+			const filter = (entry.listen ?? client.autoOpenedSubscription)?.honoredFilter;
 			honored =
 				filter === undefined
 					? []

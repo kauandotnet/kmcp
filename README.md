@@ -156,7 +156,80 @@ const hardened = server.transform(
 `decorateHandlers` with the built-ins `timeout`, `abortable`, `logCalls`, `rateLimit`, `sizeLimit`,
 `cacheCalls`, and `composeTransforms`. Every decorator passes an `InputRequiredResult` through
 untouched. `definition.mount(child, { prefix })` composes definitions and rejects a child with a
-`setup` hook unless `allowSetup: true`.
+`setup` hook unless `allowSetup: true`; `mount({ prefix, uriNamespace: { schemes } })` (or the
+standalone `namespaceUris`) additionally namespaces resource URIs by prefixing the first path
+segment of the allowlisted schemes, mapping reads back and re-projecting `contents[].uri`.
+
+`transformTool(definition, { name?, description?, args? })` derives a new canonical tool whose
+ADVERTISED input schema is rewritten — arguments renamed, re-described, or hidden (a hidden required
+argument needs a `default`, injected on every call) — while validation and the original handler keep
+the underlying shape. `transformTools({ name: options })` applies a map and refuses unknown names.
+
+### Middleware, visibility, providers
+
+Three per-request seams live on the server definition and compose with `admit()`:
+
+```ts
+import {
+	authorize,
+	connectionProvider,
+	disable,
+	enable,
+	maskErrorDetails,
+	requireScopes,
+	tokenBucketMiddleware,
+} from "kmcp"; // middleware/visibility from kmcp/server; providers from kmcp/gateway
+
+const definition = defineServer(
+	{ name: "front", version: "1.0.0" },
+	{
+		capabilities: [localTool],
+		middleware: [
+			tokenBucketMiddleware({ capacity: 20, refillPerSecond: 5 }),
+			maskErrorDetails({ onerror: report }),
+			authorize(requireScopes("mcp:call")),
+		],
+		visibility: [disable({}), enable({ tags: ["public"] })],
+		providers: [connectionProvider(manager, "github")],
+		declare: ["tool", "prompt", "resource", "resource-template"],
+	},
+);
+```
+
+- **Middleware** wraps every capability handler at materialization (outermost first) and sees the
+  request context (`era`, `authInfo`) that `decorateHandlers` cannot; decorator wrappers baked into
+  a definition run inside the chain. Built-ins: `logMiddleware`, `timingMiddleware`,
+  `tokenBucketMiddleware`, `maskErrorDetails`, `responseLimit` — all pass `InputRequiredResult`
+  through untouched.
+- **Visibility** rules run left to right, last match wins; an empty selector matches everything, so
+  `[disable({}), enable({ tags: ["public"] })]` is an allowlist. Hidden capabilities are simply not
+  installed for that request.
+- **Providers** are per-request capability sources (`(context) => definitions`). They require an
+  explicit `declare` (advertisement is fixed at construction), fail the materialization closed
+  (`PROVIDER_FAILED`) instead of silently shrinking the catalog, and collide with static keys as
+  `CAPABILITY_DUPLICATE`. `connectionProvider(manager, id)` / `hubProvider(hubs, hubId)` project a
+  managed connection or hub catalog into the definition with generation/fingerprint-fenced calls;
+  `notifyOnCatalogChange(source, handler)` bridges catalog changes to list-changed notifications.
+
+Authorization helpers: `requireScopes` (reports `missingScopes`), `requireRoles(extract, ...)`,
+`allOf` / `anyOf` (scope shortfalls aggregate conservatively — aggregation stops at the first opaque
+failure), `restrictTag(tag, ...scopes)` as a definition transform, and `authorize(...)` as call-time
+middleware raising `McpInsufficientScopeError`.
+
+### Discovery transforms
+
+`searchTools(definition, { scorer: "bm25" | "regex", maxResults, alwaysVisible })` replaces the tool
+catalog with `search_tools` + `call_tool` meta-tools so a large catalog costs two schemas. Both
+resolve against the same per-request ADMITTED set, so visibility and per-capability auth keep
+holding — a tool the principal cannot see cannot be found or called through the proxy. BM25 is built
+in (zero dependencies). `resourcesAsTools(definition)` and `promptsAsTools(definition)` synthesize
+`readOnlyHint` list/read/render tools for tool-only clients.
+
+### Lifespan
+
+`serveWithLifespan({ start, stop }, (state) => serveMcpHttp(...))` scopes process-level resources to
+a serving entry: `start()` runs first, `stop(state)` runs after the returned handle's `close()`,
+with `AggregateError` on double failure.
 
 ## Auth
 
@@ -256,17 +329,28 @@ Definition options: `requestHandlers` (`elicitation/create`, `roots/list`, `samp
 sampling), `notificationHandlers`, `roots`, `inputRequired` (an explicit small `maxRounds` is
 required when handlers exist), `autoRefreshCatalog` (single-flight, minimum interval, per-generation
 cap; works on both eras and repairs the listen stream after a `prior` reconnect), `defaults`
-(millisecond timeouts, progress), `logLevel` (stamped per request on the modern era), `oauth`.
-`httpConnection` accepts a bearer string, an SDK `AuthProvider`, or an `OAuthClientProvider`;
-`headers` may not carry `Authorization` next to `auth`; `cachePartition` defaults to a digest of the
-credential identity.
+(millisecond timeouts, progress), `logLevel` (stamped per request on the modern era), `oauth`,
+`reconnect` (opt-in backoff after an UNEXPECTED close — every attempt re-enters the public
+`connect()`, so single-flight, drain queuing, and generation discipline are inherited; snapshots
+expose `reconnect.attempts`/`nextAttemptAt` and the manager emits `connection.reconnect.scheduled` /
+`connection.reconnect.exhausted`), and `configureClient` (a synchronous escape hatch over the
+freshly constructed official `Client` before `connect()`). `httpConnection` accepts a bearer string,
+an SDK `AuthProvider`, or an `OAuthClientProvider`; `headers` may not carry `Authorization` next to
+`auth`; `cachePartition` defaults to a digest of the credential identity.
 
 Manager verbs take the SDK request option types plus `meta` (`_meta` passthrough) and an optional
-generation/fingerprint `control`: `callTool`, `readResource`, `getPrompt`, `complete`, `listTools`,
-`listResources`, `listResourceTemplates`, `listPrompts`, `ping` (`server/discover` on modern, `ping`
-on legacy), `setLogLevel`, `connectAll`, `completeAuthorization`. Snapshots carry `instructions`,
-`serverInfo`, `errorDetail { kind, code }` (so a panel can tell "server is 2025-only" from "401"),
-and `watch` (which list-changed sections are honored and why not).
+generation/fingerprint `control`: `callTool`, `callToolParsed` (raises `McpToolCallError` on
+`isError` unless `raiseOnError: false`; the SDK has already validated `structuredContent`),
+`readResource`, `getPrompt`, `complete`, `listTools`, `listResources`, `listResourceTemplates`,
+`listPrompts`, `ping` (`server/discover` on modern, `ping` on legacy), `setLogLevel`,
+`subscribeResource` / `unsubscribeResource` (legacy sends the RPC; 2026-07-28 has no
+`resources/subscribe`, so the subscription is expressed through the `subscriptions/listen` filter —
+updates surface as `resource.updated` events and subscriptions are generation-scoped, so
+re-subscribe after a reconnect), `notifyRootsChanged` (legacy-era only — the 2026 wire removed
+roots), `connectAll`, `completeAuthorization`. The hub mirrors `callToolParsed` and injects the
+resolved catalog `Tool` as `toolDefinition`. Snapshots carry `instructions`, `serverInfo`,
+`errorDetail { kind, code }` (so a panel can tell "server is 2025-only" from "401"), and `watch`
+(which list-changed sections are honored and why not).
 
 Catalogs are capability-aware and partial (`fresh` / `stale` / `failed` / `unsupported` per
 section), bounded, detached and deeply frozen. Snapshots exclude transports, endpoints, OAuth

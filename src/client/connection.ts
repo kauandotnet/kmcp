@@ -105,6 +105,43 @@ export type McpResolvedAutoRefreshOptions = Readonly<
 	Required<Omit<McpAutoRefreshOptions, "debounceMs">> & Pick<McpAutoRefreshOptions, "debounceMs">
 >;
 
+export interface McpReconnectBackoffOptions {
+	/** Delay before the first retry (ms). */
+	readonly initialMs: number;
+	/** Delay ceiling (ms). Default: 30000. */
+	readonly maxMs?: number;
+	/** Exponential growth factor. Default: 2. */
+	readonly factor?: number;
+	/** Randomize each delay into `[delay/2, delay]` to avoid thundering herds. Default: `true`. */
+	readonly jitter?: boolean;
+}
+
+/**
+ * Opt-in automatic reconnection after an UNEXPECTED close of an online connection. Deliberate
+ * lifecycle (disconnect, remove, drain, close) never reconnects, and every attempt re-enters the
+ * manager's public `connect()` — single-flight, drain queuing, and generation discipline are
+ * inherited, not re-implemented.
+ */
+export interface McpReconnectOptions {
+	readonly maxAttempts: number;
+	readonly backoff: McpReconnectBackoffOptions;
+	/**
+	 * Reset the attempt counter when the connection had been up for at least this long (ms).
+	 * Absent: the counter resets on every successful connect.
+	 */
+	readonly resetAfterMs?: number;
+}
+
+/** `McpReconnectOptions` with defaults applied (the shape stored on a definition). */
+export interface McpResolvedReconnectOptions {
+	readonly maxAttempts: number;
+	readonly initialMs: number;
+	readonly maxMs: number;
+	readonly factor: number;
+	readonly jitter: boolean;
+	readonly resetAfterMs?: number;
+}
+
 export interface McpConnectionDefinitionOptions<Id extends string> {
 	readonly id: Id;
 	readonly label?: string;
@@ -126,6 +163,14 @@ export interface McpConnectionDefinitionOptions<Id extends string> {
 	readonly inputRequired?: InputRequiredOptions & { readonly maxRounds: number };
 	/** Refresh the catalog when the upstream announces a list change (both eras). */
 	readonly autoRefreshCatalog?: boolean | McpAutoRefreshOptions;
+	/** Reconnect automatically after an unexpected close (see `McpReconnectOptions`). */
+	readonly reconnect?: McpReconnectOptions;
+	/**
+	 * Raw escape hatch: runs on the freshly constructed official `Client` after every typed
+	 * handler is installed and BEFORE `connect()`. Synchronous by design — an async hook would
+	 * push construction into the connect critical section.
+	 */
+	readonly configureClient?: (client: Client) => void;
 	readonly defaults?: McpRequestDefaults;
 	/** Initial log level stamped on modern requests (`_meta["io.modelcontextprotocol/logLevel"]`). */
 	readonly logLevel?: LoggingLevel;
@@ -146,12 +191,14 @@ export class McpConnectionDefinition<const Id extends string = string> {
 	readonly connectOptions: ConnectOptions | undefined;
 	readonly defaults: McpRequestDefaults;
 	readonly autoRefreshCatalog: McpResolvedAutoRefreshOptions | undefined;
+	readonly reconnect: McpResolvedReconnectOptions | undefined;
 	readonly logLevel: LoggingLevel | undefined;
 	readonly #transportFactory: McpTransportFactory;
 	readonly #requestHandlers: McpClientRequestHandlers;
 	readonly #notificationHandlers: McpClientNotificationHandlers;
 	readonly #roots: McpRootsSource | undefined;
 	readonly #oauth: OAuthClientProvider | undefined;
+	readonly #configureClient: ((client: Client) => void) | undefined;
 
 	constructor(options: McpConnectionDefinitionOptions<Id>) {
 		assertNonEmpty(options.id, "connection id");
@@ -201,6 +248,11 @@ export class McpConnectionDefinition<const Id extends string = string> {
 		}
 		this.defaults = Object.freeze({ ...options.defaults });
 		this.autoRefreshCatalog = normalizeAutoRefresh(options.autoRefreshCatalog);
+		this.reconnect = normalizeReconnect(options.reconnect);
+		if (options.configureClient !== undefined && typeof options.configureClient !== "function") {
+			throw new TypeError("configureClient must be a function.");
+		}
+		this.#configureClient = options.configureClient;
 		this.logLevel = options.logLevel;
 		this.clientOptions = Object.freeze({
 			enforceStrictCapabilities: true,
@@ -232,12 +284,27 @@ export class McpConnectionDefinition<const Id extends string = string> {
 	}
 
 	/** Registers this definition's server→client handlers and roots on a freshly constructed client. */
-	installHandlers(client: Client): void {
+	installHandlers(client: Client, overrides: McpOfficialClientOverrides = {}): void {
 		for (const [method, handler] of Object.entries(this.#requestHandlers)) {
 			client.setRequestHandler(method as McpClientRequestMethod, handler as never);
 		}
+		const observer = overrides.onResourceUpdated;
 		for (const [method, handler] of Object.entries(this.#notificationHandlers)) {
+			if (method === "notifications/resources/updated" && observer !== undefined) continue;
 			client.setNotificationHandler(method as McpClientNotificationMethod, handler as never);
+		}
+		if (observer !== undefined) {
+			// `setNotificationHandler` is last-write-wins; compose observer-then-user so the
+			// manager's event stream never clobbers a user handler (and vice versa).
+			const user = this.#notificationHandlers["notifications/resources/updated"];
+			client.setNotificationHandler("notifications/resources/updated", async (notification) => {
+				try {
+					observer(notification);
+				} catch {
+					// The manager's observation seam cannot break the user's handler.
+				}
+				await user?.(notification);
+			});
 		}
 		const roots = this.#roots;
 		if (roots !== undefined) {
@@ -245,6 +312,7 @@ export class McpConnectionDefinition<const Id extends string = string> {
 				roots: normalizeRoots(typeof roots === "function" ? await roots() : roots),
 			}));
 		}
+		this.#configureClient?.(client);
 	}
 }
 
@@ -268,6 +336,39 @@ function normalizeAutoRefresh(
 		minIntervalMs,
 		maxRefreshesPerGeneration,
 		...(debounceMs === undefined ? {} : { debounceMs }),
+	});
+}
+
+function normalizeReconnect(
+	value: McpReconnectOptions | undefined,
+): McpResolvedReconnectOptions | undefined {
+	if (value === undefined) return undefined;
+	const { maxAttempts, backoff, resetAfterMs } = value;
+	if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
+		throw new RangeError("reconnect.maxAttempts must be a positive integer.");
+	}
+	const initialMs = backoff?.initialMs;
+	if (!Number.isFinite(initialMs) || initialMs <= 0) {
+		throw new RangeError("reconnect.backoff.initialMs must be positive.");
+	}
+	const maxMs = backoff.maxMs ?? 30_000;
+	if (!Number.isFinite(maxMs) || maxMs < initialMs) {
+		throw new RangeError("reconnect.backoff.maxMs must be at least initialMs.");
+	}
+	const factor = backoff.factor ?? 2;
+	if (!Number.isFinite(factor) || factor < 1) {
+		throw new RangeError("reconnect.backoff.factor must be at least 1.");
+	}
+	if (resetAfterMs !== undefined && (!Number.isFinite(resetAfterMs) || resetAfterMs < 0)) {
+		throw new RangeError("reconnect.resetAfterMs must be non-negative.");
+	}
+	return Object.freeze({
+		maxAttempts,
+		initialMs,
+		maxMs,
+		factor,
+		jitter: backoff.jitter !== false,
+		...(resetAfterMs === undefined ? {} : { resetAfterMs }),
 	});
 }
 
@@ -609,6 +710,10 @@ export class McpClientSession<const Id extends string = string> implements Async
 export interface McpOfficialClientOverrides {
 	/** Manager-injected list-changed handlers (generation-fenced), merged into the client options. */
 	readonly listChanged?: ListChangedHandlers;
+	/** Manager-injected observer for `notifications/resources/updated`, composed BEFORE the user handler. */
+	readonly onResourceUpdated?: (
+		notification: NotificationTypeMap["notifications/resources/updated"],
+	) => void;
 }
 
 /** Constructs the official `Client` for a definition and installs its handlers; the single seam the manager uses. */
@@ -620,6 +725,6 @@ export function createOfficialClient(
 		...definition.clientOptions,
 		...(overrides.listChanged === undefined ? {} : { listChanged: overrides.listChanged }),
 	});
-	definition.installHandlers(client);
+	definition.installHandlers(client, overrides);
 	return client;
 }

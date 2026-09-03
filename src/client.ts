@@ -16,6 +16,9 @@ export {
 export type {
 	McpAutoRefreshOptions,
 	McpClientAdvertise,
+	McpReconnectBackoffOptions,
+	McpReconnectOptions,
+	McpResolvedReconnectOptions,
 	McpClientNotificationHandlers,
 	McpClientNotificationMethod,
 	McpClientRequestHandlers,
@@ -38,10 +41,12 @@ export {
 	McpConnectionManager,
 	McpToolCallError,
 	describeError,
+	parseToolResult,
 	throwIfToolError,
 } from "./client/manager.ts";
 export type {
 	McpCallToolOptions,
+	McpCallToolParsedOptions,
 	McpConnectAllOptions,
 	McpConnectionEvent,
 	McpConnectionEventType,
@@ -54,6 +59,7 @@ export type {
 	McpErrorDetail,
 	McpMetaOptions,
 	McpMrtrForwardOptions,
+	McpParsedToolResult,
 	McpPingResult,
 	McpReadOptions,
 	McpRequestOptionsWithMeta,

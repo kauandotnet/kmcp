@@ -28,10 +28,26 @@ import {
 	type McpArgumentCompleter,
 	type McpAuthVerdict,
 	type McpCapabilityAuth,
+	type McpCapabilityInstallWrap,
+	type McpCapabilityKind,
 	type McpRegistrationHandle,
 } from "./capability.ts";
+import { middlewareInstallWrap, type McpMiddleware } from "./middleware.ts";
+import { namespaceUris, type McpUriNamespaceOptions } from "./uri-namespace.ts";
+import { applyVisibility, normalizeVisibilityRules, type McpVisibilityRule } from "./visibility.ts";
 
 export type McpSetupCleanup = () => MaybePromise<void>;
+
+/**
+ * A dynamic capability source, resolved once per materialization (per request under the official
+ * per-request factory). Every returned definition must be canonical; keys must not collide with
+ * the static capabilities or another provider's output. A throwing provider fails the whole
+ * materialization (`PROVIDER_FAILED`) — a silently shrunken catalog is indistinguishable from an
+ * authorization decision, and kmcp fails closed.
+ */
+export type McpCapabilityProvider = (
+	context: McpRequestContext,
+) => MaybePromise<readonly AnyMcpCapabilityDefinition[]>;
 
 export interface McpCapabilityDenial {
 	readonly definition: AnyMcpCapabilityDefinition;
@@ -55,6 +71,26 @@ export interface McpServerDefinitionOptions {
 	 */
 	readonly resourceSubscriptions?: boolean;
 	readonly capabilities?: readonly AnyMcpCapabilityDefinition[];
+	/** Dynamic capability sources, resolved per materialization. Requires `declare`. */
+	readonly providers?: readonly McpCapabilityProvider[];
+	/**
+	 * The capability kinds providers may contribute. REQUIRED when `providers` is set: the
+	 * server's capability advertisement is fixed at construction, before any provider runs.
+	 */
+	readonly declare?: readonly McpCapabilityKind[];
+	/**
+	 * Capability-call middleware, composed once per capability per materialization
+	 * (`middleware[0]` outermost). Runs OUTSIDE any `decorateHandlers` wrappers, which are baked
+	 * into the definitions themselves.
+	 */
+	readonly middleware?: readonly McpMiddleware[];
+	/**
+	 * Visibility rules applied at materialization (left to right, last match wins). A hidden
+	 * capability is simply not installed for that request.
+	 */
+	readonly visibility?: readonly McpVisibilityRule[];
+	/** Observability seam for a provider failure (the materialization still fails closed). */
+	readonly onProviderError?: (error: unknown, context: McpRequestContext) => void;
 	/**
 	 * Runs once per materialized instance after the capabilities are installed. It may return a
 	 * cleanup function, which `McpServerRuntime.close()` awaits after the server closes. Under
@@ -70,12 +106,17 @@ export interface McpServerDefinitionOptions {
 }
 
 export interface McpMountOptions {
-	/** Name prefix for the mounted capabilities (URIs are untouched). */
+	/** Name prefix for the mounted capabilities (URIs are untouched unless `uriNamespace` is set). */
 	readonly prefix?: string;
 	/** Separator between prefix and name. Default: `"."`. */
 	readonly separator?: string;
 	/** Permit a mounted child that declares a `setup` hook. */
 	readonly allowSetup?: boolean;
+	/**
+	 * Also namespace the child's resource/template URIs (first path segment, allowlisted schemes —
+	 * see `namespaceUris`). Requires `prefix`, which becomes the URI namespace.
+	 */
+	readonly uriNamespace?: McpUriNamespaceOptions;
 }
 
 export interface McpInstalledCapability {
@@ -185,8 +226,13 @@ export class McpServerDefinition implements McpServable {
 	readonly serverInfo: Readonly<Implementation>;
 	readonly sdkOptions: ServerOptions | undefined;
 	readonly capabilities: readonly AnyMcpCapabilityDefinition[];
+	readonly providers: readonly McpCapabilityProvider[];
+	readonly declaredKinds: readonly McpCapabilityKind[];
+	readonly middleware: readonly McpMiddleware[];
+	readonly visibility: readonly McpVisibilityRule[];
 	readonly #setup: McpServerDefinitionOptions["setup"];
 	readonly #onCapabilityDenied: McpServerDefinitionOptions["onCapabilityDenied"];
+	readonly #onProviderError: McpServerDefinitionOptions["onProviderError"];
 	readonly #serverOptions: ServerOptions;
 	readonly #promptCompleters: ReadonlyMap<string, Readonly<Record<string, McpArgumentCompleter>>>;
 
@@ -194,13 +240,36 @@ export class McpServerDefinition implements McpServable {
 		this.serverInfo = immutableProtocolClone(serverInfo, "server info");
 		this.sdkOptions = options.sdk === undefined ? undefined : deepFreeze({ ...options.sdk });
 		this.capabilities = Object.freeze([...(options.capabilities ?? [])]);
+		this.providers = Object.freeze([...(options.providers ?? [])]);
+		for (const provider of this.providers) {
+			if (typeof provider !== "function") throw new TypeError("providers must be functions.");
+		}
+		this.declaredKinds = normalizeDeclaredKinds(options.declare);
+		if (this.providers.length > 0 && this.declaredKinds.length === 0) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				"A definition with providers must declare the capability kinds they may contribute.",
+			);
+		}
+		this.middleware = Object.freeze([...(options.middleware ?? [])]);
+		for (const entry of this.middleware) {
+			if (typeof entry !== "function") throw new TypeError("middleware must be functions.");
+		}
+		this.visibility = normalizeVisibilityRules(options.visibility);
 		this.#setup = options.setup;
 		this.#onCapabilityDenied = options.onCapabilityDenied;
+		this.#onProviderError = options.onProviderError;
 		for (const capability of this.capabilities) assertCanonicalCapability(capability);
 		assertUniqueCapabilities(this.capabilities);
 		this.#promptCompleters = promptCompleters(this.capabilities);
 		this.#serverOptions = deepFreeze(
-			buildServerOptions(this.sdkOptions, options, this.capabilities, this.#promptCompleters),
+			buildServerOptions(
+				this.sdkOptions,
+				options,
+				this.capabilities,
+				this.#promptCompleters,
+				this.declaredKinds,
+			),
 		);
 		Object.freeze(this);
 	}
@@ -221,16 +290,19 @@ export class McpServerDefinition implements McpServable {
 
 	async instantiate(context: McpRequestContext): Promise<McpServerRuntime> {
 		const admitted = await this.admit(context);
+		const wrap = this.#installWrap(context);
 		const server = new McpServer(this.serverInfo, this.#serverOptions);
 		try {
 			const registrations = admitted.map((definition) =>
 				Object.freeze({
 					definition,
-					handle: installCanonicalCapability(definition, server),
+					handle: installCanonicalCapability(definition, server, wrap),
 				}),
 			);
-			if (this.#promptCompleters.size > 0) {
-				installCompletionHandler(server, admitted, registrations, this.#promptCompleters);
+			const completers =
+				this.providers.length === 0 ? this.#promptCompleters : promptCompleters(admitted);
+			if (completers.size > 0 && this.#serverOptions.capabilities?.completions !== undefined) {
+				installCompletionHandler(server, admitted, registrations, completers);
 			}
 			if (
 				context.era === "legacy" &&
@@ -309,11 +381,37 @@ export class McpServerDefinition implements McpServable {
 				"The mounted definition has a setup hook; pass { allowSetup: true } to chain it knowingly.",
 			);
 		}
+		if (child.providers.length > 0) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				"Cannot mount a provider-backed definition; add its providers to the parent instead.",
+			);
+		}
+		if (child.middleware.length > 0) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				"Cannot mount a definition with middleware; compose middleware on the parent instead.",
+			);
+		}
+		if (options.uriNamespace !== undefined && options.prefix === undefined) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				"mount({ uriNamespace }) requires a prefix — it becomes the URI namespace.",
+			);
+		}
 		const separator = options.separator ?? ".";
+		// The child's own visibility rules are static; bake them in before merging.
+		let mounted = applyVisibility(child.capabilities, child.visibility);
+		if (options.uriNamespace !== undefined && options.prefix !== undefined) {
+			const namespaced = child
+				.withCapabilities(mounted)
+				.transform(namespaceUris(options.prefix, options.uriNamespace));
+			mounted = namespaced.capabilities;
+		}
 		const capabilities =
 			options.prefix === undefined
-				? child.capabilities
-				: child.capabilities.map((capability) =>
+				? mounted
+				: mounted.map((capability) =>
 						capability.withName(`${options.prefix}${separator}${capability.name}`),
 					);
 		const parentSetup = this.#setup;
@@ -337,21 +435,84 @@ export class McpServerDefinition implements McpServable {
 			...(this.#serverOptions.capabilities?.resources?.subscribe === false
 				? { resourceSubscriptions: false }
 				: {}),
+			...(this.providers.length === 0 ? {} : { providers: this.providers }),
+			...(this.declaredKinds.length === 0 ? {} : { declare: this.declaredKinds }),
+			...(this.middleware.length === 0 ? {} : { middleware: this.middleware }),
+			...(this.visibility.length === 0 ? {} : { visibility: this.visibility }),
 			...(this.#setup === undefined ? {} : { setup: this.#setup }),
 			...(this.#onCapabilityDenied === undefined
 				? {}
 				: { onCapabilityDenied: this.#onCapabilityDenied }),
+			...(this.#onProviderError === undefined ? {} : { onProviderError: this.#onProviderError }),
 		};
 	}
 
+	/** The construction options of this definition, without `capabilities` (for derivations). */
+	configuration(): McpServerDefinitionOptions {
+		return this.#options();
+	}
+
+	#installWrap(context: McpRequestContext): McpCapabilityInstallWrap | undefined {
+		if (this.middleware.length === 0) return undefined;
+		return middlewareInstallWrap(this.middleware, context);
+	}
+
+	/** The static capabilities plus every provider's contribution, validated and duplicate-checked. */
+	async #resolve(context: McpRequestContext): Promise<readonly AnyMcpCapabilityDefinition[]> {
+		if (this.providers.length === 0) return this.capabilities;
+		const provided: AnyMcpCapabilityDefinition[] = [];
+		for (const provider of this.providers) {
+			let contribution: readonly AnyMcpCapabilityDefinition[];
+			try {
+				contribution = await provider(context);
+			} catch (error) {
+				this.#reportProviderError(error, context);
+				throw new KmcpError(
+					KMCP_ERROR_CODES.PROVIDER_FAILED,
+					"A capability provider failed; the materialization fails closed.",
+					{ cause: error },
+				);
+			}
+			if (!Array.isArray(contribution)) {
+				throw new KmcpError(
+					KMCP_ERROR_CODES.PROVIDER_FAILED,
+					"A capability provider must return an array of canonical definitions.",
+				);
+			}
+			for (const capability of contribution) {
+				assertCanonicalCapability(capability);
+				if (!this.declaredKinds.includes(capability.kind)) {
+					throw new KmcpError(
+						KMCP_ERROR_CODES.PROVIDER_FAILED,
+						`A provider contributed a '${capability.kind}' but the definition declares only: ${this.declaredKinds.join(", ")}.`,
+					);
+				}
+			}
+			provided.push(...contribution);
+		}
+		const merged = Object.freeze([...this.capabilities, ...provided]);
+		assertUniqueCapabilities(merged);
+		return merged;
+	}
+
+	#reportProviderError(error: unknown, context: McpRequestContext): void {
+		try {
+			this.#onProviderError?.(error, context);
+		} catch {
+			// The observability seam cannot alter the fail-closed outcome.
+		}
+	}
+
 	/**
-	 * The capabilities a request may see: every capability without `auth`, plus those whose `auth`
-	 * check passes for `context.authInfo` (denials go to `onCapabilityDenied`). `instantiate()`
-	 * installs exactly this set; gateways reuse it to reconcile long-lived instances.
+	 * The capabilities a request may see: the static capabilities plus every provider's
+	 * contribution, filtered by the visibility rules, minus every capability whose `auth` check
+	 * fails for `context.authInfo` (denials go to `onCapabilityDenied`). `instantiate()` installs
+	 * exactly this set; gateways reuse it to reconcile long-lived instances.
 	 */
 	async admit(context: McpRequestContext): Promise<readonly AnyMcpCapabilityDefinition[]> {
+		const visible = applyVisibility(await this.#resolve(context), this.visibility);
 		const admitted: AnyMcpCapabilityDefinition[] = [];
-		for (const capability of this.capabilities) {
+		for (const capability of visible) {
 			const auth = capability.auth;
 			if (auth === undefined) {
 				admitted.push(capability);
@@ -429,8 +590,9 @@ function buildServerOptions(
 	options: McpServerDefinitionOptions,
 	capabilities: readonly AnyMcpCapabilityDefinition[],
 	completers: ReadonlyMap<string, unknown>,
+	declaredKinds: readonly McpCapabilityKind[],
 ): ServerOptions {
-	const kinds = new Set(capabilities.map((capability) => capability.kind));
+	const kinds = new Set([...capabilities.map((capability) => capability.kind), ...declaredKinds]);
 	const hasResources = kinds.has("resource") || kinds.has("resource-template");
 	const declared: Partial<ServerCapabilities> = {
 		...(kinds.has("tool") ? { tools: { listChanged: true } } : {}),
@@ -535,6 +697,29 @@ function completionContext(
 function installLegacySubscribeHandlers(server: McpServer): void {
 	server.server.setRequestHandler("resources/subscribe", () => ({}));
 	server.server.setRequestHandler("resources/unsubscribe", () => ({}));
+}
+
+const CAPABILITY_KINDS: readonly McpCapabilityKind[] = Object.freeze([
+	"prompt",
+	"resource",
+	"resource-template",
+	"tool",
+]);
+
+function normalizeDeclaredKinds(
+	declare: readonly McpCapabilityKind[] | undefined,
+): readonly McpCapabilityKind[] {
+	if (declare === undefined) return Object.freeze([]);
+	const kinds = [...new Set(declare)];
+	for (const kind of kinds) {
+		if (!CAPABILITY_KINDS.includes(kind)) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`Unknown capability kind in declare: '${String(kind)}'.`,
+			);
+		}
+	}
+	return Object.freeze(kinds);
 }
 
 function assertUniqueCapabilities(capabilities: readonly AnyMcpCapabilityDefinition[]): void {

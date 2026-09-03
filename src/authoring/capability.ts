@@ -38,9 +38,28 @@ export type McpCapabilityKind = "prompt" | "resource" | "resource-template" | "t
 export type McpRegistrationHandle =
 	RegisteredPrompt | RegisteredResource | RegisteredResourceTemplate | RegisteredTool;
 
+/** The raw SDK-shaped callback of a capability, as seen by an install-time wrapper. */
+export type McpWrappableHandler = (...args: never[]) => unknown;
+
+/**
+ * An install-time handler wrapper. Only `McpServerDefinition.instantiate` supplies one (it is how
+ * the definition-level middleware chain reaches every handler with the request context); the
+ * public `definition.install(server)` path never wraps, so canonicality checks are unaffected.
+ */
+export type McpCapabilityInstallWrap = (
+	handler: McpWrappableHandler,
+	definition: AnyMcpCapabilityDefinition,
+) => McpWrappableHandler;
+
 /** The outcome of a per-capability authorization check. A bare `boolean` is accepted as shorthand. */
 export type McpAuthVerdict =
-	{ readonly allowed: true } | { readonly allowed: false; readonly reason: string };
+	| { readonly allowed: true }
+	| {
+			readonly allowed: false;
+			readonly reason: string;
+			/** The scopes still missing, when the failure is scope-shaped (drives 403 challenges). */
+			readonly missingScopes?: readonly string[];
+	  };
 
 /**
  * Per-capability authorization, evaluated when a server is materialized for a request. A denied
@@ -63,7 +82,11 @@ export function requireScopes(...scopes: readonly string[]): McpCapabilityAuth["
 		const missing = required.filter((scope) => !authInfo.scopes.includes(scope));
 		return missing.length === 0
 			? { allowed: true }
-			: { allowed: false, reason: `missing scope(s): ${missing.join(", ")}` };
+			: {
+					allowed: false,
+					reason: `missing scope(s): ${missing.join(", ")}`,
+					missingScopes: Object.freeze(missing),
+				};
 	};
 }
 
@@ -123,6 +146,9 @@ export abstract class McpCapabilityDefinition<
 
 	/** A copy of this definition whose handler is replaced (used by `decorateHandlers`). */
 	abstract withHandler(handler: unknown): McpCapabilityDefinition<Kind, Name>;
+
+	/** A copy of this definition with its authorization replaced (used by `restrictTag`). */
+	abstract withAuth(auth: McpCapabilityAuth): McpCapabilityDefinition<Kind, Name>;
 }
 
 interface McpToolMetadataOptions extends McpCommonCapabilityOptions {
@@ -205,7 +231,13 @@ export class McpToolDefinition<
 		assertHandler(handler, "tool handler");
 		registerCapability(
 			this,
-			(server) => installTool(server, this.name, this.options, this.handler),
+			(server, wrap) =>
+				installTool(
+					server,
+					this.name,
+					this.options,
+					wrapHandler(wrap, this.handler, this) as McpToolHandler<Input, Output>,
+				),
 			canonicalToolInstall,
 		);
 		Object.freeze(this);
@@ -231,6 +263,14 @@ export class McpToolDefinition<
 		handler: McpToolHandler<Input, Output>,
 	): McpToolDefinition<Name, Input, Output> {
 		return new McpToolDefinition(this.name, this.options, handler);
+	}
+
+	override withAuth(auth: McpCapabilityAuth): McpToolDefinition<Name, Input, Output> {
+		return new McpToolDefinition(
+			this.name,
+			{ ...this.options, auth } as McpToolOptions<Input, Output>,
+			this.handler,
+		);
 	}
 }
 
@@ -275,7 +315,13 @@ export class McpPromptDefinition<
 		assertHandler(handler, "prompt handler");
 		registerCapability(
 			this,
-			(server) => installPrompt(server, this.name, this.options, this.handler),
+			(server, wrap) =>
+				installPrompt(
+					server,
+					this.name,
+					this.options,
+					wrapHandler(wrap, this.handler, this) as PromptCallback<Args>,
+				),
 			canonicalPromptInstall,
 		);
 		Object.freeze(this);
@@ -299,6 +345,14 @@ export class McpPromptDefinition<
 
 	override withHandler(handler: PromptCallback<Args>): McpPromptDefinition<Name, Args> {
 		return new McpPromptDefinition(this.name, this.options, handler);
+	}
+
+	override withAuth(auth: McpCapabilityAuth): McpPromptDefinition<Name, Args> {
+		return new McpPromptDefinition(
+			this.name,
+			{ ...this.options, auth } as McpPromptOptions<Args>,
+			this.handler,
+		);
 	}
 }
 
@@ -343,8 +397,13 @@ export class McpResourceDefinition<
 		assertHandler(handler, "resource handler");
 		registerCapability(
 			this,
-			(server) =>
-				server.registerResource(this.name, this.uri, resourceConfig(this.options), this.handler),
+			(server, wrap) =>
+				server.registerResource(
+					this.name,
+					this.uri,
+					resourceConfig(this.options),
+					wrapHandler(wrap, this.handler, this) as ReadResourceCallback,
+				),
 			canonicalResourceInstall,
 		);
 		Object.freeze(this);
@@ -369,6 +428,10 @@ export class McpResourceDefinition<
 
 	override withHandler(handler: ReadResourceCallback): McpResourceDefinition<Name, Uri> {
 		return new McpResourceDefinition(this.name, this.uri, this.options, handler);
+	}
+
+	override withAuth(auth: McpCapabilityAuth): McpResourceDefinition<Name, Uri> {
+		return new McpResourceDefinition(this.name, this.uri, { ...this.options, auth }, this.handler);
 	}
 }
 
@@ -400,12 +463,12 @@ export class McpResourceTemplateDefinition<
 		assertHandler(handler, "resource-template handler");
 		registerCapability(
 			this,
-			(server) =>
+			(server, wrap) =>
 				server.registerResource(
 					this.name,
 					this.template,
 					resourceConfig(this.options),
-					this.handler,
+					wrapHandler(wrap, this.handler, this) as ReadResourceTemplateCallback,
 				),
 			canonicalResourceTemplateInstall,
 		);
@@ -436,6 +499,15 @@ export class McpResourceTemplateDefinition<
 	override withHandler(handler: ReadResourceTemplateCallback): McpResourceTemplateDefinition<Name> {
 		return new McpResourceTemplateDefinition(this.name, this.template, this.options, handler);
 	}
+
+	override withAuth(auth: McpCapabilityAuth): McpResourceTemplateDefinition<Name> {
+		return new McpResourceTemplateDefinition(
+			this.name,
+			this.template,
+			{ ...this.options, auth },
+			this.handler,
+		);
+	}
 }
 
 /**
@@ -454,6 +526,7 @@ export interface AnyMcpToolDefinition extends McpCapabilityDefinition<"tool", st
 	withName(name: string): AnyMcpToolDefinition;
 	withMetadata(patch: McpCapabilityMetadataPatch): AnyMcpToolDefinition;
 	withHandler(handler: unknown): AnyMcpToolDefinition;
+	withAuth(auth: McpCapabilityAuth): AnyMcpToolDefinition;
 }
 
 export interface AnyMcpPromptDefinition extends McpCapabilityDefinition<"prompt", string> {
@@ -462,6 +535,7 @@ export interface AnyMcpPromptDefinition extends McpCapabilityDefinition<"prompt"
 	withName(name: string): AnyMcpPromptDefinition;
 	withMetadata(patch: McpCapabilityMetadataPatch): AnyMcpPromptDefinition;
 	withHandler(handler: unknown): AnyMcpPromptDefinition;
+	withAuth(auth: McpCapabilityAuth): AnyMcpPromptDefinition;
 }
 
 export interface AnyMcpResourceDefinition extends McpCapabilityDefinition<"resource", string> {
@@ -471,6 +545,7 @@ export interface AnyMcpResourceDefinition extends McpCapabilityDefinition<"resou
 	withName(name: string): AnyMcpResourceDefinition;
 	withMetadata(patch: McpCapabilityMetadataPatch): AnyMcpResourceDefinition;
 	withHandler(handler: unknown): AnyMcpResourceDefinition;
+	withAuth(auth: McpCapabilityAuth): AnyMcpResourceDefinition;
 }
 
 export interface AnyMcpResourceTemplateDefinition extends McpCapabilityDefinition<
@@ -484,6 +559,7 @@ export interface AnyMcpResourceTemplateDefinition extends McpCapabilityDefinitio
 	withName(name: string): AnyMcpResourceTemplateDefinition;
 	withMetadata(patch: McpCapabilityMetadataPatch): AnyMcpResourceTemplateDefinition;
 	withHandler(handler: unknown): AnyMcpResourceTemplateDefinition;
+	withAuth(auth: McpCapabilityAuth): AnyMcpResourceTemplateDefinition;
 }
 
 export type AnyMcpCapabilityDefinition =
@@ -541,7 +617,7 @@ export function defineResourceTemplate<const Name extends string>(
 }
 
 interface CapabilityState {
-	readonly install: (server: McpServer) => McpRegistrationHandle;
+	readonly install: (server: McpServer, wrap?: McpCapabilityInstallWrap) => McpRegistrationHandle;
 	readonly publicInstall: McpCapabilityDefinition<McpCapabilityKind, string>["install"];
 }
 
@@ -566,31 +642,37 @@ export function assertCanonicalCapability(
 export function installCanonicalCapability(
 	definition: AnyMcpToolDefinition,
 	server: McpServer,
+	wrap?: McpCapabilityInstallWrap,
 ): RegisteredTool;
 export function installCanonicalCapability(
 	definition: AnyMcpPromptDefinition,
 	server: McpServer,
+	wrap?: McpCapabilityInstallWrap,
 ): RegisteredPrompt;
 export function installCanonicalCapability(
 	definition: AnyMcpResourceDefinition,
 	server: McpServer,
+	wrap?: McpCapabilityInstallWrap,
 ): RegisteredResource;
 export function installCanonicalCapability(
 	definition: AnyMcpResourceTemplateDefinition,
 	server: McpServer,
+	wrap?: McpCapabilityInstallWrap,
 ): RegisteredResourceTemplate;
 export function installCanonicalCapability(
 	definition: AnyMcpCapabilityDefinition,
 	server: McpServer,
+	wrap?: McpCapabilityInstallWrap,
 ): McpRegistrationHandle;
 export function installCanonicalCapability(
 	definition: AnyMcpCapabilityDefinition,
 	server: McpServer,
+	wrap?: McpCapabilityInstallWrap,
 ): McpRegistrationHandle {
 	assertCanonicalCapability(definition);
 	const state = capabilityStates.get(definition);
 	if (state === undefined) throw new TypeError("Unreachable canonical capability state.");
-	return state.install(server);
+	return state.install(server, wrap);
 }
 
 /** The definition-level identity keys a capability occupies (name per kind, plus URI keyspaces). */
@@ -605,10 +687,19 @@ export function capabilityKeys(capability: AnyMcpCapabilityDefinition): readonly
 
 function registerCapability(
 	definition: object,
-	install: (server: McpServer) => McpRegistrationHandle,
+	install: (server: McpServer, wrap?: McpCapabilityInstallWrap) => McpRegistrationHandle,
 	publicInstall: McpCapabilityDefinition<McpCapabilityKind, string>["install"],
 ): void {
 	capabilityStates.set(definition, Object.freeze({ install, publicInstall }));
+}
+
+function wrapHandler(
+	wrap: McpCapabilityInstallWrap | undefined,
+	handler: unknown,
+	definition: McpCapabilityDefinition<McpCapabilityKind, string>,
+): unknown {
+	if (wrap === undefined) return handler;
+	return wrap(handler as McpWrappableHandler, definition as unknown as AnyMcpCapabilityDefinition);
 }
 
 function installTool<

@@ -218,6 +218,10 @@ test("the canonical capability base rejects forged external construction tokens"
 		override withHandler(): never {
 			throw new Error("not decoratable");
 		}
+
+		override withAuth(): never {
+			throw new Error("not authorizable");
+		}
 	}
 
 	assert.throws(

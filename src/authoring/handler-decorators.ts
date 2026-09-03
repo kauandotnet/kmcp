@@ -7,7 +7,8 @@ import type { McpHandlerDecorator } from "./transform.ts";
 
 /** Built-in handler decorators for `decorateHandlers`. Instances keep state on the definition, so counters and caches persist across per-request servers. */
 
-function contextOf(args: readonly unknown[]): ServerContext {
+/** Extracts the trailing SDK `ServerContext` from a raw handler argument list. */
+export function contextOf(args: readonly unknown[]): ServerContext {
 	const last = args[args.length - 1];
 	if (typeof last !== "object" || last === null || !("mcpReq" in last)) {
 		throw new TypeError(
