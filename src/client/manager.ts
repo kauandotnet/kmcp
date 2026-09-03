@@ -674,31 +674,21 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		this.#assertOpen();
 		const entry = this.#entry(id);
 		const pending = entry.pendingAuthorization;
-		if (entry.phase !== "authorizing" || pending === undefined) {
+		if (pending === undefined) return this.#completeLiveAuthorization(entry, callbackParams);
+		if (entry.phase !== "authorizing") {
 			throw new KmcpError(
 				KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE,
 				`Connection '${id}' is not waiting for authorization.`,
 			);
 		}
-		const transport = pending.transport as Transport & {
-			finishAuth?: (params: URLSearchParams) => Promise<void>;
-		};
-		if (typeof transport.finishAuth !== "function") {
-			throw new KmcpError(
-				KMCP_ERROR_CODES.OPERATION_FAILED,
-				`The transport of '${id}' cannot finish an authorization flow.`,
-			);
-		}
+		const transport = finishingTransport(pending.transport, id);
 		const oauthError = callbackParams.get("error");
 		if (oauthError !== null) {
 			await this.#releasePendingAuthorization(entry);
 			entry.errorCode = KMCP_ERROR_CODES.AUTH_FORBIDDEN;
 			entry.errorDetail = { kind: "oauth", code: oauthError.slice(0, 64) };
 			this.#transition(entry, "failed");
-			throw new KmcpError(
-				KMCP_ERROR_CODES.AUTH_FORBIDDEN,
-				`Authorization of '${id}' was refused by the authorization server (${oauthError.slice(0, 64)}).`,
-			);
+			throw refusedAuthorization(id, oauthError);
 		}
 		// A state mismatch is not a failed round: the callback simply is not ours. Stay parked.
 		await entry.definition.verifyAuthorizationCallback(callbackParams);
@@ -715,6 +705,42 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		}
 		this.#transition(entry, "offline");
 		return this.connect(id);
+	}
+
+	/**
+	 * The live variant of `completeAuthorization`: a 403 `insufficient_scope` step-up (or a 401
+	 * after token expiry) surfaces from an OPERATION on an online connection, as the SDK's
+	 * `UnauthorizedError`, after the provider was handed the new authorization URL. The manager
+	 * announces it as `connection.authorization.required` without leaving the online phase;
+	 * finishing auth on the live transport stores the widened tokens and the next operation
+	 * carries them. Nothing is reconnected.
+	 */
+	async #completeLiveAuthorization(
+		entry: ManagedConnection<Id>,
+		callbackParams: URLSearchParams,
+	): Promise<McpConnectionSnapshot<Id>> {
+		const id = entry.definition.id;
+		if (!isUsable(entry) || entry.transport === undefined || !entry.definition.interactiveOAuth) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE,
+				`Connection '${id}' is not waiting for authorization.`,
+			);
+		}
+		const transport = finishingTransport(entry.transport, id);
+		const oauthError = callbackParams.get("error");
+		if (oauthError !== null) throw refusedAuthorization(id, oauthError);
+		await entry.definition.verifyAuthorizationCallback(callbackParams);
+		try {
+			await transport.finishAuth(callbackParams);
+		} catch (error) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.OPERATION_FAILED,
+				`Authorization of '${id}' could not be completed.`,
+				{ cause: error },
+			);
+		}
+		this.#publish("connection.state.changed", entry);
+		return this.#snapshotEntry(entry);
 	}
 
 	async withClient<Result>(
@@ -1926,7 +1952,20 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		session: McpClientSession<Id>,
 		error: unknown,
 	): void {
-		if (entry.session !== session || entry.transport?.sessionId === undefined) return;
+		if (entry.session !== session) return;
+		if (
+			entry.definition.interactiveOAuth &&
+			findCause(
+				error,
+				(candidate): candidate is UnauthorizedError => candidate instanceof UnauthorizedError,
+			) !== undefined
+		) {
+			// The transport already handed the provider a new authorization URL (a 403 step-up or a
+			// 401 the refresh could not fix); the host completes it on the live connection.
+			this.#publish("connection.authorization.required", entry);
+			return;
+		}
+		if (entry.transport?.sessionId === undefined) return;
 		const http = findCause(
 			error,
 			(candidate): candidate is SdkHttpError => candidate instanceof SdkHttpError,
@@ -2855,6 +2894,29 @@ function networkErrorCode(error: unknown): string | undefined {
 	const code = (error as { readonly code?: unknown }).code;
 	if (typeof code === "string" && NETWORK_ERROR_CODE.test(code)) return code;
 	return undefined;
+}
+
+function finishingTransport(
+	transport: Transport,
+	id: string,
+): Transport & { finishAuth: (params: URLSearchParams) => Promise<void> } {
+	const candidate = transport as Transport & {
+		finishAuth?: (params: URLSearchParams) => Promise<void>;
+	};
+	if (typeof candidate.finishAuth !== "function") {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.OPERATION_FAILED,
+			`The transport of '${id}' cannot finish an authorization flow.`,
+		);
+	}
+	return candidate as Transport & { finishAuth: (params: URLSearchParams) => Promise<void> };
+}
+
+function refusedAuthorization(id: string, oauthError: string): KmcpError {
+	return new KmcpError(
+		KMCP_ERROR_CODES.AUTH_FORBIDDEN,
+		`Authorization of '${id}' was refused by the authorization server (${oauthError.slice(0, 64)}).`,
+	);
 }
 
 function notAdvertised(kind: "Prompt" | "Tool", name: string): McpContractResult {

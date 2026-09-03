@@ -58,6 +58,7 @@
 		"test:dist": "node scripts/test-dist.mjs",
 		"conformance:golden": "tsc -p tsconfig.test.json --outDir .test-dist-conformance && node --test \".test-dist-conformance/test/conformance/*.test.js\"",
 		"conformance:server": "node scripts/conformance-server.mjs",
+		"conformance:client": "node scripts/conformance-client.mjs",
 		"conformance:gateway": "CONFORMANCE_FIXTURE=test/conformance/gateway-fixture.ts CONFORMANCE_BASELINE=conformance-baseline-gateway.yml PORT=39751 node scripts/conformance-server.mjs"
 	},
 	"peerDependencies": {

@@ -1,0 +1,12 @@
+# MCP conformance baseline for the CLIENT scenarios — `pnpm run conformance:client`.
+#
+# Same format and semantics as conformance-baseline.yml (a listed scenario that fails is expected,
+# a listed one that passes is a stale entry, an unlisted one that fails is a regression), applied
+# once per scenario invocation by scripts/conformance-client.mjs.
+#
+# Recorded against test/conformance/client-fixture.ts with @modelcontextprotocol/conformance 0.1.16
+# on 2026-09-03: all 26 client scenarios pass (interactive OAuth included), so the list is empty.
+# The two `auth/2025-03-26-*` scenarios pass only with the SDK's `skipIssuerMetadataValidation`
+# opt-out, which the adapter enables for them alone (see the comment in the fixture).
+
+client: []
