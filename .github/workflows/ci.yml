@@ -81,3 +81,10 @@ jobs:
       # expected failures; see conformance-baseline-gateway.yml.
       - name: Conformance (pinned tool, gateway fixture)
         run: pnpm run conformance:gateway
+
+      # The client side: every client scenario the pinned tool offers, driven through
+      # kmcp/client's manager by test/conformance/client-fixture.ts (the redirect leg of the
+      # interactive OAuth scenarios is completed by fetching the authorization URL — kmcp never
+      # opens a browser). conformance-baseline-client.yml lists the justified expected failures.
+      - name: Conformance (pinned tool, client scenarios)
+        run: pnpm run conformance:client

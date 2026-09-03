@@ -8,12 +8,14 @@ import {
 	SdkHttpError,
 	type SubscriptionFilter,
 	type Transport,
+	UnauthorizedError,
 } from "@modelcontextprotocol/client";
 
 import {
 	KMCP_ERROR_CODES,
 	KmcpError,
 	McpConnectionManager,
+	McpOAuthClientProvider,
 	defineConnection,
 	defineResource,
 	defineServer,
@@ -378,4 +380,79 @@ test("callTool enforces a tool contract before the request goes out", async (t) 
 	assert.equal(check.valid, false);
 	const missing = await manager.checkToolContract("c", "nope", expected);
 	assert.equal(missing.valid, false);
+});
+
+test("a mid-session authorization round is announced and completed on the live transport", async (t) => {
+	const server = createRawLegacyServer({
+		handlers: {
+			"tools/list": () => ({ tools: [{ name: "echo", inputSchema: { type: "object" } }] }),
+		},
+	});
+	const finished: URLSearchParams[] = [];
+	const transport = server.transport as Transport & {
+		finishAuth?: (params: URLSearchParams) => Promise<void>;
+	};
+	transport.finishAuth = async (params) => {
+		finished.push(params);
+	};
+	const provider = new McpOAuthClientProvider({
+		serverUrl: "https://mcp.example.com/mcp",
+		redirectUrl: "http://127.0.0.1:1/callback",
+		onRedirect: () => undefined,
+	});
+	const manager = new McpConnectionManager<"live">();
+	t.after(() => manager.close());
+	const recorded = recordEvents(manager);
+	manager.register(
+		defineConnection({
+			id: "live",
+			transport: () => transport,
+			protocolVersion: "2025-11-25",
+			oauth: provider,
+		}),
+	);
+	await manager.connect("live");
+	const client = await currentClient(manager, "live");
+	t.mock.method(client, "listTools", async () => {
+		throw new UnauthorizedError("step-up required");
+	});
+	await assert.rejects(
+		manager.listTools("live"),
+		(error: unknown) => error instanceof UnauthorizedError,
+	);
+	const required = await recorded.waitFor(
+		(event) => event.type === "connection.authorization.required",
+	);
+	assert.equal(required.connection.phase, "online", "the connection stays online during a step-up");
+	// The provider issued no state for this round, so any callback passes state verification.
+	await assert.rejects(
+		manager.completeAuthorization("live", new URLSearchParams({ error: "access_denied" })),
+		(error: unknown) =>
+			error instanceof KmcpError && error.code === KMCP_ERROR_CODES.AUTH_FORBIDDEN,
+	);
+	assert.equal(manager.state("live").phase, "online");
+	const snapshot = await manager.completeAuthorization(
+		"live",
+		new URLSearchParams({ code: "c-1" }),
+	);
+	assert.equal(snapshot.phase, "online");
+	assert.equal(finished.length, 1);
+	assert.equal(finished[0]?.get("code"), "c-1");
+	assert.equal(snapshot.generation, required.connection.generation, "nothing was reconnected");
+	// Without an interactive provider a live completion is refused.
+	const plain = new McpConnectionManager<"p">();
+	t.after(() => plain.close());
+	plain.register(
+		inProcessConnection({
+			id: "p",
+			definition: defineServer({ name: "p", version: "1" }),
+			era: "modern",
+		}),
+	);
+	await plain.connect("p");
+	await assert.rejects(
+		plain.completeAuthorization("p", new URLSearchParams({ code: "x" })),
+		(error: unknown) =>
+			error instanceof KmcpError && error.code === KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE,
+	);
 });

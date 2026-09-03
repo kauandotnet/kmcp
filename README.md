@@ -460,11 +460,15 @@ try {
 optional `profile` (several identities for one server share a store without sharing anything else),
 persists PKCE and discovery state, never overwrites a pre-registered client id, issues and verifies
 the OAuth `state` parameter the SDK leaves to hosts (`AUTH_STATE_MISMATCH`; the manager's
-`completeAuthorization` verifies it before the code is exchanged), refreshes an access token before
-it expires through the SDK's `refreshAuthorization` (single-flight, 60 s buffer, off with
-`refresh: false`; a failed refresh falls back to the transport's 401 path), and reports what it
-holds through `status()` (issuer, client id, scope, expiry, save time, display-only identity).
-`InMemoryKeyValueStore`, `FileKeyValueStore` (`kmcp/node`, mode `0600`, atomic) and
+`completeAuthorization` verifies it before the code is exchanged; the same verb also finishes a
+MID-SESSION round — a 403 scope step-up or a 401 the refresh could not fix surfaces from the
+operation as the SDK's `UnauthorizedError` after the provider was handed the new authorization URL,
+the manager announces `connection.authorization.required` without leaving the online phase, and
+completing it on the live transport stores the widened tokens for the next request), refreshes an
+access token before it expires through the SDK's `refreshAuthorization` (single-flight, 60 s buffer,
+off with `refresh: false`; a failed refresh falls back to the transport's 401 path), and reports
+what it holds through `status()` (issuer, client id, scope, expiry, save time, display-only
+identity). `InMemoryKeyValueStore`, `FileKeyValueStore` (`kmcp/node`, mode `0600`, atomic) and
 `KeyringKeyValueStore` (an OS keyring through a host-supplied `(service, account)` entry factory
 such as `@napi-rs/keyring`'s `Entry`; kmcp itself never loads a native module) are the bundled
 stores. `explainOAuthError` turns any error from the flow into a stable
@@ -555,6 +559,13 @@ forwarded.
   sockets: modern through the real `createMcpHandler` path, legacy over `InMemoryTransport`.
 - `pnpm run check` runs typecheck, both-era unit tests, build, a dist smoke test, `publint` and
   prettier. `pnpm run conformance:golden` runs the `server/discover` wire goldens.
+- `pnpm run conformance:client` runs every CLIENT scenario of the official suite (26 in 0.1.16, the
+  interactive OAuth ones included: kmcp never opens a browser, so
+  `test/conformance/client-fixture.ts` completes the redirect leg itself by fetching the
+  authorization URL and handing the callback to `completeAuthorization` — connect-time and
+  mid-session step-up alike); `conformance-baseline-client.yml` lists expected failures. The two
+  `auth/2025-03-26-*` scenarios need the SDK's `skipIssuerMetadataValidation` opt-out, which the
+  adapter enables for them only.
 - `pnpm run conformance:server` and `pnpm run conformance:gateway` run the official
   `@modelcontextprotocol/conformance` suite against the everything-server fixture and the same
   fixture behind a gateway; `conformance-baseline*.yml` list the justified expected failures
