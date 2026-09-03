@@ -1,14 +1,19 @@
 import {
+	type FetchLike,
 	type OAuthClientInformationContext,
 	type OAuthClientMetadata,
 	type OAuthClientProvider,
 	type OAuthDiscoveryState,
 	type StoredOAuthClientInformation,
 	type StoredOAuthTokens,
+	refreshAuthorization,
+	selectResourceURL,
 	validateClientMetadataUrl,
 } from "@modelcontextprotocol/client";
 
 import { KMCP_ERROR_CODES, KmcpError } from "../errors.ts";
+import { encodeBase64Url } from "../internal/base64.ts";
+import { decodeJwtClaims, jwtExpiresAt, type McpJwtClaims } from "./jwt.ts";
 
 /**
  * The persistence port every kmcp OAuth credential read and write goes through.
@@ -39,6 +44,40 @@ export class InMemoryKeyValueStore implements McpKeyValueStore {
 	}
 }
 
+/** Proactive refresh policy for {@link McpOAuthClientProvider}. */
+export interface McpOAuthRefreshOptions {
+	/** Refresh when the access token expires within this window (ms). Default: 60 000. */
+	readonly bufferMs?: number;
+	/** Observes a failed proactive refresh. The stale token is still returned; the SDK's 401 path takes over. */
+	readonly onError?: (error: unknown) => void;
+}
+
+/** The token set as kmcp persists it: the SDK's stored shape plus an absolute expiry. */
+export type McpStoredOAuthTokens = StoredOAuthTokens & {
+	/** Unix time (seconds) the access token expires, derived from `expires_in` at save time. */
+	readonly expires_at?: number;
+};
+
+/** A non-secret description of what a provider currently holds. Safe to log or display. */
+export interface McpOAuthCredentialStatus {
+	readonly serverUrl: string;
+	readonly issuer?: string;
+	readonly clientId?: string;
+	readonly hasTokens: boolean;
+	readonly hasRefreshToken: boolean;
+	readonly tokenType?: string;
+	readonly scope?: string;
+	/** ISO timestamp the access token expires, when the server reported a lifetime. */
+	readonly expiresAt?: string;
+	/** Display-only identity claims decoded (unverified) from an OIDC `id_token`. */
+	readonly identity?: Readonly<{ subject?: string; email?: string; name?: string }>;
+}
+
+/** A provider that can verify the `state` parameter of an authorization callback. */
+export interface McpCallbackStateVerifier {
+	verifyCallbackState(params: URLSearchParams): Promise<void>;
+}
+
 /** Construction options for {@link McpOAuthClientProvider}. */
 export interface McpOAuthClientProviderOptions {
 	/**
@@ -58,6 +97,8 @@ export interface McpOAuthClientProviderOptions {
 	readonly clientSecret?: string;
 	/** `client_name` advertised during Dynamic Client Registration. Default: `"kmcp"`. */
 	readonly clientName?: string;
+	/** Extra RFC 7591 metadata (`client_uri`, `logo_uri`, `tos_uri`, ...) merged into the registration document. */
+	readonly clientMetadata?: Partial<OAuthClientMetadata>;
 	/** Requested scopes, as a space-delimited string or a list of scope tokens. */
 	readonly scope?: string | readonly string[];
 	/**
@@ -79,22 +120,40 @@ export interface McpOAuthClientProviderOptions {
 	 * browser, prints to a terminal, or otherwise decides how a user is prompted.
 	 */
 	readonly onRedirect: (url: URL) => void | Promise<void>;
+	/**
+	 * Refresh the access token BEFORE it expires (through the SDK's `refreshAuthorization`), so a
+	 * request never has to fail with 401 first. Default: on, with a 60 s buffer. `false` leaves
+	 * refresh entirely to the transport's 401 path.
+	 */
+	readonly refresh?: McpOAuthRefreshOptions | false;
+	/** `fetch` used for proactive refresh. Default: the global `fetch`. */
+	readonly fetch?: FetchLike;
+	/**
+	 * Generate an OAuth `state` parameter for every authorization request and verify it on the
+	 * callback (see {@link McpOAuthClientProvider.verifyCallbackState}). Default: `true`. Some
+	 * authorization servers require `state` even though OAuth 2.1 only recommends it.
+	 */
+	readonly state?: boolean;
+	/** Clock for expiry decisions (ms since the Unix epoch). Default: `Date.now`. */
+	readonly now?: () => number;
 }
 
 /**
  * An interactive `authorization_code` + PKCE {@link OAuthClientProvider} for the official SDK
  * transports.
  *
- * The SDK owns the protocol: this class only persists what `auth()` hands it. There is no refresh
- * loop and no `finishAuth` of its own — the transport drives refresh, the 401 retry and the 403
- * scope step-up, and the host passes the callback `URLSearchParams` to `transport.finishAuth()`.
+ * The SDK owns the protocol: this class persists what `auth()` hands it, verifies the callback
+ * `state` the SDK deliberately leaves to hosts, and refreshes an expiring access token ahead of
+ * time through the SDK's own `refreshAuthorization`. There is no `finishAuth` of its own — the
+ * transport drives the 401 retry and the 403 scope step-up, and the host passes the callback
+ * `URLSearchParams` to `transport.finishAuth()` (or the manager's `completeAuthorization`).
  *
  * Credentials are keyed per authorization server (SEP-2352). Everything the SDK resolves an
  * `issuer` for is stored under `` `${issuer}/…` ``; everything bound to the MCP server instead —
- * the PKCE verifier, the discovery state, and the "last issuer seen" pointer — is stored under
- * `` `${serverUrl}/…` ``. Two MCP servers that resolve to the same authorization server therefore
- * share client credentials and tokens, which is the RFC 6749 §2.2 identity model: a `client_id` is
- * unique to the authorization server that issued it, not to the resource.
+ * the PKCE verifier, the `state`, the discovery state, and the "last issuer seen" pointer — is
+ * stored under `` `${serverUrl}/…` ``. Two MCP servers that resolve to the same authorization
+ * server therefore share client credentials and tokens, which is the RFC 6749 §2.2 identity
+ * model: a `client_id` is unique to the authorization server that issued it, not to the resource.
  *
  * A pre-registered {@link McpOAuthClientProviderOptions.clientId} makes this a *static* provider:
  * `saveClientInformation` is then absent from the instance, which is how the SDK distinguishes
@@ -103,7 +162,7 @@ export interface McpOAuthClientProviderOptions {
  * Instances are frozen. The store, the client secret, and the PKCE verifier are never reachable
  * through a public field.
  */
-export class McpOAuthClientProvider implements OAuthClientProvider {
+export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackStateVerifier {
 	/** The normalized MCP server URL used as this provider's store namespace. */
 	readonly serverUrl: string;
 	/** SEP-991 Client ID Metadata Document URL, when one was configured. */
@@ -113,9 +172,17 @@ export class McpOAuthClientProvider implements OAuthClientProvider {
 	readonly #clientSecret: string | undefined;
 	readonly #expectedIssuer: string | undefined;
 	readonly #clientName: string;
+	readonly #extraMetadata: Partial<OAuthClientMetadata>;
 	readonly #scope: string | undefined;
 	readonly #store: McpKeyValueStore;
 	readonly #onRedirect: (url: URL) => void | Promise<void>;
+	readonly #refresh:
+		| (Required<Pick<McpOAuthRefreshOptions, "bufferMs">> & Pick<McpOAuthRefreshOptions, "onError">)
+		| undefined;
+	readonly #fetch: FetchLike | undefined;
+	readonly #useState: boolean;
+	readonly #now: () => number;
+	readonly #refreshing = new Map<string, Promise<McpStoredOAuthTokens>>();
 
 	/**
 	 * Persists a dynamically registered client under `ctx.issuer`.
@@ -151,9 +218,24 @@ export class McpOAuthClientProvider implements OAuthClientProvider {
 		this.#clientSecret = options.clientSecret;
 		this.#expectedIssuer = options.clientId === undefined ? undefined : options.expectedIssuer;
 		this.#clientName = options.clientName ?? "kmcp";
+		this.#extraMetadata = { ...options.clientMetadata };
 		this.#scope = normalizeScope(options.scope);
 		this.#store = options.store ?? new InMemoryKeyValueStore();
 		this.#onRedirect = options.onRedirect;
+		if (options.refresh === false) this.#refresh = undefined;
+		else {
+			const bufferMs = options.refresh?.bufferMs ?? 60_000;
+			if (!Number.isFinite(bufferMs) || bufferMs < 0) {
+				throw new RangeError("refresh.bufferMs must be non-negative.");
+			}
+			this.#refresh = {
+				bufferMs,
+				...(options.refresh?.onError === undefined ? {} : { onError: options.refresh.onError }),
+			};
+		}
+		this.#fetch = options.fetch;
+		this.#useState = options.state !== false;
+		this.#now = options.now ?? Date.now;
 		if (options.clientId === undefined) {
 			// An own property rather than a prototype method: a static provider must not carry this
 			// member at all, and a prototype method cannot be withheld per instance.
@@ -185,12 +267,45 @@ export class McpOAuthClientProvider implements OAuthClientProvider {
 	 */
 	get clientMetadata(): OAuthClientMetadata {
 		return {
+			...this.#extraMetadata,
 			redirect_uris: [this.#redirectUrl.href],
 			token_endpoint_auth_method: this.#clientSecret === undefined ? "none" : "client_secret_post",
 			response_types: ["code"],
 			client_name: this.#clientName,
 			...(this.#scope === undefined ? {} : { scope: this.#scope }),
 		};
+	}
+
+	/**
+	 * Returns a fresh OAuth `state` value and remembers it for {@link verifyCallbackState}. The
+	 * SDK calls this when building the authorization URL; it never verifies the value itself.
+	 */
+	async state(): Promise<string> {
+		const bytes = new Uint8Array(32);
+		globalThis.crypto.getRandomValues(bytes);
+		const value = encodeBase64Url(bytes);
+		if (this.#useState) await this.#store.set(this.#key("state"), value);
+		return value;
+	}
+
+	/**
+	 * Verifies the `state` of an authorization callback against the value issued by
+	 * {@link state} and forgets it (one-time use). Passes when no state was recorded (a callback
+	 * for a redirect this process never issued cannot be checked) or when `state` is disabled.
+	 */
+	async verifyCallbackState(params: URLSearchParams): Promise<void> {
+		if (!this.#useState) return;
+		const key = this.#key("state");
+		const expected = await this.#store.get(key);
+		if (expected === undefined) return;
+		await this.#store.delete(key);
+		const received = params.get("state");
+		if (received === null || !constantTimeEqual(received, expected)) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.AUTH_STATE_MISMATCH,
+				"The OAuth callback state does not match the value issued for this authorization.",
+			);
+		}
 	}
 
 	/**
@@ -214,17 +329,24 @@ export class McpOAuthClientProvider implements OAuthClientProvider {
 	/**
 	 * Returns the token set for `ctx.issuer`. A context-less call is the transport's per-request
 	 * bearer-token read, which SEP-2352 requires to resolve the most recently saved set — hence
-	 * the last-issuer pointer rather than `undefined`.
+	 * the last-issuer pointer rather than `undefined`. An access token inside the refresh buffer
+	 * is refreshed first when a refresh token and discovery state are on hand; a refresh failure
+	 * returns the stale set so the transport's 401 path can recover.
 	 */
-	async tokens(ctx?: OAuthClientInformationContext): Promise<StoredOAuthTokens | undefined> {
+	async tokens(ctx?: OAuthClientInformationContext): Promise<McpStoredOAuthTokens | undefined> {
 		const issuer = ctx?.issuer ?? (await this.#lastIssuer());
-		return this.#readJson<StoredOAuthTokens>(this.#key("tokens", issuer));
+		const stored = await this.#readTokens(issuer);
+		if (stored === undefined || this.#refresh === undefined) return stored;
+		if (!this.#expiresSoon(stored, this.#refresh.bufferMs) || stored.refresh_token === undefined) {
+			return stored;
+		}
+		return this.#refreshSingleFlight(issuer, stored);
 	}
 
-	/** Persists a token set under `ctx.issuer` and records it as the server's last issuer. */
+	/** Persists a token set under `ctx.issuer`, stamping an absolute expiry, and records the last issuer. */
 	async saveTokens(tokens: StoredOAuthTokens, ctx?: OAuthClientInformationContext): Promise<void> {
 		await this.#rememberIssuer(ctx?.issuer);
-		await this.#store.set(this.#key("tokens", ctx?.issuer), JSON.stringify(tokens));
+		await this.#store.set(this.#key("tokens", ctx?.issuer), JSON.stringify(this.#stamp(tokens)));
 	}
 
 	/** Hands the authorization URL to {@link McpOAuthClientProviderOptions.onRedirect}. */
@@ -283,10 +405,34 @@ export class McpOAuthClientProvider implements OAuthClientProvider {
 		}
 		if (scope === "all" || scope === "verifier") {
 			await this.#store.delete(this.#key("code_verifier"));
+			await this.#store.delete(this.#key("state"));
 		}
 		if (scope === "all" || scope === "discovery") {
 			await this.#store.delete(this.#key("discovery"));
 		}
+	}
+
+	/** Describes the stored credentials without revealing any secret. Never triggers a refresh. */
+	async status(): Promise<McpOAuthCredentialStatus> {
+		const issuer = (await this.#lastIssuer()) ?? this.#expectedIssuer;
+		const tokens = await this.#readTokens(issuer);
+		const client = await this.clientInformation(issuer === undefined ? undefined : { issuer });
+		const claims: McpJwtClaims | undefined =
+			tokens?.id_token === undefined ? undefined : decodeJwtClaims(tokens.id_token);
+		const identity = claims === undefined ? undefined : identityFromClaims(claims);
+		return Object.freeze({
+			serverUrl: this.serverUrl,
+			...(issuer === undefined ? {} : { issuer }),
+			...(client?.client_id === undefined ? {} : { clientId: client.client_id }),
+			hasTokens: tokens !== undefined,
+			hasRefreshToken: tokens?.refresh_token !== undefined,
+			...(tokens?.token_type === undefined ? {} : { tokenType: tokens.token_type }),
+			...(tokens?.scope === undefined ? {} : { scope: tokens.scope }),
+			...(tokens?.expires_at === undefined
+				? {}
+				: { expiresAt: new Date(tokens.expires_at * 1000).toISOString() }),
+			...(identity === undefined ? {} : { identity }),
+		});
 	}
 
 	async #saveRegisteredClient(
@@ -295,6 +441,72 @@ export class McpOAuthClientProvider implements OAuthClientProvider {
 	): Promise<void> {
 		await this.#rememberIssuer(ctx?.issuer);
 		await this.#store.set(this.#key("client_info", ctx?.issuer), JSON.stringify(clientInformation));
+	}
+
+	#stamp(tokens: StoredOAuthTokens): McpStoredOAuthTokens {
+		const existing = (tokens as McpStoredOAuthTokens).expires_at;
+		if (existing !== undefined) return tokens as McpStoredOAuthTokens;
+		const lifetime = tokens.expires_in;
+		if (typeof lifetime !== "number" || !Number.isFinite(lifetime)) return tokens;
+		return { ...tokens, expires_at: Math.floor(this.#now() / 1000) + lifetime };
+	}
+
+	#expiresSoon(tokens: McpStoredOAuthTokens, bufferMs: number): boolean {
+		if (tokens.expires_at === undefined) return false;
+		return tokens.expires_at * 1000 - this.#now() <= bufferMs;
+	}
+
+	#refreshSingleFlight(
+		issuer: string | undefined,
+		stale: McpStoredOAuthTokens,
+	): Promise<McpStoredOAuthTokens> {
+		const key = issuer ?? "";
+		const inFlight = this.#refreshing.get(key);
+		if (inFlight !== undefined) return inFlight;
+		const task = this.#refreshTokens(issuer, stale).finally(() => {
+			if (this.#refreshing.get(key) === task) this.#refreshing.delete(key);
+		});
+		this.#refreshing.set(key, task);
+		return task;
+	}
+
+	async #refreshTokens(
+		issuer: string | undefined,
+		stale: McpStoredOAuthTokens,
+	): Promise<McpStoredOAuthTokens> {
+		try {
+			const discovery = await this.discoveryState();
+			const refreshToken = stale.refresh_token;
+			if (discovery?.authorizationServerUrl === undefined || refreshToken === undefined) {
+				return stale;
+			}
+			const ctx = issuer === undefined ? undefined : { issuer };
+			const clientInformation = await this.clientInformation(ctx);
+			if (clientInformation === undefined) return stale;
+			const resource = await selectResourceURL(this.serverUrl, this, discovery.resourceMetadata);
+			const refreshed = await refreshAuthorization(discovery.authorizationServerUrl, {
+				...(discovery.authorizationServerMetadata === undefined
+					? {}
+					: { metadata: discovery.authorizationServerMetadata }),
+				clientInformation,
+				refreshToken,
+				...(resource === undefined ? {} : { resource }),
+				...(this.#fetch === undefined ? {} : { fetchFn: this.#fetch }),
+			});
+			const stamped = this.#stamp({
+				...refreshed,
+				...(stale.issuer === undefined ? {} : { issuer: stale.issuer }),
+			});
+			await this.saveTokens(stamped, ctx);
+			return stamped;
+		} catch (error) {
+			this.#refresh?.onError?.(error);
+			return stale;
+		}
+	}
+
+	async #readTokens(issuer: string | undefined): Promise<McpStoredOAuthTokens | undefined> {
+		return this.#readJson<McpStoredOAuthTokens>(this.#key("tokens", issuer));
 	}
 
 	#key(kind: string, issuer?: string): string {
@@ -330,6 +542,38 @@ export class McpOAuthClientProvider implements OAuthClientProvider {
 	}
 }
 
+/** Display-only identity from OIDC claims (`sub`, `email`, `name` or `preferred_username`). */
+export function identityFromClaims(
+	claims: McpJwtClaims,
+): Readonly<{ subject?: string; email?: string; name?: string }> | undefined {
+	const subject = typeof claims.sub === "string" ? claims.sub : undefined;
+	const email = typeof claims.email === "string" ? claims.email : undefined;
+	const name =
+		typeof claims.name === "string"
+			? claims.name
+			: typeof claims.preferred_username === "string"
+				? claims.preferred_username
+				: undefined;
+	if (subject === undefined && email === undefined && name === undefined) return undefined;
+	return Object.freeze({
+		...(subject === undefined ? {} : { subject }),
+		...(email === undefined ? {} : { email }),
+		...(name === undefined ? {} : { name }),
+	});
+}
+
+/** Whether a token set's access token has expired (or expires within `bufferMs`). */
+export function oauthTokensExpireWithin(
+	tokens: McpStoredOAuthTokens,
+	bufferMs: number,
+	now: () => number = Date.now,
+): boolean {
+	if (tokens.expires_at === undefined) return false;
+	return tokens.expires_at * 1000 - now() <= bufferMs;
+}
+
+export { jwtExpiresAt };
+
 function absoluteUrl(value: string | URL, label: string): URL {
 	try {
 		return typeof value === "string" ? new URL(value) : new URL(value.href);
@@ -340,8 +584,19 @@ function absoluteUrl(value: string | URL, label: string): URL {
 	}
 }
 
-function normalizeScope(scope: string | readonly string[] | undefined): string | undefined {
+/** Joins a scope list into the space-delimited wire form; an empty value becomes `undefined`. */
+export function normalizeScope(scope: string | readonly string[] | undefined): string | undefined {
 	if (scope === undefined) return undefined;
 	const value = typeof scope === "string" ? scope : scope.join(" ");
-	return value.trim().length === 0 ? undefined : value;
+	return value.trim().length === 0 ? undefined : value.trim();
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+	const a = new TextEncoder().encode(left);
+	const b = new TextEncoder().encode(right);
+	let diff = a.length ^ b.length;
+	for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+		diff |= (a[index] ?? 0) ^ (b[index] ?? 0);
+	}
+	return diff === 0;
 }

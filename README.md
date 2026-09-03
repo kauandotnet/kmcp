@@ -286,9 +286,14 @@ lives in the kernel — compose those in your framework over `createNodeMcpHandl
 (one request conversion, `req.auth` never trusted).
 
 `serveMcpStdio(server)` returns `{ runtime, notify, close }` so a stdio server can emit list-changed
-and resource-updated signals on both eras. `connectionsFromMcpConfig(config)` turns an `mcpServers`
-config into keyed connection definitions with hub-safe namespace suggestions in
-`tags["kmcp.namespace"]`.
+and resource-updated signals on both eras. `connectionsFromMcpConfig(config, { env })` turns an
+`mcpServers` config (or the VS Code `servers` shape) into keyed connection definitions with hub-safe
+namespace suggestions in `tags["kmcp.namespace"]`, honoring `timeout` (seconds), `protocolVersion`,
+and `${VAR}` substitution when an `env` map is supplied; `standardMcpConfigPaths` /
+`discoverMcpConfigs` / `readMcpConfigFile` find and read the Claude Code, Claude Desktop, Cursor, VS
+Code, Windsurf and Kiro config locations. `decodeResourceContent` (`kmcp/client`) and
+`writeResourceToFile` (`kmcp/node`, atomic) materialize a `resources/read` result; pair the latter
+with `resource.updated` events to keep a file in sync.
 
 ## Connections and catalogs
 
@@ -333,45 +338,106 @@ cap; works on both eras and repairs the listen stream after a `prior` reconnect)
 `reconnect` (opt-in backoff after an UNEXPECTED close — every attempt re-enters the public
 `connect()`, so single-flight, drain queuing, and generation discipline are inherited; snapshots
 expose `reconnect.attempts`/`nextAttemptAt` and the manager emits `connection.reconnect.scheduled` /
-`connection.reconnect.exhausted`), and `configureClient` (a synchronous escape hatch over the
-freshly constructed official `Client` before `connect()`). `httpConnection` accepts a bearer string,
-an SDK `AuthProvider`, or an `OAuthClientProvider`; `headers` may not carry `Authorization` next to
-`auth`; `cachePartition` defaults to a digest of the credential identity.
+`connection.reconnect.exhausted`), `keepalive` (periodic `ping` / `server/discover`; after
+`failureThreshold` consecutive failures the session is closed as an unexpected close and `reconnect`
+takes over — `connection.keepalive.failed`, `CONNECTION_KEEPALIVE_FAILED`), `protocolVersion` (pin
+one exact revision, strict: a modern pin drives the `server/discover` probe, a legacy pin runs the
+plain `initialize` handshake offering only that revision; `MCP_SUPPORTED_PROTOCOL_VERSIONS` lists
+what can be pinned), `disconnectTimeoutMs` (a close that overruns it quarantines instead of
+hanging), `terminateSession` (send the Streamable HTTP `DELETE` on disconnect; default on), `tasks`
+(advertise the 2025-11-25 `tasks` client capability; default on), `extensions` (capability
+extensions), and `configureClient` (a synchronous escape hatch over the freshly constructed official
+`Client` before `connect()`). `httpConnection` accepts a bearer string, an SDK `AuthProvider`, or
+any `OAuthClientProvider` (an interactive one arms the `authorizing` flow; client-credentials and
+enterprise providers advertise their capability extension automatically); `headers` may not carry
+`Authorization` next to `auth`; `middlewares` composes SDK fetch middlewares (`withLogging`,
+`createMiddleware`, …) around the transport; `resume` adopts a server-side session once (`sessionId`
+plus the negotiated `protocolVersion`) and any later reconnect starts fresh; `reconnection`
+overrides `MCP_HTTP_RECONNECTION_DEFAULTS` (1 s → 30 s, factor 2, 10 retries for the
+server-to-client stream); `cachePartition` defaults to a digest of the credential identity.
+`stdioConnection` (`kmcp/node`) adds `onStderrLine` to receive the child's stderr line by line.
 
 Manager verbs take the SDK request option types plus `meta` (`_meta` passthrough) and an optional
-generation/fingerprint `control`: `callTool`, `callToolParsed` (raises `McpToolCallError` on
-`isError` unless `raiseOnError: false`; the SDK has already validated `structuredContent`),
-`readResource`, `getPrompt`, `complete`, `listTools`, `listResources`, `listResourceTemplates`,
-`listPrompts`, `ping` (`server/discover` on modern, `ping` on legacy), `setLogLevel`,
-`subscribeResource` / `unsubscribeResource` (legacy sends the RPC; 2026-07-28 has no
-`resources/subscribe`, so the subscription is expressed through the `subscriptions/listen` filter —
-updates surface as `resource.updated` events and subscriptions are generation-scoped, so
-re-subscribe after a reconnect), `notifyRootsChanged` (legacy-era only — the 2026 wire removed
-roots), `connectAll`, `completeAuthorization`. The hub mirrors `callToolParsed` and injects the
-resolved catalog `Tool` as `toolDefinition`. Snapshots carry `instructions`, `serverInfo`,
-`errorDetail { kind, code }` (so a panel can tell "server is 2025-only" from "401"), and `watch`
-(which list-changed sections are honored and why not).
+generation/fingerprint `control`: `callTool` (with `contract` it refuses the call when the
+advertised tool has drifted from an expected shape in a way that breaks it — see
+`checkToolContract`), `callToolParsed` (raises `McpToolCallError` on `isError` unless
+`raiseOnError: false`; the SDK has already validated `structuredContent`), `readResource`,
+`getPrompt`, `complete`, `listTools`, `listResources`, `listResourceTemplates`, `listPrompts`,
+`listSkills` / `readSkill` (SEP-2640: the `skill://index.json` index, then a scan of the resource
+list), `ping` (`server/discover` on modern, `ping` on legacy), `discover` (a live `server/discover`,
+modern only), `setLogLevel`, `subscribeResource` / `unsubscribeResource` (legacy sends the RPC;
+2026-07-28 has no `resources/subscribe`, so the subscription is expressed through the
+`subscriptions/listen` filter — updates surface as `resource.updated` events and subscriptions are
+generation-scoped, so re-subscribe after a reconnect), `notifyRootsChanged` (legacy-era only — the
+2026 wire removed roots), `connectAll`, `completeAuthorization`, and the task verbs below. The hub
+mirrors `callToolParsed` and injects the resolved catalog `Tool` as `toolDefinition`. Snapshots
+carry `transportKind`, `sessionId`, `connectionMode` (`stateful` / `stateless`), `supportedVersions`
+(from `server/discover`), `lastSeenAt`, `keepalive`, `instructions`, `serverInfo`,
+`errorDetail { kind, code, httpStatus? }` (so a panel can tell "server is 2025-only" from "401" from
+"registration rejected"), and `watch` (which list-changed sections are honored, why not, and how
+often the stream was re-opened).
+
+Two resilience behaviors run without configuration. A modern `subscriptions/listen` stream that
+drops unexpectedly (`closed` resolving `'remote'`) is re-opened with 1 s → 30 s backoff for as long
+as the generation lives (`connection.listen.dropped` / `connection.listen.reopened`); the SDK never
+re-listens on its own, so list changes and resource updates would otherwise stop silently after the
+first network hiccup. A request that fails with HTTP 404 on a transport that carries a session id is
+read as the server having expired the session: the generation fails with
+`CONNECTION_SESSION_EXPIRED` (`connection.session.expired`) and the reconnect policy, when any,
+opens a fresh session.
 
 Catalogs are capability-aware and partial (`fresh` / `stale` / `failed` / `unsupported` per
 section), bounded, detached and deeply frozen. Snapshots exclude transports, endpoints, OAuth
 objects and raw error messages.
 
-### Interactive OAuth
+### Tasks (2025-11-25)
 
 ```ts
-import { InMemoryKeyValueStore, McpOAuthClientProvider, httpConnection } from "kmcp/client";
-import { FileKeyValueStore, loopbackOAuthCallback } from "kmcp/node";
+const created = await manager.callToolTask("github", "index_repo", { repo: "octo/mcp" });
+const result = await manager.waitForTask("github", created.task.taskId, {
+	pollIntervalMs: 2000,
+	onUpdate: (update) => console.log(update.status, update.statusMessage),
+});
+// or in one go: manager.callToolViaTask(id, name, args, { onUpdate })
+await manager.listTasks("github");
+await manager.cancelTask("github", created.task.taskId);
+```
 
-const callback = await loopbackOAuthCallback({ port: 0 });
+Task-augmented tool calls (SEP-1686) use the 2025-11-25 wire vocabulary through `Client.request()`
+with the SDK's own result validators: `callToolTask`, `waitForTask` (a `failed` or `cancelled` task
+rejects with `McpTaskFailedError`; `input_required` delegates to `tasks/result`), `callToolViaTask`,
+`getTask`, `getTaskResult`, `listTasks`, `cancelTask`, and `supportsToolTasks`. Revision 2026-07-28
+moved tasks to the `io.modelcontextprotocol/tasks` extension, which the SDK does not implement yet,
+so on a modern connection every task verb rejects with `TASKS_UNAVAILABLE` instead of returning a
+tool result where a task id was expected. `McpTaskClient` exposes the same verbs over a raw official
+`Client`.
+
+### OAuth
+
+```ts
+import { McpOAuthClientProvider, authorizeOAuth, httpConnection } from "kmcp/client";
+import { FileKeyValueStore, loopbackOAuthCallback, openBrowser } from "kmcp/node";
+
+const callback = await loopbackOAuthCallback({ port: [13316, 31613, 0] });
 const provider = new McpOAuthClientProvider({
 	serverUrl: "https://mcp.example.com/mcp",
 	redirectUrl: callback.redirectUrl,
 	store: new FileKeyValueStore("~/.config/app/oauth.json"),
-	onRedirect: callback.onRedirect,
+	onRedirect: async (url) => {
+		callback.onRedirect(url);
+		if (!(await openBrowser(url))) console.log(`Open ${url.href}`);
+	},
 });
+// Log in ahead of any connection (discovery, registration or CIMD, redirect, exchange):
+await authorizeOAuth(provider, {
+	serverUrl: provider.serverUrl,
+	waitForCallback: callback.waitForCallback,
+});
+console.log(await provider.status()); // non-secret: issuer, clientId, scope, expiresAt, identity
 manager.register(
 	httpConnection({ id: "remote", url: "https://mcp.example.com/mcp", auth: provider }),
 );
+// Or let the connection raise the challenge:
 try {
 	await manager.connect("remote");
 } catch {
@@ -380,9 +446,37 @@ try {
 }
 ```
 
-The provider stores credentials per authorization-server issuer (SEP-2352), persists PKCE and
-discovery state, never overwrites a pre-registered client id, and leaves refresh, 401 retry and
-step-up to the SDK transport.
+`McpOAuthClientProvider` stores credentials per authorization-server issuer (SEP-2352), persists
+PKCE and discovery state, never overwrites a pre-registered client id, issues and verifies the OAuth
+`state` parameter the SDK leaves to hosts (`AUTH_STATE_MISMATCH`; the manager's
+`completeAuthorization` verifies it before the code is exchanged), refreshes an access token before
+it expires through the SDK's `refreshAuthorization` (single-flight, 60 s buffer, off with
+`refresh: false`; a failed refresh falls back to the transport's 401 path), and reports what it
+holds through `status()`. `explainOAuthError` turns any error from the flow into a stable
+`{ kind, message, remediation? }` — registration refused or unsupported, client rejected, access
+denied, issuer mix-up (never echoing the attacker-controlled issuer), insufficient scope — and
+`describeError` carries the same classification into snapshots. `openBrowser` / `browserOpenCommand`
+(`kmcp/node`) open only `http(s)` URLs and never through a shell.
+
+Machine-to-machine (`io.modelcontextprotocol/oauth-client-credentials`):
+
+```ts
+import { clientCredentialsAuth, validateOAuthCredentials } from "kmcp/client";
+
+const auth = clientCredentialsAuth({ clientId, clientSecret, scope: ["read"] }); // or privateKey / jwtBearerAssertion
+await validateOAuthCredentials(auth, "https://mcp.example.com/mcp"); // one real token request
+manager.register(httpConnection({ id: "m2m", url: "https://mcp.example.com/mcp", auth }));
+```
+
+`clientCredentialsAuth` builds the SDK's `ClientCredentialsProvider` / `PrivateKeyJwtProvider` /
+`StaticPrivateKeyJwtProvider`; `tokenEndpoint` pins the endpoint for servers without discoverable
+metadata. Enterprise-managed authorization (SEP-990,
+`io.modelcontextprotocol/enterprise-managed-authorization`) is `authorizeEnterpriseIdp` for the
+one-time OIDC sign-in at the IdP (PKCE S256, `state`, `nonce`) and `enterpriseManagedAuth` for the
+runtime `CrossAppAccessProvider`, which exchanges the ID token for an ID-JAG at the IdP and the
+ID-JAG for an access token at the MCP authorization server, renewing the ID token through the IdP
+refresh token (`reloadIdpTokens` / `onIdpTokensRefreshed` keep several processes in step).
+Connections that use either provider advertise the matching capability extension automatically.
 
 ## Hubs
 
@@ -454,6 +548,11 @@ forwarded.
   over the `all` suite.
 
 ## Known gaps
+
+- Tasks only on 2025-11-25: the SDK has no runtime for the 2026-07-28
+  `io.modelcontextprotocol/tasks` extension yet, so modern connections reject the task verbs.
+- No bundled OS keychain, persistent session daemon, or x402 payment support: bring a
+  `McpKeyValueStore`, a process model, and a `fetch` middleware respectively.
 
 - Anything that needs ownership of the SDK `tools/list` / `tools/call` handlers: cursor pagination,
   list-level middleware, protocol-level tool errors (the SDK converts every handler throw into an

@@ -5,6 +5,7 @@ export type {
 	McpCatalogStatus,
 } from "./client/catalog.ts";
 export {
+	MCP_HTTP_RECONNECTION_DEFAULTS,
 	McpClientSession,
 	McpConnectionDefinition,
 	createOfficialClient,
@@ -15,9 +16,13 @@ export {
 } from "./client/connection.ts";
 export type {
 	McpAutoRefreshOptions,
+	McpCapabilityExtensions,
 	McpClientAdvertise,
+	McpKeepaliveOptions,
 	McpReconnectBackoffOptions,
 	McpReconnectOptions,
+	McpResolvedAutoRefreshOptions,
+	McpResolvedKeepaliveOptions,
 	McpResolvedReconnectOptions,
 	McpClientNotificationHandlers,
 	McpClientNotificationMethod,
@@ -26,20 +31,113 @@ export type {
 	McpConnectionDefinitionOptions,
 	McpHttpAuth,
 	McpHttpConnectionOptions,
+	McpHttpResumeOptions,
 	McpInProcessConnectionOptions,
 	McpInProcessServer,
 	McpOfficialClientOverrides,
 	McpRequestDefaults,
 	McpRootsSource,
 	McpTransportFactory,
+	McpTransportKind,
 } from "./client/connection.ts";
-export { InMemoryKeyValueStore, McpOAuthClientProvider } from "./client/oauth.ts";
-export type { McpKeyValueStore, McpOAuthClientProviderOptions } from "./client/oauth.ts";
-export { MCP_MODERN_PROTOCOL_VERSION } from "./internal/protocol.ts";
-export type { McpProtocolEra } from "./internal/protocol.ts";
+export {
+	InMemoryKeyValueStore,
+	McpOAuthClientProvider,
+	identityFromClaims,
+	normalizeScope,
+	oauthTokensExpireWithin,
+} from "./client/oauth.ts";
+export type {
+	McpCallbackStateVerifier,
+	McpKeyValueStore,
+	McpOAuthClientProviderOptions,
+	McpOAuthCredentialStatus,
+	McpOAuthRefreshOptions,
+	McpStoredOAuthTokens,
+} from "./client/oauth.ts";
+export {
+	MCP_CLIENT_CREDENTIALS_EXTENSION,
+	MCP_DEFAULT_IDP_SCOPE,
+	MCP_ENTERPRISE_MANAGED_AUTH_EXTENSION,
+	MCP_ID_JAG_GRANT_PROFILE,
+	MCP_PRIVATE_KEY_JWT_ALGORITHMS,
+	assertCallbackSucceeded,
+	authorizeEnterpriseIdp,
+	authorizeOAuth,
+	clientCredentialsAuth,
+	enterpriseManagedAuth,
+	explainOAuthError,
+	oauthGrantOf,
+	oauthServerUrl,
+	pinnedDiscoveryState,
+	refreshIdpTokens,
+	serverAcceptsIdJag,
+	validateOAuthCredentials,
+} from "./client/oauth-flows.ts";
+export type {
+	McpAuthorizeOAuthOptions,
+	McpAuthorizeOAuthResult,
+	McpClientCredentialsOptions,
+	McpEnterpriseManagedAuthOptions,
+	McpIdpAuthorizationOptions,
+	McpIdpAuthorizationResult,
+	McpIdpTokens,
+	McpOAuthFailure,
+	McpOAuthFailureKind,
+	McpOAuthGrant,
+	McpRefreshIdpTokensOptions,
+	McpValidateCredentialsOptions,
+	McpValidatedCredentials,
+} from "./client/oauth-flows.ts";
+export { decodeJwtClaims, jwtExpiresAt } from "./client/jwt.ts";
+export type { McpJwtClaims } from "./client/jwt.ts";
+export {
+	MCP_TASK_TERMINAL_STATUSES,
+	McpTaskClient,
+	McpTaskFailedError,
+	assertTasksAvailable,
+	supportsToolTasks,
+} from "./client/tasks.ts";
+export type {
+	McpCreateToolTaskOptions,
+	McpTaskPollOptions,
+	McpTaskRequester,
+	McpTaskUpdate,
+} from "./client/tasks.ts";
+export {
+	MCP_SKILLS_EXTENSION_KEY,
+	MCP_SKILLS_INDEX_URI,
+	discoverSkills,
+	parseSkillsIndex,
+	resolveSkillUri,
+	skillTextContent,
+	skillsFromResources,
+} from "./client/skills.ts";
+export type { McpSkill, McpSkillReader, McpSkillType } from "./client/skills.ts";
+export { decodeResourceContent } from "./client/resources.ts";
+export type { McpDecodeResourceOptions, McpDecodedResourceContent } from "./client/resources.ts";
+export { checkPromptContract, checkToolContract } from "./client/contract.ts";
+export type {
+	McpContractMode,
+	McpContractResult,
+	McpExpectedPrompt,
+	McpExpectedTool,
+	McpPromptContractOptions,
+	McpSchemaShape,
+	McpToolContractOptions,
+} from "./client/contract.ts";
+export {
+	MCP_LEGACY_PROTOCOL_VERSIONS,
+	MCP_MODERN_PROTOCOL_VERSION,
+	MCP_SUPPORTED_PROTOCOL_VERSIONS,
+	isModernProtocolVersion,
+	resolveProtocolPin,
+} from "./internal/protocol.ts";
+export type { McpProtocolEra, McpProtocolPin } from "./internal/protocol.ts";
 export {
 	McpConnectionManager,
 	McpToolCallError,
+	McpToolContractError,
 	describeError,
 	parseToolResult,
 	throwIfToolError,
@@ -53,15 +151,19 @@ export type {
 	McpConnectionListener,
 	McpConnectionManagerOptions,
 	McpConnectionManagerSnapshot,
+	McpConnectionMode,
 	McpConnectionOperationControl,
 	McpConnectionPhase,
 	McpConnectionSnapshot,
+	McpContractOptions,
 	McpErrorDetail,
+	McpKeepaliveSnapshot,
 	McpMetaOptions,
 	McpMrtrForwardOptions,
 	McpParsedToolResult,
 	McpPingResult,
 	McpReadOptions,
 	McpRequestOptionsWithMeta,
+	McpToolContractOption,
 	McpWatchSnapshot,
 } from "./client/manager.ts";

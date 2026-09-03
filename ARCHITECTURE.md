@@ -90,6 +90,19 @@ The manager guarantees:
     `resources/subscribe` RPC no longer exists); the manager re-opens its listen stream with the
     widened filter, new-before-old (over-delivery in the overlap, never a gap).
 
+11. Every session that ends without a deliberate lifecycle transition goes through one path — the
+    transport's `onclose`, the keepalive verdict, and a server that declared the Streamable HTTP
+    session expired (HTTP 404 on a session-bearing transport) all release the session, record the
+    cause (`CONNECTION_NOT_ONLINE`, `CONNECTION_KEEPALIVE_FAILED`, `CONNECTION_SESSION_EXPIRED`),
+    announce it, and only then hand over to the reconnect policy. Only the entry's CURRENT session
+    can fail it, so a late signal from a superseded session is a no-op.
+12. A modern `subscriptions/listen` stream that drops remotely is re-opened by the manager with
+    backoff for as long as its generation lives; the SDK never re-listens on its own. `'local'` and
+    `'graceful'` closes are deliberate and never trigger a re-open.
+13. A resumed Streamable HTTP session (`httpConnection({ resume })`) is consumed by the first
+    transport only: once the server declares it gone, the reconnect opens a fresh session rather
+    than resuming a dead one forever.
+
 The present implementation is process-local. Durable desired state and cross-process ownership must
 not be inferred from these guarantees.
 
@@ -109,6 +122,19 @@ but stops at the first opaque failure, so requirements behind a gate the request
 never disclosed. `authorize()` re-enforces checks at call time (materialization already hides;
 call-time matters for long-lived instances) and raises `McpInsufficientScopeError` when the
 shortfall is scope-shaped.
+
+### Client-side OAuth
+
+`McpOAuthClientProvider` implements the SDK's `OAuthClientProvider` and nothing more: the SDK owns
+discovery, registration, PKCE, the redirect, the exchange, the 401 retry and the 403 step-up. kmcp
+adds the three things the SDK leaves to hosts — issuing and verifying the callback `state`,
+refreshing an expiring token before a request fails (through the SDK's `refreshAuthorization`,
+single-flight, falling back to the 401 path on failure), and a non-secret `status()`. The
+non-interactive grants reuse the SDK's providers verbatim (`clientCredentialsAuth`,
+`enterpriseManagedAuth`); `httpConnection` derives the capability extension to advertise from the
+provider's grant. Tasks are the one place kmcp speaks a wire vocabulary the SDK has no runtime for:
+the 2025-11-25 task requests go through `Client.request()` with the SDK's own result validators, and
+every modern connection refuses them rather than degrading a task call into a plain result.
 
 ## Materialization pipeline
 
