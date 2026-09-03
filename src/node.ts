@@ -8,6 +8,8 @@ import {
 	type StdioServerHandle,
 } from "@modelcontextprotocol/server/stdio";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createInterface } from "node:readline";
+import type { Readable } from "node:stream";
 
 import {
 	toNodeHandler,
@@ -36,18 +38,54 @@ import {
 
 export interface McpStdioConnectionOptions<Id extends string> extends Omit<
 	McpConnectionDefinitionOptions<Id>,
-	"transport"
+	"transport" | "transportKind"
 > {
 	readonly stdio: StdioServerParameters;
+	/**
+	 * Receives every newline-terminated line the child writes to stderr (the SDK pipes it instead
+	 * of inheriting the parent's stderr). Lines are untrusted upstream text: bound them before they
+	 * reach logs. Without it the SDK default applies (`stdio.stderr`, else `inherit`).
+	 */
+	readonly onStderrLine?: (line: string) => void;
+	/** Longest stderr line delivered to `onStderrLine`; longer lines are truncated. Default: 8 KiB. */
+	readonly maxStderrLineLength?: number;
 }
+
+const DEFAULT_MAX_STDERR_LINE = 8 * 1024;
 
 export function stdioConnection<const Id extends string>(
 	options: McpStdioConnectionOptions<Id>,
 ): McpConnectionDefinition<Id> {
-	const { stdio, ...definition } = options;
+	const { stdio, onStderrLine, maxStderrLineLength, ...definition } = options;
+	if (onStderrLine !== undefined && typeof onStderrLine !== "function") {
+		throw new TypeError("onStderrLine must be a function.");
+	}
+	const maxLine = maxStderrLineLength ?? DEFAULT_MAX_STDERR_LINE;
+	if (!Number.isSafeInteger(maxLine) || maxLine < 1) {
+		throw new RangeError("maxStderrLineLength must be a positive integer.");
+	}
 	return new McpConnectionDefinition({
 		...definition,
-		transport: () => new StdioClientTransport(stdio),
+		transportKind: "stdio",
+		transport: () => {
+			if (onStderrLine === undefined) return new StdioClientTransport(stdio);
+			const transport = new StdioClientTransport({ ...stdio, stderr: "pipe" });
+			// With `stderr: "pipe"` the SDK exposes a PassThrough from construction time, so the
+			// reader attaches before `start()` and never loses early startup output.
+			const stream = transport.stderr as Readable | null;
+			if (stream !== null) {
+				const lines = createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
+				lines.on("line", (line) => {
+					if (line.length === 0) return;
+					try {
+						onStderrLine(line.length > maxLine ? `${line.slice(0, maxLine)}…` : line);
+					} catch {
+						// A throwing observer must not break the transport.
+					}
+				});
+			}
+			return transport;
+		},
 	});
 }
 
@@ -181,18 +219,43 @@ export type {
 	McpHttpServerAddress,
 	McpHttpServerHandle,
 } from "./node/serve.ts";
-export { FileKeyValueStore, loopbackOAuthCallback } from "./node/oauth.ts";
-export type { McpLoopbackOAuthCallback, McpLoopbackOAuthCallbackOptions } from "./node/oauth.ts";
+export {
+	FileKeyValueStore,
+	browserOpenCommand,
+	loopbackOAuthCallback,
+	openBrowser,
+} from "./node/oauth.ts";
+export type {
+	McpBrowserOpenCommand,
+	McpLoopbackOAuthCallback,
+	McpLoopbackOAuthCallbackOptions,
+} from "./node/oauth.ts";
 
 export {
 	MCP_CONFIG_TAGS,
+	asMcpServersConfig,
 	connectionsFromMcpConfig,
+	discoverMcpConfigs,
 	mcpConfigNamespace,
+	readMcpConfigFile,
+	standardMcpConfigPaths,
+	type McpConfigCandidate,
 	type McpConfigConnectionDefaults,
 	type McpConfigConnections,
+	type McpConfigDiscovery,
 	type McpConfigLoaderOptions,
+	type McpConfigPathOptions,
+	type McpConfigProblem,
+	type McpDiscoveredConfig,
 	type McpHttpServerConfig,
 	type McpServerConfig,
 	type McpServersConfig,
 	type McpStdioServerConfig,
 } from "./node/config.ts";
+export { syncResourceToFile, writeDecodedResource, writeResourceToFile } from "./node/resources.ts";
+export type {
+	McpResourceFileSync,
+	McpResourceFileSyncOptions,
+	McpWriteResourceFileOptions,
+	McpWrittenResourceFile,
+} from "./node/resources.ts";

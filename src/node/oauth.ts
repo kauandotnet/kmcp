@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -112,10 +113,20 @@ export class FileKeyValueStore implements McpKeyValueStore {
 
 /** Options for {@link loopbackOAuthCallback}. */
 export interface McpLoopbackOAuthCallbackOptions {
-	/** Port to bind on `127.0.0.1`. Default: `0`, an ephemeral port chosen by the OS. */
-	readonly port?: number;
+	/**
+	 * Port to bind on `127.0.0.1`. Default: `0`, an ephemeral port chosen by the OS. Pass a list to
+	 * try fixed ports in order (a pre-registered client or a hosted Client ID Metadata Document
+	 * lists exact `redirect_uris`); the first free one is bound.
+	 */
+	readonly port?: number | readonly number[];
 	/** Path the authorization server redirects back to. Default: `"/callback"`. */
 	readonly path?: string;
+	/**
+	 * Host name written into `redirectUrl`. The endpoint always binds the loopback IP literal
+	 * (RFC 8252 §8.3); `"localhost"` only changes the string some pre-registered clients require.
+	 * Default: `"127.0.0.1"`.
+	 */
+	readonly hostname?: "127.0.0.1" | "localhost";
 	/** How long {@link McpLoopbackOAuthCallback.waitForCallback} waits. Default: 5 minutes. */
 	readonly timeoutMs?: number;
 }
@@ -220,11 +231,32 @@ export async function loopbackOAuthCallback(
 		return closing;
 	}
 
-	try {
-		await listen(server, options.port ?? 0);
-	} catch (error) {
+	const ports = typeof options.port === "number" ? [options.port] : [...(options.port ?? [0])];
+	if (ports.length === 0) {
 		clearTimeout(timer);
-		throw error;
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			"loopbackOAuthCallback needs at least one port to try.",
+		);
+	}
+	let bound = false;
+	let lastError: unknown;
+	for (const port of ports) {
+		try {
+			await listen(server, port);
+			bound = true;
+			break;
+		} catch (error) {
+			lastError = error;
+		}
+	}
+	if (!bound) {
+		clearTimeout(timer);
+		throw new KmcpError(
+			KMCP_ERROR_CODES.OPERATION_FAILED,
+			`None of the loopback OAuth callback ports could be bound (${ports.join(", ")}).`,
+			{ cause: lastError },
+		);
 	}
 
 	const address = server.address();
@@ -235,7 +267,7 @@ export async function loopbackOAuthCallback(
 			"The loopback OAuth callback server did not bind a TCP port.",
 		);
 	}
-	const redirectUrl = new URL(`http://127.0.0.1:${address.port}${path}`);
+	const redirectUrl = new URL(`http://${options.hostname ?? "127.0.0.1"}:${address.port}${path}`);
 
 	return Object.freeze({
 		redirectUrl,
@@ -270,6 +302,12 @@ function handleCallback(
 	path: string,
 	settlers: { resolve(params: URLSearchParams): void; reject(error: unknown): void },
 ): void {
+	// Only loopback names may address this endpoint (DNS-rebinding defense).
+	const host = (request.headers.host ?? "").split(":")[0] ?? "";
+	if (host !== "127.0.0.1" && host !== "localhost" && host !== "[::1]") {
+		respond(response, 403, "Forbidden", "This endpoint only accepts loopback requests.");
+		return;
+	}
 	const url = new URL(request.url ?? "/", "http://127.0.0.1");
 	if (url.pathname !== path) {
 		respond(response, 404, "Not found", "This is not the OAuth callback endpoint.");
@@ -320,4 +358,54 @@ function respond(
 
 function page(title: string, body: string): string {
 	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${title}</title></head><body><h1>${title}</h1><p>${body}</p></body></html>`;
+}
+
+/** The launcher invocation {@link openBrowser} runs: never a shell. */
+export interface McpBrowserOpenCommand {
+	readonly command: string;
+	readonly args: readonly string[];
+}
+
+/**
+ * The platform command that opens `url` in the default browser. Exported so hosts can inspect or
+ * run it themselves. Two invariants hold because the URL comes from the authorization server:
+ * only `http:` and `https:` are accepted (a `javascript:`, `file:`, or custom scheme never reaches
+ * the OS URL handler), and no command interpreter is involved — on Windows `rundll32
+ * url.dll,FileProtocolHandler` hands the URL straight to the shell-execute API, whereas
+ * `cmd /c start` would interpret `&`, `|`, `^`, and `%VAR%` inside a URL.
+ */
+export function browserOpenCommand(
+	url: URL,
+	platform: NodeJS.Platform = process.platform,
+): McpBrowserOpenCommand {
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.AUTH_FORBIDDEN,
+			`Refusing to open a '${url.protocol}' URL; only http: and https: authorization URLs are opened.`,
+		);
+	}
+	// WHATWG serialization percent-encodes whitespace and quotes: one unambiguous argument.
+	const target = url.href;
+	if (platform === "darwin")
+		return Object.freeze({ command: "open", args: Object.freeze([target]) });
+	if (platform === "win32") {
+		return Object.freeze({
+			command: "rundll32",
+			args: Object.freeze(["url.dll,FileProtocolHandler", target]),
+		});
+	}
+	return Object.freeze({ command: "xdg-open", args: Object.freeze([target]) });
+}
+
+/**
+ * Opens an authorization URL in the user's default browser, when the host decides to. Resolves
+ * `true` when the launcher ran, `false` when it could not (no browser, headless host): the caller
+ * then shows the URL for manual use. Throws only for a non-`http(s)` URL, which is a bad
+ * authorization server rather than a missing browser. kmcp never calls this on its own.
+ */
+export function openBrowser(url: URL): Promise<boolean> {
+	const { command, args } = browserOpenCommand(url);
+	return new Promise((resolve) => {
+		execFile(command, [...args], { windowsHide: true }, (error) => resolve(error === null));
+	});
 }

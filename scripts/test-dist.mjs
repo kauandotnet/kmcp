@@ -13,8 +13,16 @@ for (const entry of entries) {
 }
 
 const { defineServer, defineTool, MCP_MODERN_PROTOCOL_VERSION } = modules["kmcp/server"];
-const { inProcessConnection } = modules["kmcp/client"];
-const { createNodeMcpHandler } = modules["kmcp/node"];
+const { inProcessConnection, McpTaskClient, clientCredentialsAuth, oauthGrantOf } =
+	modules["kmcp/client"];
+const { createNodeMcpHandler, discoverMcpConfigs, browserOpenCommand } = modules["kmcp/node"];
+assert.equal(typeof McpTaskClient, "function");
+assert.equal(
+	oauthGrantOf(clientCredentialsAuth({ clientId: "a", clientSecret: "b" })),
+	"client_credentials",
+);
+assert.equal(typeof discoverMcpConfigs, "function");
+assert.equal(browserOpenCommand(new URL("https://x.example/a"), "linux").command, "xdg-open");
 
 const definition = defineServer(
 	{ name: "dist-smoke", version: "0.0.0" },

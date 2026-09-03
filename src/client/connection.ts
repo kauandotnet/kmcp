@@ -11,6 +11,7 @@ import {
 	type InputRequiredOptions,
 	type ListChangedHandlers,
 	type LoggingLevel,
+	type Middleware,
 	mergeCapabilities,
 	type NotificationTypeMap,
 	type OAuthClientProvider,
@@ -18,10 +19,13 @@ import {
 	type RequestTypeMap,
 	type ResponseCacheStore,
 	type Root,
+	type ServerCapabilities,
 	StreamableHTTPClientTransport,
 	type StreamableHTTPClientTransportOptions,
+	type StreamableHTTPReconnectionOptions,
 	type Transport,
 	type VersionNegotiationOptions,
+	applyMiddlewares,
 } from "@modelcontextprotocol/client";
 import type {
 	AuthInfo,
@@ -32,9 +36,21 @@ import type {
 } from "@modelcontextprotocol/server";
 
 import { KMCP_ERROR_CODES, KmcpError } from "../errors.ts";
-import { MCP_MODERN_PROTOCOL_VERSION, type McpProtocolEra } from "../internal/protocol.ts";
+import {
+	MCP_MODERN_PROTOCOL_VERSION,
+	MCP_SUPPORTED_PROTOCOL_VERSIONS,
+	type McpProtocolEra,
+	isModernProtocolVersion,
+	resolveProtocolPin,
+} from "../internal/protocol.ts";
 import { assertNonEmpty, type MaybePromise } from "../internal/value.ts";
 import { KMCP_VERSION } from "../internal/version.ts";
+import type { McpCallbackStateVerifier } from "./oauth.ts";
+import {
+	MCP_CLIENT_CREDENTIALS_EXTENSION,
+	MCP_ENTERPRISE_MANAGED_AUTH_EXTENSION,
+	oauthGrantOf,
+} from "./oauth-flows.ts";
 
 export type McpTransportFactory = () => MaybePromise<Transport>;
 
@@ -142,6 +158,49 @@ export interface McpResolvedReconnectOptions {
 	readonly resetAfterMs?: number;
 }
 
+/**
+ * Opt-in liveness probing of an online connection: a periodic `ping` (legacy) or
+ * `server/discover` (modern). After `failureThreshold` consecutive failures the session is closed
+ * as an UNEXPECTED close, so the definition's `reconnect` policy (when any) takes over.
+ */
+export interface McpKeepaliveOptions {
+	/** Interval between probes (ms). Default: 30000. */
+	readonly intervalMs?: number;
+	/** Timeout of one probe (ms). Default: 10000. */
+	readonly timeoutMs?: number;
+	/** Consecutive failures before the session is declared dead. Default: 2. */
+	readonly failureThreshold?: number;
+}
+
+export type McpResolvedKeepaliveOptions = Readonly<Required<McpKeepaliveOptions>>;
+
+/** The transport carrying a connection, as declared by the helper that built it. */
+export type McpTransportKind = "custom" | "in-process" | "sse" | "stdio" | "streamable-http";
+
+/**
+ * A server-side session adopted without a handshake. The SDK skips `initialize` / the
+ * `server/discover` probe when the transport already carries a session id, so the client learns
+ * neither the era nor the server's capabilities; this record supplies what the original handshake
+ * reported. Persist it from a connection snapshot (`sessionId`, `protocolVersion`, `capabilities`,
+ * `serverInfo`, `instructions`) and hand it back on the next start.
+ */
+export interface McpResumedSession {
+	readonly sessionId: string;
+	/** The revision the original handshake negotiated; drives the era and the wire header. */
+	readonly protocolVersion?: string;
+	readonly capabilities?: ServerCapabilities;
+	readonly serverInfo?: Implementation;
+	readonly instructions?: string;
+}
+
+/** `McpResumedSession` with the era resolved from `protocolVersion`. */
+export interface McpResolvedResumedSession extends McpResumedSession {
+	readonly era: McpProtocolEra | undefined;
+}
+
+/** The SDK's `capabilities.extensions` map: reverse-DNS extension ids to JSON option objects. */
+export type McpCapabilityExtensions = NonNullable<ClientCapabilities["extensions"]>;
+
 export interface McpConnectionDefinitionOptions<Id extends string> {
 	readonly id: Id;
 	readonly label?: string;
@@ -150,6 +209,8 @@ export interface McpConnectionDefinitionOptions<Id extends string> {
 	readonly clientOptions?: ClientOptions;
 	readonly connectOptions?: ConnectOptions;
 	readonly transport: McpTransportFactory;
+	/** What `transport` opens; drives transport-specific behavior (session termination, close budgets). */
+	readonly transportKind?: McpTransportKind;
 	readonly requestHandlers?: McpClientRequestHandlers;
 	readonly notificationHandlers?: McpClientNotificationHandlers;
 	readonly advertise?: McpClientAdvertise;
@@ -165,6 +226,42 @@ export interface McpConnectionDefinitionOptions<Id extends string> {
 	readonly autoRefreshCatalog?: boolean | McpAutoRefreshOptions;
 	/** Reconnect automatically after an unexpected close (see `McpReconnectOptions`). */
 	readonly reconnect?: McpReconnectOptions;
+	/** Probe liveness periodically and treat repeated failures as an unexpected close (see `McpKeepaliveOptions`). */
+	readonly keepalive?: boolean | McpKeepaliveOptions;
+	/**
+	 * Pin one exact protocol revision (strict, no fallback) instead of the default `auto`
+	 * negotiation. A modern revision pins the `server/discover` probe; a legacy revision runs the
+	 * plain `initialize` handshake offering only that revision. Mutually exclusive with an explicit
+	 * `clientOptions.versionNegotiation`.
+	 */
+	readonly protocolVersion?: string;
+	/**
+	 * Upper bound on closing the official client during `disconnect` (ms). A close that overruns
+	 * it is reported as a close failure (the connection is quarantined) rather than hanging the
+	 * caller. Absent: unbounded.
+	 */
+	readonly disconnectTimeoutMs?: number;
+	/**
+	 * Send the Streamable HTTP `DELETE` that terminates the server-side session before closing the
+	 * client on `disconnect`. Default: `true`. Only transports that expose `terminateSession` are
+	 * affected.
+	 */
+	readonly terminateSession?: boolean;
+	/**
+	 * Advertise the 2025-11-25 `tasks` client capability (`list` and `cancel`) so servers may
+	 * expose task-augmented tool calls. Default: `true`.
+	 */
+	readonly tasks?: boolean;
+	/**
+	 * The session the FIRST transport this definition opens resumes (the transport factory must
+	 * carry the same `sessionId`). While that session lives, snapshots and era-dependent verbs use
+	 * this record in place of the handshake the SDK skipped, and strict capability enforcement is
+	 * off (there is nothing to enforce against) unless `clientOptions.enforceStrictCapabilities`
+	 * says otherwise. A later reconnect runs a full handshake.
+	 */
+	readonly resumed?: McpResumedSession;
+	/** Capability extensions (reverse-DNS keys) merged into `capabilities.extensions`. */
+	readonly extensions?: McpCapabilityExtensions;
 	/**
 	 * Raw escape hatch: runs on the freshly constructed official `Client` after every typed
 	 * handler is installed and BEFORE `connect()`. Synchronous by design — an async hook would
@@ -192,7 +289,13 @@ export class McpConnectionDefinition<const Id extends string = string> {
 	readonly defaults: McpRequestDefaults;
 	readonly autoRefreshCatalog: McpResolvedAutoRefreshOptions | undefined;
 	readonly reconnect: McpResolvedReconnectOptions | undefined;
+	readonly keepalive: McpResolvedKeepaliveOptions | undefined;
 	readonly logLevel: LoggingLevel | undefined;
+	readonly transportKind: McpTransportKind;
+	readonly protocolVersion: string | undefined;
+	readonly disconnectTimeoutMs: number | undefined;
+	readonly terminateSession: boolean;
+	readonly resumed: McpResolvedResumedSession | undefined;
 	readonly #transportFactory: McpTransportFactory;
 	readonly #requestHandlers: McpClientRequestHandlers;
 	readonly #notificationHandlers: McpClientNotificationHandlers;
@@ -249,18 +352,55 @@ export class McpConnectionDefinition<const Id extends string = string> {
 		this.defaults = Object.freeze({ ...options.defaults });
 		this.autoRefreshCatalog = normalizeAutoRefresh(options.autoRefreshCatalog);
 		this.reconnect = normalizeReconnect(options.reconnect);
+		this.keepalive = normalizeKeepalive(options.keepalive);
 		if (options.configureClient !== undefined && typeof options.configureClient !== "function") {
 			throw new TypeError("configureClient must be a function.");
 		}
 		this.#configureClient = options.configureClient;
 		this.logLevel = options.logLevel;
+		this.transportKind = options.transportKind ?? "custom";
+		this.protocolVersion = options.protocolVersion;
+		if (
+			options.disconnectTimeoutMs !== undefined &&
+			(!Number.isFinite(options.disconnectTimeoutMs) || options.disconnectTimeoutMs <= 0)
+		) {
+			throw new RangeError("disconnectTimeoutMs must be positive.");
+		}
+		this.disconnectTimeoutMs = options.disconnectTimeoutMs;
+		this.terminateSession = options.terminateSession !== false;
+		this.resumed = normalizeResumed(options.resumed);
+		const pin =
+			options.protocolVersion === undefined
+				? undefined
+				: resolveProtocolPin(options.protocolVersion);
+		if (pin !== undefined && options.clientOptions?.versionNegotiation !== undefined) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				"Pass either protocolVersion or clientOptions.versionNegotiation, not both.",
+			);
+		}
+		const extensions: McpCapabilityExtensions = { ...options.extensions };
 		this.clientOptions = Object.freeze({
-			enforceStrictCapabilities: true,
+			// A resumed session never re-learns the server's capabilities, so there is nothing to
+			// enforce against; the record supplied in `resumed` is display-only.
+			enforceStrictCapabilities: this.resumed === undefined,
 			...options.clientOptions,
-			versionNegotiation: options.clientOptions?.versionNegotiation ?? { mode: "auto" as const },
+			versionNegotiation:
+				pin?.versionNegotiation ??
+				options.clientOptions?.versionNegotiation ??
+				({ mode: "auto" } as const),
+			...(pin?.supportedProtocolVersions === undefined
+				? {}
+				: { supportedProtocolVersions: [...pin.supportedProtocolVersions] }),
 			capabilities: mergeCapabilities(
 				options.clientOptions?.capabilities ?? {},
-				derivedCapabilities(this.#requestHandlers, this.#roots, options.advertise),
+				derivedCapabilities(
+					this.#requestHandlers,
+					this.#roots,
+					options.advertise,
+					options.tasks !== false,
+					extensions,
+				),
 			),
 			...(options.inputRequired === undefined
 				? {}
@@ -281,6 +421,18 @@ export class McpConnectionDefinition<const Id extends string = string> {
 	/** True when the definition carries an interactive OAuth provider (the manager may park it in `authorizing`). */
 	get interactiveOAuth(): boolean {
 		return this.#oauth !== undefined;
+	}
+
+	/**
+	 * Verifies an authorization callback against the OAuth provider (the `state` parameter, when
+	 * the provider issued one) before the code is exchanged. A no-op for providers without
+	 * `verifyCallbackState`.
+	 */
+	async verifyAuthorizationCallback(params: URLSearchParams): Promise<void> {
+		const verifier = this.#oauth as Partial<McpCallbackStateVerifier> | undefined;
+		if (typeof verifier?.verifyCallbackState === "function") {
+			await verifier.verifyCallbackState(params);
+		}
 	}
 
 	/** Registers this definition's server→client handlers and roots on a freshly constructed client. */
@@ -372,11 +524,58 @@ function normalizeReconnect(
 	});
 }
 
+function normalizeResumed(
+	value: McpResumedSession | undefined,
+): McpResolvedResumedSession | undefined {
+	if (value === undefined) return undefined;
+	assertNonEmpty(value.sessionId, "resumed.sessionId");
+	if (
+		value.protocolVersion !== undefined &&
+		!MCP_SUPPORTED_PROTOCOL_VERSIONS.includes(value.protocolVersion)
+	) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.PROTOCOL_VERSION_UNSUPPORTED,
+			`resumed.protocolVersion '${value.protocolVersion}' is not a revision kmcp can speak.`,
+		);
+	}
+	return Object.freeze({
+		...value,
+		era:
+			value.protocolVersion === undefined
+				? undefined
+				: isModernProtocolVersion(value.protocolVersion)
+					? "modern"
+					: "legacy",
+	});
+}
+
+function normalizeKeepalive(
+	value: boolean | McpKeepaliveOptions | undefined,
+): McpResolvedKeepaliveOptions | undefined {
+	if (value === undefined || value === false) return undefined;
+	const options = value === true ? {} : value;
+	const intervalMs = options.intervalMs ?? 30_000;
+	const timeoutMs = options.timeoutMs ?? 10_000;
+	const failureThreshold = options.failureThreshold ?? 2;
+	if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+		throw new RangeError("keepalive.intervalMs must be positive.");
+	}
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+		throw new RangeError("keepalive.timeoutMs must be positive.");
+	}
+	if (!Number.isSafeInteger(failureThreshold) || failureThreshold < 1) {
+		throw new RangeError("keepalive.failureThreshold must be a positive integer.");
+	}
+	return Object.freeze({ intervalMs, timeoutMs, failureThreshold });
+}
+
 /** The minimal capability set implied by the configured handlers (see `McpClientAdvertise` for the opt-ins). */
 function derivedCapabilities(
 	handlers: McpClientRequestHandlers,
 	roots: McpRootsSource | undefined,
 	advertise: McpClientAdvertise | undefined,
+	tasks: boolean,
+	extensions: McpCapabilityExtensions,
 ): Partial<ClientCapabilities> {
 	return {
 		...(handlers["elicitation/create"] === undefined
@@ -388,6 +587,8 @@ function derivedCapabilities(
 		...(handlers["roots/list"] === undefined && roots === undefined
 			? {}
 			: { roots: { listChanged: typeof roots === "function" } }),
+		...(tasks ? { tasks: { list: {}, cancel: {} } } : {}),
+		...(Object.keys(extensions).length === 0 ? {} : { extensions: { ...extensions } }),
 	};
 }
 
@@ -408,22 +609,49 @@ export function defineConnection<const Id extends string>(
 
 export type McpHttpAuth = string | AuthProvider | OAuthClientProvider;
 
+/**
+ * A server-side session to resume instead of running a fresh handshake (Streamable HTTP). The
+ * SDK skips the handshake when a session id is supplied, so `protocolVersion` is needed for the
+ * `MCP-Protocol-Version` header and the era, and the remaining fields stand in for what the
+ * original handshake reported (see `McpResumedSession`).
+ */
+export type McpHttpResumeOptions = McpResumedSession;
+
+/**
+ * kmcp's default Streamable HTTP reconnection policy for the server-to-client SSE stream:
+ * 1 s → 30 s exponential backoff (factor 2), at most 10 retries. The SDK's own defaults give up
+ * after two attempts, which is too little for a long-lived connection.
+ */
+export const MCP_HTTP_RECONNECTION_DEFAULTS: StreamableHTTPReconnectionOptions = Object.freeze({
+	initialReconnectionDelay: 1000,
+	maxReconnectionDelay: 30_000,
+	reconnectionDelayGrowFactor: 2,
+	maxRetries: 10,
+});
+
 export interface McpHttpConnectionOptions<Id extends string> extends Omit<
 	McpConnectionDefinitionOptions<Id>,
-	"transport" | "oauth"
+	"transport" | "transportKind" | "oauth" | "resumed"
 > {
 	readonly url: string | URL;
 	readonly transportOptions?: StreamableHTTPClientTransportOptions;
 	/**
 	 * A static bearer token (a leading `Bearer ` is stripped), an SDK `AuthProvider`
-	 * (`{ token, onUnauthorized? }`), or an `OAuthClientProvider` (interactive; also arms the
-	 * manager's `authorizing` flow). Credentials live only inside the transport closure.
+	 * (`{ token, onUnauthorized? }`), or an `OAuthClientProvider` (interactive providers also arm
+	 * the manager's `authorizing` flow; client-credentials and enterprise providers advertise their
+	 * capability extension automatically). Credentials live only inside the transport closure.
 	 */
 	readonly auth?: McpHttpAuth;
 	/** Per-request headers for schemes `AuthProvider` cannot express (non-Bearer token types, extra headers). */
 	readonly authHeaders?: () => MaybePromise<Readonly<Record<string, string>>>;
 	/** Static extra headers. An `Authorization` entry alongside `auth` is rejected: the SDK spreads `requestInit.headers` after the provider's header and would silently win. */
 	readonly headers?: Readonly<Record<string, string>>;
+	/** SDK fetch middlewares (`withLogging`, `createMiddleware`, ...) composed around the transport's fetch, outermost first. */
+	readonly middlewares?: readonly Middleware[];
+	/** Resume a server-side session once (see `McpResumedSession`); a later reconnect always starts fresh. */
+	readonly resume?: McpHttpResumeOptions;
+	/** Overrides for the SSE stream reconnection policy (see `MCP_HTTP_RECONNECTION_DEFAULTS`). */
+	readonly reconnection?: Partial<StreamableHTTPReconnectionOptions>;
 	/** Principal id partitioning `'private'` cache entries. Defaults to a digest of the credential identity when `auth` is set. */
 	readonly cachePartition?: string;
 	readonly responseCacheStore?: ResponseCacheStore;
@@ -439,6 +667,9 @@ export function httpConnection<const Id extends string>(
 		auth,
 		authHeaders,
 		headers,
+		middlewares,
+		resume,
+		reconnection,
 		cachePartition,
 		responseCacheStore,
 		defaultCacheTtlMs,
@@ -455,8 +686,19 @@ export function httpConnection<const Id extends string>(
 			}
 		}
 	}
+	if (middlewares !== undefined && middlewares.some((entry) => typeof entry !== "function")) {
+		throw new TypeError("middlewares must be functions.");
+	}
 	const authProvider = auth === undefined ? undefined : toAuthProvider(auth);
-	const oauth = auth !== undefined && isOAuthClientProvider(auth) ? auth : undefined;
+	const oauthProvider = auth !== undefined && isOAuthClientProvider(auth) ? auth : undefined;
+	const grant = oauthProvider === undefined ? undefined : oauthGrantOf(oauthProvider);
+	const oauth = grant === "authorization_code" ? oauthProvider : undefined;
+	const grantExtensions =
+		grant === "client_credentials"
+			? { [MCP_CLIENT_CREDENTIALS_EXTENSION]: {} }
+			: grant === "jwt_bearer"
+				? { [MCP_ENTERPRISE_MANAGED_AUTH_EXTENSION]: {} }
+				: {};
 	const partition =
 		cachePartition ?? (auth === undefined ? undefined : `kmcp:${credentialIdentity(auth)}`);
 	const clientOptions: ClientOptions = {
@@ -465,21 +707,49 @@ export function httpConnection<const Id extends string>(
 		...(responseCacheStore === undefined ? {} : { responseCacheStore }),
 		...(defaultCacheTtlMs === undefined ? {} : { defaultCacheTtlMs }),
 	};
+	const reconnectionOptions: StreamableHTTPReconnectionOptions = {
+		...MCP_HTTP_RECONNECTION_DEFAULTS,
+		...transportOptions?.reconnectionOptions,
+		...reconnection,
+	};
+	// The resumed session is consumed by the first transport only: a reconnect after the server
+	// declared it gone must start a fresh session, or it would resume a dead one forever.
+	let pendingResume: McpHttpResumeOptions | undefined = resume;
+	const baseFetch = transportOptions?.fetch ?? ((input, init) => globalThis.fetch(input, init));
+	const wrappedFetch =
+		middlewares === undefined || middlewares.length === 0
+			? transportOptions?.fetch
+			: applyMiddlewares(...middlewares)(baseFetch);
+	const finalFetch =
+		authHeaders === undefined ? wrappedFetch : fetchWithAuthHeaders(authHeaders, wrappedFetch);
 	return new McpConnectionDefinition({
 		...definition,
 		clientOptions,
+		extensions: { ...grantExtensions, ...definition.extensions },
+		transportKind: "streamable-http",
+		...(resume === undefined ? {} : { resumed: resume }),
 		...(oauth === undefined ? {} : { oauth }),
-		transport: () =>
-			new StreamableHTTPClientTransport(endpoint, {
+		transport: () => {
+			const resumed = pendingResume;
+			pendingResume = undefined;
+			return new StreamableHTTPClientTransport(endpoint, {
 				...transportOptions,
+				reconnectionOptions,
 				...(authProvider === undefined ? {} : { authProvider }),
 				...(headers === undefined
 					? {}
 					: { requestInit: { ...transportOptions?.requestInit, headers: { ...headers } } }),
-				...(authHeaders === undefined
+				...(finalFetch === undefined ? {} : { fetch: finalFetch }),
+				...(resumed === undefined
 					? {}
-					: { fetch: fetchWithAuthHeaders(authHeaders, transportOptions?.fetch) }),
-			}),
+					: {
+							sessionId: resumed.sessionId,
+							...(resumed.protocolVersion === undefined
+								? {}
+								: { protocolVersion: resumed.protocolVersion }),
+						}),
+			});
+		},
 	});
 }
 
@@ -548,7 +818,7 @@ export interface McpInProcessServer {
 
 export interface McpInProcessConnectionOptions<Id extends string> extends Omit<
 	McpConnectionDefinitionOptions<Id>,
-	"transport" | "oauth"
+	"transport" | "transportKind" | "oauth"
 > {
 	readonly definition: McpInProcessServer;
 	/** The protocol era the connection negotiates. Default: `"modern"`. */
@@ -581,10 +851,17 @@ export function inProcessConnection<const Id extends string>(
 			"inProcessConnection requires a server definition with handler() and instantiate().",
 		);
 	}
+	if (rest.protocolVersion !== undefined) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			"inProcessConnection selects the revision through era; protocolVersion is not accepted.",
+		);
+	}
 	const negotiation = inProcessNegotiation(era, rest.clientOptions?.versionNegotiation);
 	return new McpConnectionDefinition({
 		...rest,
 		clientOptions: { ...rest.clientOptions, versionNegotiation: negotiation },
+		transportKind: "in-process",
 		transport:
 			era === "modern"
 				? () => openModernInProcessTransport(definition, mcp, authInfo)

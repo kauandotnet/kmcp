@@ -1,34 +1,47 @@
 import {
+	AuthorizationServerMismatchError,
 	type CacheableRequestOptions,
 	type CallToolRequestOptions,
 	type CallToolResult,
+	type CancelTaskResult,
 	type Client,
 	type CompleteRequest,
 	type CompleteResult,
 	type ContentBlock,
+	type CreateTaskResult,
 	type DiscoverResult,
 	type GetPromptResult,
+	type GetTaskResult,
 	type Implementation,
+	InsecureTokenEndpointError,
 	InsufficientScopeError,
+	IssuerMismatchError,
 	type ListChangedHandlers,
 	type ListPromptsResult,
 	type ListResourceTemplatesResult,
 	type ListResourcesResult,
+	type ListTasksResult,
 	type ListToolsResult,
 	LOG_LEVEL_META_KEY,
 	type LoggingLevel,
 	type McpSubscription,
 	MissingRequiredClientCapabilityError,
+	OAuthError,
 	type ProtocolEra,
 	ProtocolError,
 	type ReadResourceResult,
+	RegistrationRejectedError,
 	type RequestOptions,
 	SdkError,
+	SdkHttpError,
 	type ServerCapabilities,
 	type SubscriptionFilter,
+	type Tool,
 	type Transport,
 	UnauthorizedError,
 	UnsupportedProtocolVersionError,
+	UrlElicitationRequiredError,
+	specTypeSchemas,
 } from "@modelcontextprotocol/client";
 
 import { KMCP_ERROR_CODES, KmcpError, errorCode } from "../errors.ts";
@@ -41,7 +54,25 @@ import {
 	type MaybePromise,
 } from "../internal/value.ts";
 import type { McpCatalogCapability, McpCatalogSection, McpCatalogSnapshot } from "./catalog.ts";
-import { McpClientSession, McpConnectionDefinition, createOfficialClient } from "./connection.ts";
+import {
+	McpClientSession,
+	McpConnectionDefinition,
+	type McpTransportKind,
+	createOfficialClient,
+} from "./connection.ts";
+import {
+	type McpContractMode,
+	type McpContractResult,
+	type McpExpectedTool,
+	checkToolContract,
+} from "./contract.ts";
+import { type McpSkill, discoverSkills, resolveSkillUri } from "./skills.ts";
+import {
+	type McpCreateToolTaskOptions,
+	McpTaskClient,
+	type McpTaskPollOptions,
+	supportsToolTasks,
+} from "./tasks.ts";
 
 export type McpConnectionPhase =
 	| "authorizing"
@@ -55,8 +86,10 @@ export type McpConnectionPhase =
 
 /** A classification of the last failure that is richer than `errorCode` (which only names kmcp codes). */
 export interface McpErrorDetail {
-	readonly kind: "kmcp" | "oauth" | "protocol" | "sdk" | "unknown";
+	readonly kind: "http" | "kmcp" | "network" | "oauth" | "protocol" | "sdk" | "unknown";
 	readonly code: string | number;
+	/** Present for HTTP-level failures (`kind: "http"` and OAuth registration rejections). */
+	readonly httpStatus?: number;
 }
 
 export interface McpWatchSnapshot {
@@ -66,6 +99,18 @@ export interface McpWatchSnapshot {
 	readonly unhonoredSections: readonly McpCatalogCapability[];
 	readonly reason?: "not-advertised" | "not-configured" | "refresh-cap" | "unsupported-era";
 	readonly refreshes: number;
+	/** How many times the modern listen stream was re-opened after an unexpected drop this generation. */
+	readonly reopens: number;
+}
+
+/** Whether the connection carries server-side session state (derived from transport and session id). */
+export type McpConnectionMode = "stateful" | "stateless";
+
+export interface McpKeepaliveSnapshot {
+	/** Consecutive failed probes. */
+	readonly failures: number;
+	readonly lastProbeAt?: string;
+	readonly lastFailureAt?: string;
 }
 
 export interface McpConnectionSnapshot<Id extends string = string> {
@@ -76,8 +121,16 @@ export interface McpConnectionSnapshot<Id extends string = string> {
 	readonly generation: number;
 	readonly lastTransitionAt: string;
 	readonly connectedAt?: string;
+	/** Last successful exchange with the upstream (an operation result or a keepalive probe). */
+	readonly lastSeenAt?: string;
+	readonly transportKind?: McpTransportKind;
+	/** The server-issued `Mcp-Session-Id` (Streamable HTTP), when the server keeps session state. */
+	readonly sessionId?: string;
+	readonly connectionMode?: McpConnectionMode;
 	readonly protocolVersion?: string;
 	readonly protocolEra?: ProtocolEra;
+	/** Every revision the server advertised in `server/discover` (modern connections only). */
+	readonly supportedVersions?: readonly string[];
 	/** Self-reported by the upstream and untrusted; a modern anonymous server may have none. */
 	readonly serverInfo?: Readonly<Implementation>;
 	/** Free-form, model-facing text from the upstream (length-capped, untrusted). */
@@ -87,6 +140,7 @@ export interface McpConnectionSnapshot<Id extends string = string> {
 	readonly errorCode?: string;
 	readonly errorDetail?: McpErrorDetail;
 	readonly watch?: McpWatchSnapshot;
+	readonly keepalive?: McpKeepaliveSnapshot;
 	/** URIs with an active `resources/subscribe` on the current generation (sorted). */
 	readonly subscribedResources?: readonly string[];
 	/** Present when the definition opts into reconnection and a failure has occurred. */
@@ -105,10 +159,14 @@ export type McpConnectionEventType =
 	| "catalog.failed"
 	| "catalog.refreshed"
 	| "connection.authorization.required"
+	| "connection.keepalive.failed"
+	| "connection.listen.dropped"
+	| "connection.listen.reopened"
 	| "connection.reconnect.exhausted"
 	| "connection.reconnect.scheduled"
 	| "connection.registered"
 	| "connection.removed"
+	| "connection.session.expired"
 	| "connection.state.changed"
 	| "resource.updated";
 
@@ -136,6 +194,8 @@ export interface McpConnectionManagerOptions {
 	readonly maxCatalogPropertiesPerObject?: number;
 	/** Maximum `instructions` length retained in snapshots. Default: 16 KiB. */
 	readonly maxInstructionsLength?: number;
+	/** Budget for the Streamable HTTP session-terminating `DELETE` on disconnect (ms). Default: 2000. */
+	readonly terminateSessionTimeoutMs?: number;
 	readonly now?: () => number;
 	readonly onListenerError?: (error: unknown, event: McpConnectionEvent) => MaybePromise<void>;
 }
@@ -160,7 +220,26 @@ export interface McpMrtrForwardOptions {
 	readonly requestState?: string;
 }
 
-export type McpCallToolOptions = CallToolRequestOptions & McpMetaOptions & McpMrtrForwardOptions;
+/** A tool contract to enforce before a call goes out (see `checkToolContract`). */
+export interface McpToolContractOption {
+	readonly expected: McpExpectedTool;
+	/** Default: `"compatible"`. */
+	readonly mode?: McpContractMode;
+}
+
+export interface McpContractOptions {
+	/**
+	 * Refuse the call with `TOOL_CONTRACT_MISMATCH` when the tool the upstream advertises now has
+	 * drifted from `expected` in a way that breaks this call. The advertised tool comes from the
+	 * current catalog when one is published for this generation, else from a `tools/list`.
+	 */
+	readonly contract?: McpToolContractOption;
+}
+
+export type McpCallToolOptions = CallToolRequestOptions &
+	McpMetaOptions &
+	McpMrtrForwardOptions &
+	McpContractOptions;
 export type McpReadOptions = CacheableRequestOptions & McpMetaOptions;
 export type McpRequestOptionsWithMeta = RequestOptions & McpMetaOptions;
 
@@ -183,6 +262,20 @@ export class McpToolCallError extends KmcpError {
 		super(KMCP_ERROR_CODES.TOOL_CALL_FAILED, message);
 		this.name = "McpToolCallError";
 		this.content = Object.freeze([...content]);
+	}
+}
+
+/** Thrown when a `contract` check refuses a call; carries the full check result. */
+export class McpToolContractError extends KmcpError {
+	readonly result: McpContractResult;
+
+	constructor(toolName: string, result: McpContractResult) {
+		super(
+			KMCP_ERROR_CODES.TOOL_CONTRACT_MISMATCH,
+			`Tool '${toolName}' no longer matches its contract: ${result.errors.join(" ")}`,
+		);
+		this.name = "McpToolContractError";
+		this.result = result;
 	}
 }
 
@@ -240,6 +333,23 @@ interface AutoRefreshState {
 	capped: boolean;
 }
 
+interface KeepaliveState {
+	timer?: ReturnType<typeof setTimeout>;
+	inFlight: boolean;
+	failures: number;
+	lastProbeAt?: string;
+	lastFailureAt?: string;
+}
+
+interface ListenWatchState {
+	/** The subscription currently watched for an unexpected drop. */
+	subscription?: McpSubscription;
+	retryTimer?: ReturnType<typeof setTimeout>;
+	reopening: boolean;
+	attempts: number;
+	reopens: number;
+}
+
 interface ManagedConnection<Id extends string> {
 	readonly definition: McpConnectionDefinition<Id>;
 	phase: McpConnectionPhase;
@@ -247,11 +357,15 @@ interface ManagedConnection<Id extends string> {
 	activeOperations: number;
 	lastTransitionAt: string;
 	connectedAt?: string;
+	lastSeenAt?: string;
 	errorCode?: string;
 	errorDetail?: McpErrorDetail;
 	catalog?: McpCatalogSnapshot;
 	catalogRevision: number;
 	session?: McpClientSession<Id>;
+	transport?: Transport;
+	/** True while the current session was adopted through `definition.resumed` (no handshake ran). */
+	resumed: boolean;
 	connectTask?: Promise<McpConnectionSnapshot<Id>>;
 	disconnectTask?: Promise<McpConnectionSnapshot<Id>>;
 	removeTask?: Promise<void>;
@@ -260,7 +374,9 @@ interface ManagedConnection<Id extends string> {
 	discover?: DiscoverResult;
 	logLevel?: LoggingLevel;
 	listen?: McpSubscription;
+	listenWatch?: ListenWatchState;
 	autoRefresh?: AutoRefreshState;
+	keepalive?: KeepaliveState;
 	subscribedUris?: Set<string>;
 	reconnect?: ReconnectState;
 	readonly drainWaiters: Set<() => void>;
@@ -290,12 +406,17 @@ const CATALOG_SECTIONS: readonly McpCatalogCapability[] = Object.freeze([
 	"resourceTemplates",
 ]);
 
+const LISTEN_REOPEN_INITIAL_MS = 1000;
+const LISTEN_REOPEN_MAX_MS = 30_000;
+const MAX_SUPPORTED_VERSIONS = 32;
+
 export class McpConnectionManager<Id extends string = string> implements AsyncDisposable {
 	readonly #entries = new Map<Id, ManagedConnection<Id>>();
 	readonly #listeners = new Set<McpConnectionListener<Id>>();
 	readonly #maxConnections: number;
 	readonly #catalogBounds: McpCatalogBounds;
 	readonly #maxInstructionsLength: number;
+	readonly #terminateSessionTimeoutMs: number;
 	readonly #now: () => number;
 	readonly #onListenerError:
 		((error: unknown, event: McpConnectionEvent<Id>) => MaybePromise<void>) | undefined;
@@ -331,6 +452,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			options.maxInstructionsLength ?? 16 * 1024,
 			"maxInstructionsLength",
 		);
+		this.#terminateSessionTimeoutMs = positiveInteger(
+			options.terminateSessionTimeoutMs ?? 2000,
+			"terminateSessionTimeoutMs",
+		);
 		this.#now = safeClock(options.now ?? Date.now);
 		this.#onListenerError = options.onListenerError;
 	}
@@ -351,6 +476,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			phase: "offline",
 			generation: 0,
 			activeOperations: 0,
+			resumed: false,
 			catalogRevision: 0,
 			lastTransitionAt: isoTimestamp(this.#now),
 			drainWaiters: new Set(),
@@ -488,8 +614,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 	/**
 	 * Completes an interactive OAuth round for a connection parked in the `authorizing` phase:
-	 * hands the authorization callback parameters to the SAME transport that raised the challenge
-	 * (the SDK requires that), releases it, and reconnects with the freshly stored tokens.
+	 * refuses a callback that reports an OAuth `error`, verifies the callback `state` against the
+	 * provider (when it issued one), hands the parameters to the SAME transport that raised the
+	 * challenge (the SDK requires that), releases it, and reconnects with the freshly stored tokens.
+	 * A `state` mismatch leaves the connection parked so the host can retry with the right callback.
 	 */
 	async completeAuthorization(
 		id: Id,
@@ -513,6 +641,19 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				`The transport of '${id}' cannot finish an authorization flow.`,
 			);
 		}
+		const oauthError = callbackParams.get("error");
+		if (oauthError !== null) {
+			await this.#releasePendingAuthorization(entry);
+			entry.errorCode = KMCP_ERROR_CODES.AUTH_FORBIDDEN;
+			entry.errorDetail = { kind: "oauth", code: oauthError.slice(0, 64) };
+			this.#transition(entry, "failed");
+			throw new KmcpError(
+				KMCP_ERROR_CODES.AUTH_FORBIDDEN,
+				`Authorization of '${id}' was refused by the authorization server (${oauthError.slice(0, 64)}).`,
+			);
+		}
+		// A state mismatch is not a failed round: the callback simply is not ours. Stay parked.
+		await entry.definition.verifyAuthorizationCallback(callbackParams);
 		try {
 			await transport.finishAuth(callbackParams);
 		} catch (error) {
@@ -549,7 +690,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 		entry.activeOperations += 1;
 		try {
-			return await operation(session.client, session);
+			const result = await operation(session.client, session);
+			if (entry.session === session) entry.lastSeenAt = isoTimestamp(this.#now);
+			return result;
+		} catch (error) {
+			this.#inspectOperationFailure(entry, session, error);
+			throw error;
 		} finally {
 			entry.activeOperations -= 1;
 			if (entry.activeOperations === 0) {
@@ -568,7 +714,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	): Promise<CallToolResult> {
 		return this.withClient(
 			id,
-			(client) => {
+			async (client) => {
+				if (options?.contract !== undefined) {
+					await this.#enforceToolContract(id, client, name, arguments_, options.contract);
+				}
 				const params = this.#params(
 					id,
 					forwardMrtrCallToolParams(name, arguments_, options),
@@ -613,6 +762,178 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	}
 
 	/**
+	 * Compares the tool the upstream advertises now with an expected shape (see
+	 * `checkToolContract`). Reads the published catalog when it belongs to the current generation,
+	 * else issues a `tools/list`. A tool that is not advertised at all is an error.
+	 */
+	checkToolContract(
+		id: Id,
+		name: string,
+		expected: McpExpectedTool,
+		options: {
+			readonly mode?: McpContractMode;
+			readonly arguments?: Readonly<Record<string, unknown>>;
+			readonly signal?: AbortSignal;
+		} = {},
+		control?: McpConnectionOperationControl,
+	): Promise<McpContractResult> {
+		return this.withClient(
+			id,
+			async (client) => {
+				const tool = await this.#advertisedTool(id, client, name, options.signal);
+				if (tool === undefined) {
+					return Object.freeze({
+						valid: false,
+						errors: Object.freeze([`Tool '${name}' is not advertised by the upstream.`]),
+						warnings: Object.freeze([]),
+					});
+				}
+				return checkToolContract(tool, expected, {
+					...(options.mode === undefined ? {} : { mode: options.mode }),
+					...(options.arguments === undefined ? {} : { arguments: options.arguments }),
+				});
+			},
+			options.signal,
+			control,
+		);
+	}
+
+	/** Whether the upstream advertises task-augmented `tools/call` on a revision kmcp can drive. */
+	supportsToolTasks(id: Id): boolean {
+		const entry = this.#entry(id);
+		const client = entry.session?.client;
+		return client === undefined
+			? false
+			: supportsToolTasks({
+					request: () => Promise.resolve(undefined),
+					getProtocolEra: () => this.#era(entry, client),
+					getNegotiatedProtocolVersion: () => client.getNegotiatedProtocolVersion(),
+					getServerCapabilities: () => this.#capabilities(entry, client),
+				});
+	}
+
+	/** Issues a task-augmented `tools/call` (2025-11-25); the tool keeps running after this resolves. */
+	callToolTask(
+		id: Id,
+		name: string,
+		arguments_: Readonly<Record<string, unknown>> = {},
+		options?: McpCreateToolTaskOptions & McpMetaOptions & { readonly signal?: AbortSignal },
+		control?: McpConnectionOperationControl,
+	): Promise<CreateTaskResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				this.#taskClient(this.#entry(id), client).createToolTask(name, arguments_, {
+					...(options?.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+					meta: this.#params(id, {}, options)._meta ?? {},
+					request: this.#requestOptions(id, "tool", this.#taskRequest(options)),
+				}),
+			options?.signal,
+			control,
+		);
+	}
+
+	/** Polls a task until it settles and returns the tool result (see `McpTaskClient.waitForTask`). */
+	waitForTask(
+		id: Id,
+		taskId: string,
+		options?: McpTaskPollOptions,
+		control?: McpConnectionOperationControl,
+	): Promise<CallToolResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				this.#taskClient(this.#entry(id), client).waitForTask(taskId, {
+					...options,
+					request: this.#requestOptions(id, "tool", options?.request),
+				}),
+			options?.signal,
+			control,
+		);
+	}
+
+	/** `callToolTask` followed by `waitForTask`, reporting every status change through `onUpdate`. */
+	callToolViaTask(
+		id: Id,
+		name: string,
+		arguments_: Readonly<Record<string, unknown>> = {},
+		options?: McpCreateToolTaskOptions & McpTaskPollOptions & McpMetaOptions,
+		control?: McpConnectionOperationControl,
+	): Promise<CallToolResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				this.#taskClient(this.#entry(id), client).callToolViaTask(name, arguments_, {
+					...options,
+					meta: this.#params(id, {}, options)._meta ?? {},
+					request: this.#requestOptions(id, "tool", this.#taskRequest(options)),
+				}),
+			options?.signal,
+			control,
+		);
+	}
+
+	getTask(id: Id, taskId: string, options?: McpRequestOptionsWithMeta): Promise<GetTaskResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				this.#taskClient(this.#entry(id), client).getTask(
+					taskId,
+					this.#requestOptions(id, "request", options),
+				),
+			options?.signal,
+		);
+	}
+
+	/** Blocks on the server until the task is terminal, then returns the tool result. */
+	getTaskResult(
+		id: Id,
+		taskId: string,
+		options?: McpRequestOptionsWithMeta,
+	): Promise<CallToolResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				this.#taskClient(this.#entry(id), client).getTaskResult(
+					taskId,
+					this.#requestOptions(id, "tool", options),
+				),
+			options?.signal,
+		);
+	}
+
+	listTasks(
+		id: Id,
+		options?: McpRequestOptionsWithMeta & { readonly cursor?: string },
+	): Promise<ListTasksResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				this.#taskClient(this.#entry(id), client).listTasks(
+					options?.cursor,
+					this.#requestOptions(id, "request", options),
+				),
+			options?.signal,
+		);
+	}
+
+	cancelTask(
+		id: Id,
+		taskId: string,
+		options?: McpRequestOptionsWithMeta,
+	): Promise<CancelTaskResult> {
+		return this.withClient(
+			id,
+			(client) =>
+				this.#taskClient(this.#entry(id), client).cancelTask(
+					taskId,
+					this.#requestOptions(id, "request", options),
+				),
+			options?.signal,
+		);
+	}
+
+	/**
 	 * Subscribes to `notifications/resources/updated` for one URI. On the legacy era this is the
 	 * `resources/subscribe` RPC; on 2026-07-28 that method no longer exists, so the subscription
 	 * is expressed by re-opening the `subscriptions/listen` stream with the widened
@@ -633,7 +954,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			id,
 			async (client, session) => {
 				const entry = this.#entry(id);
-				if (client.getProtocolEra() === "modern") {
+				if (this.#era(entry, client) === "modern") {
 					// `resources/subscribe` does not exist on 2026-07-28: the subscription is
 					// expressed purely through the `subscriptions/listen` filter.
 					const uris = (entry.subscribedUris ??= new Set());
@@ -678,7 +999,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			id,
 			async (client, session) => {
 				const entry = this.#entry(id);
-				if (client.getProtocolEra() === "modern") {
+				if (this.#era(entry, client) === "modern") {
 					entry.subscribedUris?.delete(uri);
 					// Narrowing is best-effort: failure means over-notification, never silence.
 					await this.#relisten(entry, session).catch(() => undefined);
@@ -706,7 +1027,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			async (client) => {
-				if (client.getProtocolEra() === "modern") {
+				if (this.#era(this.#entry(id), client) === "modern") {
 					throw new KmcpError(
 						KMCP_ERROR_CODES.OPERATION_FAILED,
 						"Roots are a legacy-era feature; the 2026-07-28 wire has no roots/list_changed.",
@@ -788,7 +1109,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				client.listTools(
+				this.#list(
+					this.#entry(id),
+					client,
+					"tools",
 					this.#params(id, {}, options),
 					this.#requestOptions(id, "request", options),
 				),
@@ -805,7 +1129,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				client.listResources(
+				this.#list(
+					this.#entry(id),
+					client,
+					"resources",
 					this.#params(id, {}, options),
 					this.#requestOptions(id, "request", options),
 				),
@@ -822,7 +1149,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				client.listResourceTemplates(
+				this.#list(
+					this.#entry(id),
+					client,
+					"resourceTemplates",
 					this.#params(id, {}, options),
 					this.#requestOptions(id, "request", options),
 				),
@@ -839,7 +1169,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				client.listPrompts(
+				this.#list(
+					this.#entry(id),
+					client,
+					"prompts",
 					this.#params(id, {}, options),
 					this.#requestOptions(id, "request", options),
 				),
@@ -848,12 +1181,53 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		);
 	}
 
+	/**
+	 * Discovers the skills the upstream exposes (SEP-2640): the `skill://index.json` index first,
+	 * then a scan of the resource list for `skill://…/SKILL.md` entries.
+	 */
+	listSkills(
+		id: Id,
+		options?: McpReadOptions,
+		control?: McpConnectionOperationControl,
+	): Promise<readonly McpSkill[]> {
+		return this.withClient(
+			id,
+			(client) => {
+				const requestOptions = this.#requestOptions(id, "resource", options);
+				return discoverSkills({
+					readResource: (uri) =>
+						client.readResource(this.#params(id, { uri }, options), requestOptions),
+					listResources: () =>
+						this.#list(
+							this.#entry(id),
+							client,
+							"resources",
+							this.#params(id, {}, options),
+							requestOptions,
+						),
+				});
+			},
+			options?.signal,
+			control,
+		);
+	}
+
+	/** Reads a skill's `SKILL.md` by name, nested path, or full `skill://` URI (see `resolveSkillUri`). */
+	readSkill(
+		id: Id,
+		reference: string,
+		options?: McpReadOptions,
+		control?: McpConnectionOperationControl,
+	): Promise<ReadResourceResult> {
+		return this.readResource(id, resolveSkillUri(reference), options, control);
+	}
+
 	/** Liveness: `server/discover` on the modern era, `ping` on the legacy era. */
 	ping(id: Id, signal?: AbortSignal): Promise<McpPingResult> {
 		return this.withClient(
 			id,
 			async (client) => {
-				const era = client.getProtocolEra() ?? "legacy";
+				const era = this.#era(this.#entry(id), client) ?? "legacy";
 				const started = performance.now();
 				const options = this.#requestOptions(
 					id,
@@ -869,6 +1243,36 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	}
 
 	/**
+	 * A live `server/discover` (2026-07-28): every revision the server supports, its capabilities,
+	 * instructions, and the `_meta` carrying its identity, as the server answers right now. The
+	 * verdict is retained for the next reconnect's `prior`. Legacy connections have no such
+	 * request — the handshake snapshot on the connection snapshot is their equivalent.
+	 */
+	discover(id: Id, signal?: AbortSignal): Promise<DiscoverResult> {
+		return this.withClient(
+			id,
+			async (client, session) => {
+				if (this.#era(this.#entry(id), client) !== "modern") {
+					throw new KmcpError(
+						KMCP_ERROR_CODES.OPERATION_FAILED,
+						`server/discover was introduced in MCP 2026-07-28; this connection negotiated ${client.getNegotiatedProtocolVersion() ?? "a legacy revision"}, whose initialize handshake carries the same information (see the connection snapshot).`,
+					);
+				}
+				const result = await client.discover(
+					this.#requestOptions(id, "request", signal === undefined ? undefined : { signal }),
+				);
+				const entry = this.#entry(id);
+				if (entry.session === session) {
+					entry.discover = result;
+					this.#publish("connection.state.changed", entry);
+				}
+				return result;
+			},
+			signal,
+		);
+	}
+
+	/**
 	 * Sets the upstream log level: `logging/setLevel` on a legacy connection; on the modern era the
 	 * level is stamped into every subsequent request's `_meta` (the RPC no longer exists).
 	 */
@@ -878,7 +1282,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		await this.withClient(
 			id,
 			async (client) => {
-				if (client.getProtocolEra() !== "modern") {
+				if (this.#era(entry, client) !== "modern") {
 					await client.setLoggingLevel(level, signal === undefined ? undefined : { signal });
 				}
 			},
@@ -913,7 +1317,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					admittedCatalogRevision = entry.catalogRevision;
 					const generation = admittedGeneration;
 					const catalogRevision = admittedCatalogRevision;
-					const capabilities = client.getServerCapabilities();
+					const capabilities = this.#capabilities(entry, client);
 					const previous = entry.catalog?.generation === generation ? entry.catalog : undefined;
 					const listOptions = {
 						...this.#requestOptions(id, "request", signal === undefined ? undefined : { signal }),
@@ -922,7 +1326,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					const discoveries = await Promise.allSettled([
 						discoverSection(
 							capabilities?.tools !== undefined,
-							() => client.listTools(this.#params(id, {}), listOptions).then((v) => v.tools),
+							() =>
+								this.#list(entry, client, "tools", this.#params(id, {}), listOptions).then(
+									(v) => v.tools,
+								),
 							previous?.tools,
 							this.#catalogBounds,
 							signal,
@@ -930,7 +1337,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 						discoverSection(
 							capabilities?.resources !== undefined,
 							() =>
-								client.listResources(this.#params(id, {}), listOptions).then((v) => v.resources),
+								this.#list(entry, client, "resources", this.#params(id, {}), listOptions).then(
+									(v) => v.resources,
+								),
 							previous?.resources,
 							this.#catalogBounds,
 							signal,
@@ -938,16 +1347,23 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 						discoverSection(
 							capabilities?.resources !== undefined,
 							() =>
-								client
-									.listResourceTemplates(this.#params(id, {}), listOptions)
-									.then((v) => v.resourceTemplates),
+								this.#list(
+									entry,
+									client,
+									"resourceTemplates",
+									this.#params(id, {}),
+									listOptions,
+								).then((v) => v.resourceTemplates),
 							previous?.resourceTemplates,
 							this.#catalogBounds,
 							signal,
 						),
 						discoverSection(
 							capabilities?.prompts !== undefined,
-							() => client.listPrompts(this.#params(id, {}), listOptions).then((v) => v.prompts),
+							() =>
+								this.#list(entry, client, "prompts", this.#params(id, {}), listOptions).then(
+									(v) => v.prompts,
+								),
 							previous?.prompts,
 							this.#catalogBounds,
 							signal,
@@ -1072,6 +1488,62 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.close();
 	}
 
+	/**
+	 * The connection's era. A session adopted through `definition.resumed` ran no handshake, so
+	 * the SDK reports none; the resumed record's `protocolVersion` decides then.
+	 */
+	#era(entry: ManagedConnection<Id>, client: Client): ProtocolEra | undefined {
+		return client.getProtocolEra() ?? (entry.resumed ? entry.definition.resumed?.era : undefined);
+	}
+
+	/** Server capabilities, falling back to the resumed record for a session that ran no handshake. */
+	#capabilities(entry: ManagedConnection<Id>, client: Client): ServerCapabilities | undefined {
+		return (
+			client.getServerCapabilities() ??
+			(entry.resumed ? entry.definition.resumed?.capabilities : undefined)
+		);
+	}
+
+	/** The task seam over a client, with the resumed-session fallbacks applied. */
+	#taskClient(entry: ManagedConnection<Id>, client: Client): McpTaskClient {
+		return new McpTaskClient({
+			request: (request, schema, options) =>
+				client.request(request as never, schema as never, options),
+			getProtocolEra: () => this.#era(entry, client),
+			getNegotiatedProtocolVersion: () =>
+				client.getNegotiatedProtocolVersion() ??
+				(entry.resumed ? entry.definition.resumed?.protocolVersion : undefined),
+			getServerCapabilities: () => this.#capabilities(entry, client),
+		});
+	}
+
+	/**
+	 * The four list verbs. The SDK's own verbs auto-aggregate pages and feed its response cache,
+	 * but answer an empty list without a request when the server's capabilities are unknown — the
+	 * state a resumed session is in. There kmcp walks the pages itself with the SDK's validators.
+	 */
+	#list<Kind extends McpListKind>(
+		entry: ManagedConnection<Id>,
+		client: Client,
+		kind: Kind,
+		params: Record<string, unknown>,
+		options: CacheableRequestOptions,
+	): Promise<McpListResult<Kind>> {
+		if (!entry.resumed || client.getServerCapabilities() !== undefined) {
+			switch (kind) {
+				case "tools":
+					return client.listTools(params, options) as Promise<McpListResult<Kind>>;
+				case "resources":
+					return client.listResources(params, options) as Promise<McpListResult<Kind>>;
+				case "resourceTemplates":
+					return client.listResourceTemplates(params, options) as Promise<McpListResult<Kind>>;
+				default:
+					return client.listPrompts(params, options) as Promise<McpListResult<Kind>>;
+			}
+		}
+		return walkListPages(client, kind, params, options);
+	}
+
 	#params<Params extends Record<string, unknown>>(
 		id: Id,
 		params: Params,
@@ -1079,7 +1551,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	): Params & { _meta?: Record<string, unknown> } {
 		const entry = this.#entries.get(id);
 		const stampLevel =
-			entry?.logLevel !== undefined && entry.session?.client.getProtocolEra() === "modern"
+			entry?.logLevel !== undefined &&
+			entry.session !== undefined &&
+			this.#era(entry, entry.session.client) === "modern"
 				? { [LOG_LEVEL_META_KEY]: entry.logLevel }
 				: {};
 		const meta = { ...stampLevel, ...options?.meta };
@@ -1105,11 +1579,13 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			meta: _meta,
 			inputResponses: _inputResponses,
 			requestState: _requestState,
+			contract: _contract,
 			...rest
-		} = (options ?? {}) as Options & McpMetaOptions & McpMrtrForwardOptions;
+		} = (options ?? {}) as Options & McpMetaOptions & McpMrtrForwardOptions & McpContractOptions;
 		void _meta;
 		void _inputResponses;
 		void _requestState;
+		void _contract;
 		return {
 			...(rest as Options),
 			...(timeout === undefined ? {} : { timeout }),
@@ -1124,6 +1600,64 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				? { onprogress: defaults.onprogress }
 				: {}),
 		};
+	}
+
+	/** The per-request options of a task call: the caller's `request` plus its `signal`. */
+	#taskRequest(
+		options: (McpCreateToolTaskOptions & { readonly signal?: AbortSignal }) | undefined,
+	): RequestOptions | undefined {
+		if (options === undefined) return undefined;
+		return {
+			...options.request,
+			...(options.signal === undefined ? {} : { signal: options.signal }),
+		};
+	}
+
+	async #advertisedTool(
+		id: Id,
+		client: Client,
+		name: string,
+		signal: AbortSignal | undefined,
+	): Promise<Tool | undefined> {
+		const entry = this.#entry(id);
+		const catalog = entry.catalog;
+		if (
+			catalog !== undefined &&
+			catalog.generation === entry.generation &&
+			catalog.tools.status === "fresh"
+		) {
+			return catalog.tools.items.find((tool) => tool.name === name);
+		}
+		const listed = await this.#list(
+			entry,
+			client,
+			"tools",
+			this.#params(id, {}),
+			this.#requestOptions(id, "request", signal === undefined ? undefined : { signal }),
+		);
+		return listed.tools.find((tool) => tool.name === name);
+	}
+
+	async #enforceToolContract(
+		id: Id,
+		client: Client,
+		name: string,
+		arguments_: Readonly<Record<string, unknown>>,
+		contract: McpToolContractOption,
+	): Promise<void> {
+		const tool = await this.#advertisedTool(id, client, name, undefined);
+		const result =
+			tool === undefined
+				? Object.freeze({
+						valid: false,
+						errors: Object.freeze([`Tool '${name}' is not advertised by the upstream.`]),
+						warnings: Object.freeze([]),
+					})
+				: checkToolContract(tool, contract.expected, {
+						mode: contract.mode ?? "compatible",
+						arguments: arguments_,
+					});
+		if (!result.valid) throw new McpToolContractError(name, result);
 	}
 
 	async #performConnect(entry: ManagedConnection<Id>): Promise<McpConnectionSnapshot<Id>> {
@@ -1147,37 +1681,44 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			});
 			session = new McpClientSession(definition.id, client);
 			liveSession = session;
+			const closingSession = session;
 			client.onclose = () => {
-				if (entry.session === session && entry.phase !== "draining" && entry.phase !== "offline") {
-					delete entry.session;
-					delete entry.connectedAt;
-					entry.errorCode = KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE;
-					delete entry.errorDetail;
-					this.#transition(entry, "failed");
-					this.#scheduleReconnect(entry);
-				}
+				this.#handleUnexpectedClose(entry, closingSession, KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE);
 			};
 			await client.connect(transport, this.#connectOptions(entry));
 			const generation = nextGeneration(this.#generationSequence);
 			this.#generationSequence = generation;
 			entry.session = session;
+			entry.transport = transport;
+			// No negotiated revision after a successful connect means the SDK adopted the session
+			// the transport carried instead of running a handshake.
+			entry.resumed =
+				definition.resumed !== undefined &&
+				client.getProtocolEra() === undefined &&
+				transport.sessionId === definition.resumed.sessionId;
 			entry.generation = generation;
 			delete entry.catalog;
 			delete entry.autoRefresh;
 			delete entry.subscribedUris;
+			delete entry.listenWatch;
 			if (entry.reconnect !== undefined) {
 				entry.reconnect.lastSuccessAt = this.#now();
 				if (definition.reconnect?.resetAfterMs === undefined) entry.reconnect.attempts = 0;
 				delete entry.reconnect.nextAttemptAt;
 			}
 			entry.connectedAt = isoTimestamp(this.#now);
+			entry.lastSeenAt = entry.connectedAt;
 			delete entry.errorCode;
 			delete entry.errorDetail;
 			const discover = client.getDiscoverResult();
 			if (discover !== undefined) entry.discover = discover;
 			else delete entry.discover;
 			await this.#repairListen(entry, session);
+			if (entry.listen === undefined) {
+				this.#watchListen(entry, session, client.autoOpenedSubscription);
+			}
 			this.#transition(entry, "online");
+			this.#startKeepalive(entry, session);
 			return this.#snapshotEntry(entry);
 		} catch (error) {
 			if (
@@ -1200,7 +1741,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			const cleanup = cleanupAfterFailedConnect(session, transport);
 			if (cleanup !== undefined) {
 				try {
-					await cleanup();
+					await this.#bounded(cleanup(), definition.disconnectTimeoutMs, "close");
 				} catch (cleanupError) {
 					entry.quarantinedCleanup = cleanup;
 					entry.errorCode = KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED;
@@ -1231,6 +1772,62 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		if (base?.prior !== undefined || entry.discover === undefined) return base;
 		// Reuse the previous modern verdict to skip the probe (same manager, same credentials).
 		return { ...base, prior: { kind: "modern" as const, discover: entry.discover } };
+	}
+
+	/**
+	 * The single path for a session that ended without a deliberate lifecycle transition: the
+	 * transport's `onclose`, a keepalive verdict, or a server declaring the session expired. It
+	 * releases the session, records why, transitions to `failed`, and hands over to the reconnect
+	 * policy. Idempotent per session: only the entry's CURRENT session can fail it.
+	 */
+	#handleUnexpectedClose(
+		entry: ManagedConnection<Id>,
+		session: McpClientSession<Id>,
+		code: string,
+		detail?: McpErrorDetail,
+		announce?: McpConnectionEventType,
+	): boolean {
+		if (entry.session !== session || entry.phase === "draining" || entry.phase === "offline") {
+			return false;
+		}
+		delete entry.session;
+		delete entry.transport;
+		delete entry.connectedAt;
+		entry.resumed = false;
+		entry.errorCode = code;
+		if (detail === undefined) delete entry.errorDetail;
+		else entry.errorDetail = detail;
+		this.#transition(entry, "failed");
+		// The cause is announced before any reconnect is scheduled, so a listener sees why first.
+		if (announce !== undefined) this.#publish(announce, entry);
+		this.#scheduleReconnect(entry);
+		return true;
+	}
+
+	/**
+	 * Recognizes a server that declared the Streamable HTTP session gone (HTTP 404 on a request
+	 * that carried a session id). The spec requires the client to start a new session; the manager
+	 * fails the generation and lets the reconnect policy open one.
+	 */
+	#inspectOperationFailure(
+		entry: ManagedConnection<Id>,
+		session: McpClientSession<Id>,
+		error: unknown,
+	): void {
+		if (entry.session !== session || entry.transport?.sessionId === undefined) return;
+		const http = findCause(
+			error,
+			(candidate): candidate is SdkHttpError => candidate instanceof SdkHttpError,
+		);
+		if (http === undefined || http.status !== 404) return;
+		const failed = this.#handleUnexpectedClose(
+			entry,
+			session,
+			KMCP_ERROR_CODES.CONNECTION_SESSION_EXPIRED,
+			{ kind: "http", code: 404, httpStatus: 404 },
+			"connection.session.expired",
+		);
+		if (failed) void session.close().catch(() => undefined);
 	}
 
 	/**
@@ -1370,6 +1967,78 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	}
 
 	/**
+	 * Periodic liveness probes for an online session. A probe is `ping` (legacy) or
+	 * `server/discover` (modern) with the keepalive timeout; a success refreshes `lastSeenAt`, and
+	 * `failureThreshold` consecutive failures close the session as an UNEXPECTED close so the
+	 * definition's `reconnect` policy takes over. Probes never overlap.
+	 */
+	#startKeepalive(entry: ManagedConnection<Id>, session: McpClientSession<Id>): void {
+		const policy = entry.definition.keepalive;
+		if (policy === undefined) return;
+		const state: KeepaliveState = { inFlight: false, failures: 0 };
+		entry.keepalive = state;
+		const schedule = (): void => {
+			if (entry.session !== session || entry.keepalive !== state || this.#closed) return;
+			const timer = setTimeout(() => {
+				delete state.timer;
+				void probe();
+			}, policy.intervalMs);
+			timer.unref?.();
+			state.timer = timer;
+		};
+		const probe = async (): Promise<void> => {
+			if (entry.session !== session || entry.keepalive !== state) return;
+			if (!isUsable(entry) || entry.disconnectTask !== undefined || this.#closed) return;
+			if (state.inFlight) {
+				schedule();
+				return;
+			}
+			state.inFlight = true;
+			const client = session.client;
+			try {
+				if (this.#era(entry, client) === "modern") {
+					await client.discover({ timeout: policy.timeoutMs });
+				} else {
+					await client.ping({ timeout: policy.timeoutMs });
+				}
+				if (entry.session === session) {
+					state.failures = 0;
+					state.lastProbeAt = isoTimestamp(this.#now);
+					entry.lastSeenAt = state.lastProbeAt;
+				}
+			} catch (error) {
+				if (entry.session !== session || entry.keepalive !== state) return;
+				state.failures += 1;
+				state.lastProbeAt = isoTimestamp(this.#now);
+				state.lastFailureAt = state.lastProbeAt;
+				this.#publish("connection.keepalive.failed", entry);
+				if (state.failures >= policy.failureThreshold) {
+					const failed = this.#handleUnexpectedClose(
+						entry,
+						session,
+						KMCP_ERROR_CODES.CONNECTION_KEEPALIVE_FAILED,
+						describeError(error),
+					);
+					if (failed) void session.close().catch(() => undefined);
+					return;
+				}
+			} finally {
+				state.inFlight = false;
+			}
+			schedule();
+		};
+		schedule();
+	}
+
+	#stopKeepalive(entry: ManagedConnection<Id>): void {
+		const state = entry.keepalive;
+		if (state === undefined) return;
+		if (state.timer !== undefined) clearTimeout(state.timer);
+		delete state.timer;
+		delete entry.keepalive;
+	}
+
+	/**
 	 * A connect that adopted a `prior` verdict registers the list-changed handlers but does not
 	 * open the modern `subscriptions/listen` stream; open it here so auto-refresh keeps working.
 	 */
@@ -1377,7 +2046,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		const client = session.client;
 		if (
 			entry.definition.autoRefreshCatalog === undefined ||
-			client.getProtocolEra() !== "modern" ||
+			this.#era(entry, client) !== "modern" ||
 			client.autoOpenedSubscription !== undefined
 		) {
 			return;
@@ -1392,7 +2061,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 	#listenFilter(entry: ManagedConnection<Id>, client: Client): SubscriptionFilter {
 		const auto = entry.definition.autoRefreshCatalog !== undefined;
-		const capabilities = client.getServerCapabilities();
+		const capabilities = this.#capabilities(entry, client);
 		return {
 			...(auto && capabilities?.tools?.listChanged === true ? { toolsListChanged: true } : {}),
 			...(auto && capabilities?.prompts?.listChanged === true ? { promptsListChanged: true } : {}),
@@ -1414,11 +2083,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	 */
 	async #relisten(entry: ManagedConnection<Id>, session: McpClientSession<Id>): Promise<void> {
 		const client = session.client;
-		if (client.getProtocolEra() !== "modern" || entry.session !== session) return;
+		if (this.#era(entry, client) !== "modern" || entry.session !== session) return;
 		const filter = this.#listenFilter(entry, client);
 		const previous = entry.listen;
 		if (Object.keys(filter).length === 0) {
 			delete entry.listen;
+			this.#watchListen(entry, session, undefined);
 			await previous?.close().catch(() => undefined);
 			return;
 		}
@@ -1428,8 +2098,89 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			return;
 		}
 		entry.listen = next;
+		this.#watchListen(entry, session, next);
 		await previous?.close().catch(() => undefined);
 		await client.autoOpenedSubscription?.close().catch(() => undefined);
+	}
+
+	/**
+	 * Watches a modern listen stream for an UNEXPECTED drop (`closed` resolving `'remote'`) and
+	 * re-opens it with backoff (1 s → 30 s) for as long as the session stays current. The SDK never
+	 * re-listens on its own, so without this every list-change and resource-update notification
+	 * would silently stop after the first network hiccup. `'local'` and `'graceful'` closes are
+	 * deliberate and ignored.
+	 */
+	#watchListen(
+		entry: ManagedConnection<Id>,
+		session: McpClientSession<Id>,
+		subscription: McpSubscription | undefined,
+	): void {
+		const state = (entry.listenWatch ??= { reopening: false, attempts: 0, reopens: 0 });
+		if (subscription === undefined) {
+			delete state.subscription;
+			return;
+		}
+		state.subscription = subscription;
+		void subscription.closed.then((reason) => {
+			if (reason !== "remote") return;
+			if (entry.session !== session || entry.listenWatch !== state) return;
+			if (state.subscription !== subscription) return;
+			if (!isUsable(entry) || entry.disconnectTask !== undefined || this.#closed) return;
+			delete state.subscription;
+			if (entry.listen === subscription) delete entry.listen;
+			this.#publish("connection.listen.dropped", entry);
+			this.#scheduleRelisten(entry, session, state);
+		});
+	}
+
+	#scheduleRelisten(
+		entry: ManagedConnection<Id>,
+		session: McpClientSession<Id>,
+		state: ListenWatchState,
+	): void {
+		if (state.retryTimer !== undefined || state.reopening) return;
+		const delay = Math.min(
+			LISTEN_REOPEN_MAX_MS,
+			LISTEN_REOPEN_INITIAL_MS * 2 ** Math.min(state.attempts, 16),
+		);
+		state.attempts += 1;
+		const timer = setTimeout(() => {
+			delete state.retryTimer;
+			if (entry.session !== session || entry.listenWatch !== state) return;
+			if (!isUsable(entry) || entry.disconnectTask !== undefined || this.#closed) return;
+			if (state.subscription !== undefined) return;
+			state.reopening = true;
+			void this.#relisten(entry, session)
+				.then(() => {
+					if (entry.session !== session || entry.listenWatch !== state) return;
+					if (state.subscription === undefined) {
+						// Nothing to listen for any more (filter emptied); stop retrying.
+						state.attempts = 0;
+						return;
+					}
+					state.attempts = 0;
+					state.reopens += 1;
+					this.#publish("connection.listen.reopened", entry);
+				})
+				.catch(() => {
+					if (entry.session !== session || entry.listenWatch !== state) return;
+					this.#scheduleRelisten(entry, session, state);
+				})
+				.finally(() => {
+					state.reopening = false;
+				});
+		}, delay);
+		timer.unref?.();
+		state.retryTimer = timer;
+	}
+
+	#stopListenWatch(entry: ManagedConnection<Id>): void {
+		const state = entry.listenWatch;
+		if (state === undefined) return;
+		if (state.retryTimer !== undefined) clearTimeout(state.retryTimer);
+		delete state.retryTimer;
+		delete state.subscription;
+		delete entry.listenWatch;
 	}
 
 	async #performRemove(entry: ManagedConnection<Id>): Promise<void> {
@@ -1499,8 +2250,11 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			delete entry.listen;
 			delete entry.subscribedUris;
 			await session.client.autoOpenedSubscription?.close().catch(() => undefined);
-			await session.close();
+			await this.#terminateSession(entry);
+			await this.#bounded(session.close(), entry.definition.disconnectTimeoutMs, "close");
 			delete entry.session;
+			delete entry.transport;
+			entry.resumed = false;
 			delete entry.connectedAt;
 			delete entry.errorCode;
 			delete entry.errorDetail;
@@ -1515,6 +2269,49 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				`Failed to close '${entry.definition.id}'.`,
 				{ cause: error },
 			);
+		}
+	}
+
+	/**
+	 * Sends the Streamable HTTP `DELETE` that lets the server release the session. Separate from
+	 * `Client.close()`, which only tears the client down. Best-effort and time-boxed: a server MAY
+	 * answer 405, and a hung DELETE must not turn a clean disconnect into a quarantine.
+	 */
+	async #terminateSession(entry: ManagedConnection<Id>): Promise<void> {
+		if (!entry.definition.terminateSession) return;
+		const transport = entry.transport as
+			(Transport & { terminateSession?: () => Promise<void> }) | undefined;
+		if (transport === undefined || typeof transport.terminateSession !== "function") return;
+		if (transport.sessionId === undefined) return;
+		try {
+			await this.#bounded(transport.terminateSession(), this.#terminateSessionTimeoutMs, "DELETE");
+		} catch {
+			// Best-effort by design.
+		}
+	}
+
+	async #bounded<Value>(
+		task: Promise<Value>,
+		timeoutMs: number | undefined,
+		label: string,
+	): Promise<Value> {
+		if (timeoutMs === undefined) return task;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => {
+				reject(
+					new KmcpError(
+						KMCP_ERROR_CODES.HANDLER_TIMEOUT,
+						`The ${label} did not complete within ${timeoutMs}ms.`,
+					),
+				);
+			}, timeoutMs);
+			timer.unref?.();
+		});
+		try {
+			return await Promise.race([task, timeout]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
 		}
 	}
 
@@ -1583,7 +2380,11 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			delete entry.catalog;
 			entry.catalogRevision += 1;
 		}
-		if (phase !== "online" && phase !== "degraded") this.#cancelAutoRefresh(entry);
+		if (phase !== "online" && phase !== "degraded") {
+			this.#cancelAutoRefresh(entry);
+			this.#stopKeepalive(entry);
+			this.#stopListenWatch(entry);
+		}
 		if (phase !== "failed") this.#cancelReconnectTimer(entry);
 		entry.phase = phase;
 		entry.lastTransitionAt = isoTimestamp(this.#now);
@@ -1624,12 +2425,26 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 	#snapshotEntry(entry: ManagedConnection<Id>): McpConnectionSnapshot<Id> {
 		const client = entry.session?.client;
-		const serverInfo = client?.getServerVersion();
-		const protocolVersion = client?.getNegotiatedProtocolVersion();
-		const protocolEra = client?.getProtocolEra();
-		const capabilities = client?.getServerCapabilities();
-		const instructions = client?.getInstructions();
+		const resumed = entry.resumed ? entry.definition.resumed : undefined;
+		const serverInfo = client?.getServerVersion() ?? resumed?.serverInfo;
+		const protocolVersion = client?.getNegotiatedProtocolVersion() ?? resumed?.protocolVersion;
+		const protocolEra = client === undefined ? undefined : this.#era(entry, client);
+		const capabilities = client === undefined ? undefined : this.#capabilities(entry, client);
+		const instructions = client?.getInstructions() ?? resumed?.instructions;
 		const watch = client === undefined ? undefined : this.#watchSnapshot(entry, client);
+		const transportKind = this.#transportKind(entry);
+		const sessionId = client === undefined ? undefined : entry.transport?.sessionId;
+		const connectionMode =
+			client === undefined ? undefined : connectionModeOf(transportKind, sessionId, protocolEra);
+		const supportedVersions =
+			client === undefined || entry.discover?.supportedVersions === undefined
+				? undefined
+				: Object.freeze(
+						entry.discover.supportedVersions
+							.filter((version): version is string => typeof version === "string")
+							.slice(0, MAX_SUPPORTED_VERSIONS),
+					);
+		const keepalive = entry.keepalive;
 		return Object.freeze({
 			id: entry.definition.id,
 			label: entry.definition.label,
@@ -1638,8 +2453,13 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			generation: entry.generation,
 			lastTransitionAt: entry.lastTransitionAt,
 			...(entry.connectedAt === undefined ? {} : { connectedAt: entry.connectedAt }),
+			...(entry.lastSeenAt === undefined ? {} : { lastSeenAt: entry.lastSeenAt }),
+			...(transportKind === undefined ? {} : { transportKind }),
+			...(sessionId === undefined ? {} : { sessionId }),
+			...(connectionMode === undefined ? {} : { connectionMode }),
 			...(protocolVersion === undefined ? {} : { protocolVersion }),
 			...(protocolEra === undefined ? {} : { protocolEra }),
+			...(supportedVersions === undefined ? {} : { supportedVersions }),
 			...(serverInfo === undefined ? {} : { serverInfo: immutableClone(serverInfo) }),
 			...(instructions === undefined
 				? {}
@@ -1649,6 +2469,19 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			...(entry.errorCode === undefined ? {} : { errorCode: entry.errorCode }),
 			...(entry.errorDetail === undefined ? {} : { errorDetail: entry.errorDetail }),
 			...(watch === undefined ? {} : { watch }),
+			...(keepalive === undefined
+				? {}
+				: {
+						keepalive: Object.freeze({
+							failures: keepalive.failures,
+							...(keepalive.lastProbeAt === undefined
+								? {}
+								: { lastProbeAt: keepalive.lastProbeAt }),
+							...(keepalive.lastFailureAt === undefined
+								? {}
+								: { lastFailureAt: keepalive.lastFailureAt }),
+						}),
+					}),
 			...(entry.subscribedUris === undefined || entry.subscribedUris.size === 0
 				? {}
 				: { subscribedResources: Object.freeze([...entry.subscribedUris].sort()) }),
@@ -1666,10 +2499,21 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		});
 	}
 
+	#transportKind(entry: ManagedConnection<Id>): McpTransportKind | undefined {
+		const declared = entry.definition.transportKind;
+		if (declared !== "custom") return declared;
+		const transport = entry.transport as
+			(Transport & { terminateSession?: unknown; stderr?: unknown }) | undefined;
+		if (transport === undefined) return "custom";
+		if (typeof transport.terminateSession === "function") return "streamable-http";
+		return "custom";
+	}
+
 	#watchSnapshot(entry: ManagedConnection<Id>, client: Client): McpWatchSnapshot {
 		const refreshes = entry.autoRefresh?.count ?? 0;
+		const reopens = entry.listenWatch?.reopens ?? 0;
 		const configured = entry.definition.autoRefreshCatalog !== undefined;
-		const base = { refreshes };
+		const base = { refreshes, reopens };
 		if (!configured) {
 			return Object.freeze({
 				...base,
@@ -1679,13 +2523,13 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				reason: "not-configured" as const,
 			});
 		}
-		const capabilities = client.getServerCapabilities();
+		const capabilities = this.#capabilities(entry, client);
 		const advertised: McpCatalogCapability[] = [];
 		if (capabilities?.tools?.listChanged === true) advertised.push("tools");
 		if (capabilities?.prompts?.listChanged === true) advertised.push("prompts");
 		if (capabilities?.resources?.listChanged === true)
 			advertised.push("resources", "resourceTemplates");
-		const era = client.getProtocolEra();
+		const era = this.#era(entry, client);
 		let honored: readonly McpCatalogCapability[];
 		if (era === "modern") {
 			const filter = (entry.listen ?? client.autoOpenedSubscription)?.honoredFilter;
@@ -1751,6 +2595,8 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 /** Classifies an error (walking `cause`) into a stable kind/code pair for snapshots. */
 export function describeError(error: unknown): McpErrorDetail {
+	// A transport-level cause is the most actionable classification, wherever it sits in the chain.
+	const network = deepNetworkErrorCode(error);
 	let current: unknown = error;
 	for (let depth = 0; depth < 8 && current !== undefined && current !== null; depth += 1) {
 		if (current instanceof KmcpError) {
@@ -1764,19 +2610,162 @@ export function describeError(error: unknown): McpErrorDetail {
 			return { kind: "oauth", code: "unauthorized" };
 		} else if (current instanceof InsufficientScopeError) {
 			return { kind: "oauth", code: "insufficient_scope" };
+		} else if (current instanceof RegistrationRejectedError) {
+			return { kind: "oauth", code: "registration_rejected", httpStatus: current.status };
+		} else if (current instanceof IssuerMismatchError) {
+			return { kind: "oauth", code: "issuer_mismatch" };
+		} else if (current instanceof AuthorizationServerMismatchError) {
+			return { kind: "oauth", code: "authorization_server_mismatch" };
+		} else if (current instanceof InsecureTokenEndpointError) {
+			return { kind: "oauth", code: "insecure_token_endpoint" };
+		} else if (current instanceof OAuthError) {
+			return { kind: "oauth", code: String(current.code).slice(0, 64) };
 		} else if (current instanceof UnsupportedProtocolVersionError) {
 			return { kind: "protocol", code: "unsupported_protocol_version" };
 		} else if (current instanceof MissingRequiredClientCapabilityError) {
 			return { kind: "protocol", code: "missing_required_client_capability" };
+		} else if (current instanceof UrlElicitationRequiredError) {
+			return { kind: "protocol", code: "url_elicitation_required" };
+		} else if (current instanceof SdkHttpError) {
+			return { kind: "http", code: current.status, httpStatus: current.status };
 		} else if (current instanceof SdkError) {
-			return { kind: "sdk", code: current.code };
+			return network === undefined
+				? { kind: "sdk", code: current.code }
+				: { kind: "network", code: network };
 		} else if (current instanceof ProtocolError) {
 			return { kind: "protocol", code: current.code };
+		} else if (network !== undefined) {
+			return { kind: "network", code: network };
 		}
 		current = current instanceof Error ? current.cause : undefined;
 	}
+	if (network !== undefined) return { kind: "network", code: network };
 	if (error instanceof KmcpError) return { kind: "kmcp", code: error.code };
 	return { kind: "unknown", code: error instanceof Error ? error.name : typeof error };
+}
+
+function deepNetworkErrorCode(error: unknown): string | undefined {
+	let current: unknown = error;
+	for (let depth = 0; depth < 8 && current !== undefined && current !== null; depth += 1) {
+		const code = networkErrorCode(current);
+		if (code !== undefined) return code;
+		// The SDK attaches the underlying failure to `data.cause` on its typed errors.
+		const data = current instanceof SdkError ? current.data : undefined;
+		const dataCause =
+			typeof data === "object" && data !== null ? (data as { cause?: unknown }).cause : undefined;
+		current = current instanceof Error && current.cause !== undefined ? current.cause : dataCause;
+	}
+	return undefined;
+}
+
+type McpListKind = "prompts" | "resourceTemplates" | "resources" | "tools";
+
+type McpListResult<Kind extends McpListKind> = Kind extends "tools"
+	? ListToolsResult
+	: Kind extends "resources"
+		? ListResourcesResult
+		: Kind extends "resourceTemplates"
+			? ListResourceTemplatesResult
+			: ListPromptsResult;
+
+const LIST_METHODS = Object.freeze({
+	tools: "tools/list",
+	resources: "resources/list",
+	resourceTemplates: "resources/templates/list",
+	prompts: "prompts/list",
+} as const);
+
+const LIST_SCHEMAS = Object.freeze({
+	tools: specTypeSchemas.ListToolsResult,
+	resources: specTypeSchemas.ListResourcesResult,
+	resourceTemplates: specTypeSchemas.ListResourceTemplatesResult,
+	prompts: specTypeSchemas.ListPromptsResult,
+} as const);
+
+const LIST_MAX_PAGES = 64;
+
+/** Walks every page of a list verb through `Client.request()` (mirrors the SDK's aggregate walk). */
+async function walkListPages<Kind extends McpListKind>(
+	client: Client,
+	kind: Kind,
+	params: Record<string, unknown>,
+	options: RequestOptions,
+): Promise<McpListResult<Kind>> {
+	const method = LIST_METHODS[kind];
+	const schema = LIST_SCHEMAS[kind];
+	const items: unknown[] = [];
+	const seen = new Set<string>();
+	let cursor: string | undefined;
+	let first: Record<string, unknown> | undefined;
+	for (let page = 0; ; page += 1) {
+		if (page >= LIST_MAX_PAGES) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.OPERATION_FAILED,
+				`${method} exceeded ${LIST_MAX_PAGES} pages without a final cursor.`,
+			);
+		}
+		const result = (await client.request(
+			{ method, params: cursor === undefined ? params : { ...params, cursor } },
+			schema,
+			options,
+		)) as Record<string, unknown>;
+		first ??= result;
+		const pageItems = result[kind];
+		if (Array.isArray(pageItems)) items.push(...pageItems);
+		const next = result.nextCursor;
+		if (typeof next !== "string" || next.length === 0) break;
+		if (seen.has(next)) break;
+		seen.add(next);
+		cursor = next;
+	}
+	const { nextCursor: _nextCursor, ...rest } = first ?? {};
+	void _nextCursor;
+	return { ...rest, [kind]: items } as McpListResult<Kind>;
+}
+
+const NETWORK_ERROR_CODE =
+	/^(E[A-Z]{2,}|EAI_[A-Z]+|UND_ERR_[A-Z_]+|CERT_[A-Z_]+|ERR_TLS_[A-Z_]+|ERR_SSL_[A-Z_]+|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_[A-Z_]+)$/;
+
+/**
+ * A stable code for a transport-level failure: Node system errors (`ECONNREFUSED`, `ENOTFOUND`,
+ * `ETIMEDOUT`, ...), undici errors, TLS/certificate errors, and aborts / timeouts raised as
+ * `DOMException`s. `undefined` for anything else.
+ */
+function networkErrorCode(error: unknown): string | undefined {
+	if (error instanceof DOMException) {
+		return error.name === "AbortError" || error.name === "TimeoutError" ? error.name : undefined;
+	}
+	if (!(error instanceof Error)) return undefined;
+	// kmcp's and the SDK's own typed errors carry codes of their own vocabulary.
+	if (error instanceof KmcpError || error instanceof SdkError || error instanceof ProtocolError) {
+		return undefined;
+	}
+	const code = (error as { readonly code?: unknown }).code;
+	if (typeof code === "string" && NETWORK_ERROR_CODE.test(code)) return code;
+	return undefined;
+}
+
+function findCause<Found>(
+	error: unknown,
+	predicate: (candidate: unknown) => candidate is Found,
+): Found | undefined {
+	let current: unknown = error;
+	for (let depth = 0; depth < 8 && current !== undefined && current !== null; depth += 1) {
+		if (predicate(current)) return current;
+		current = current instanceof Error ? current.cause : undefined;
+	}
+	return undefined;
+}
+
+function connectionModeOf(
+	transportKind: McpTransportKind | undefined,
+	sessionId: string | undefined,
+	era: ProtocolEra | undefined,
+): McpConnectionMode {
+	if (sessionId !== undefined) return "stateful";
+	if (transportKind === "streamable-http") return "stateless";
+	if (transportKind === "in-process") return era === "modern" ? "stateless" : "stateful";
+	return "stateful";
 }
 
 function boundedCompletion(result: CompleteResult): CompleteResult {
