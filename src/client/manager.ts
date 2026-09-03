@@ -27,6 +27,7 @@ import {
 	type McpSubscription,
 	MissingRequiredClientCapabilityError,
 	OAuthError,
+	type Prompt,
 	type ProtocolEra,
 	ProtocolError,
 	type ReadResourceResult,
@@ -57,13 +58,16 @@ import type { McpCatalogCapability, McpCatalogSection, McpCatalogSnapshot } from
 import {
 	McpClientSession,
 	McpConnectionDefinition,
+	type McpResumedSession,
 	type McpTransportKind,
 	createOfficialClient,
 } from "./connection.ts";
 import {
 	type McpContractMode,
 	type McpContractResult,
+	type McpExpectedPrompt,
 	type McpExpectedTool,
+	checkPromptContract,
 	checkToolContract,
 } from "./contract.ts";
 import { type McpSkill, discoverSkills, resolveSkillUri } from "./skills.ts";
@@ -236,6 +240,18 @@ export interface McpContractOptions {
 	readonly contract?: McpToolContractOption;
 }
 
+/** A prompt contract to enforce before `prompts/get` goes out (see `checkPromptContract`). */
+export interface McpPromptContractOption {
+	readonly expected: McpExpectedPrompt;
+	/** Default: `"compatible"`. */
+	readonly mode?: McpContractMode;
+}
+
+export interface McpGetPromptOptions extends RequestOptions, McpMetaOptions {
+	/** Refuse the request with `PROMPT_CONTRACT_MISMATCH` when the advertised prompt has drifted from `expected` in a way that breaks this call. */
+	readonly contract?: McpPromptContractOption;
+}
+
 export type McpCallToolOptions = CallToolRequestOptions &
 	McpMetaOptions &
 	McpMrtrForwardOptions &
@@ -277,6 +293,38 @@ export class McpToolContractError extends KmcpError {
 		this.name = "McpToolContractError";
 		this.result = result;
 	}
+}
+
+/** Thrown when a prompt `contract` check refuses a request; carries the full check result. */
+export class McpPromptContractError extends KmcpError {
+	readonly result: McpContractResult;
+
+	constructor(promptName: string, result: McpContractResult) {
+		super(
+			KMCP_ERROR_CODES.PROMPT_CONTRACT_MISMATCH,
+			`Prompt '${promptName}' no longer matches its contract: ${result.errors.join(" ")}`,
+		);
+		this.name = "McpPromptContractError";
+		this.result = result;
+	}
+}
+
+/**
+ * The record a later start needs to resume this connection's server-side session (see
+ * `McpResumedSession` / `httpConnection({ resume })`), or `undefined` when the server issued no
+ * session id. Persist it with the snapshot's `id`; a stateless connection has nothing to resume.
+ */
+export function resumedSessionFrom(snapshot: McpConnectionSnapshot): McpResumedSession | undefined {
+	if (snapshot.sessionId === undefined) return undefined;
+	return Object.freeze({
+		sessionId: snapshot.sessionId,
+		...(snapshot.protocolVersion === undefined
+			? {}
+			: { protocolVersion: snapshot.protocolVersion }),
+		...(snapshot.capabilities === undefined ? {} : { capabilities: snapshot.capabilities }),
+		...(snapshot.serverInfo === undefined ? {} : { serverInfo: snapshot.serverInfo }),
+		...(snapshot.instructions === undefined ? {} : { instructions: snapshot.instructions }),
+	});
 }
 
 /** A `CallToolResult` reduced to its stable, consumer-facing parts. */
@@ -781,13 +829,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			id,
 			async (client) => {
 				const tool = await this.#advertisedTool(id, client, name, options.signal);
-				if (tool === undefined) {
-					return Object.freeze({
-						valid: false,
-						errors: Object.freeze([`Tool '${name}' is not advertised by the upstream.`]),
-						warnings: Object.freeze([]),
-					});
-				}
+				if (tool === undefined) return notAdvertised("Tool", name);
 				return checkToolContract(tool, expected, {
 					...(options.mode === undefined ? {} : { mode: options.mode }),
 					...(options.arguments === undefined ? {} : { arguments: options.arguments }),
@@ -1061,21 +1103,52 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		id: Id,
 		name: string,
 		arguments_: Readonly<Record<string, string>> | undefined,
-		options?: McpRequestOptionsWithMeta,
+		options?: McpGetPromptOptions,
 		control?: McpConnectionOperationControl,
 	): Promise<GetPromptResult> {
 		return this.withClient(
 			id,
-			(client) =>
-				client.getPrompt(
+			async (client) => {
+				if (options?.contract !== undefined) {
+					await this.#enforcePromptContract(id, client, name, arguments_, options.contract);
+				}
+				return client.getPrompt(
 					this.#params(
 						id,
 						{ name, ...(arguments_ === undefined ? {} : { arguments: { ...arguments_ } }) },
 						options,
 					),
 					this.#requestOptions(id, "prompt", options),
-				),
+				);
+			},
 			options?.signal,
+			control,
+		);
+	}
+
+	/** The prompt counterpart of `checkToolContract`: compares the advertised prompt with an expected shape. */
+	checkPromptContract(
+		id: Id,
+		name: string,
+		expected: McpExpectedPrompt,
+		options: {
+			readonly mode?: McpContractMode;
+			readonly arguments?: Readonly<Record<string, string>>;
+			readonly signal?: AbortSignal;
+		} = {},
+		control?: McpConnectionOperationControl,
+	): Promise<McpContractResult> {
+		return this.withClient(
+			id,
+			async (client) => {
+				const prompt = await this.#advertisedPrompt(id, client, name, options.signal);
+				if (prompt === undefined) return notAdvertised("Prompt", name);
+				return checkPromptContract(prompt, expected, {
+					...(options.mode === undefined ? {} : { mode: options.mode }),
+					...(options.arguments === undefined ? {} : { arguments: options.arguments }),
+				});
+			},
+			options.signal,
 			control,
 		);
 	}
@@ -1648,16 +1721,55 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		const tool = await this.#advertisedTool(id, client, name, undefined);
 		const result =
 			tool === undefined
-				? Object.freeze({
-						valid: false,
-						errors: Object.freeze([`Tool '${name}' is not advertised by the upstream.`]),
-						warnings: Object.freeze([]),
-					})
+				? notAdvertised("Tool", name)
 				: checkToolContract(tool, contract.expected, {
 						mode: contract.mode ?? "compatible",
 						arguments: arguments_,
 					});
 		if (!result.valid) throw new McpToolContractError(name, result);
+	}
+
+	async #advertisedPrompt(
+		id: Id,
+		client: Client,
+		name: string,
+		signal: AbortSignal | undefined,
+	): Promise<Prompt | undefined> {
+		const entry = this.#entry(id);
+		const catalog = entry.catalog;
+		if (
+			catalog !== undefined &&
+			catalog.generation === entry.generation &&
+			catalog.prompts.status === "fresh"
+		) {
+			return catalog.prompts.items.find((prompt) => prompt.name === name);
+		}
+		const listed = await this.#list(
+			entry,
+			client,
+			"prompts",
+			this.#params(id, {}),
+			this.#requestOptions(id, "request", signal === undefined ? undefined : { signal }),
+		);
+		return listed.prompts.find((prompt) => prompt.name === name);
+	}
+
+	async #enforcePromptContract(
+		id: Id,
+		client: Client,
+		name: string,
+		arguments_: Readonly<Record<string, string>> | undefined,
+		contract: McpPromptContractOption,
+	): Promise<void> {
+		const prompt = await this.#advertisedPrompt(id, client, name, undefined);
+		const result =
+			prompt === undefined
+				? notAdvertised("Prompt", name)
+				: checkPromptContract(prompt, contract.expected, {
+						mode: contract.mode ?? "compatible",
+						...(arguments_ === undefined ? {} : { arguments: arguments_ }),
+					});
+		if (!result.valid) throw new McpPromptContractError(name, result);
 	}
 
 	async #performConnect(entry: ManagedConnection<Id>): Promise<McpConnectionSnapshot<Id>> {
@@ -2743,6 +2855,14 @@ function networkErrorCode(error: unknown): string | undefined {
 	const code = (error as { readonly code?: unknown }).code;
 	if (typeof code === "string" && NETWORK_ERROR_CODE.test(code)) return code;
 	return undefined;
+}
+
+function notAdvertised(kind: "Prompt" | "Tool", name: string): McpContractResult {
+	return Object.freeze({
+		valid: false,
+		errors: Object.freeze([`${kind} '${name}' is not advertised by the upstream.`]),
+		warnings: Object.freeze([]),
+	});
 }
 
 function findCause<Found>(

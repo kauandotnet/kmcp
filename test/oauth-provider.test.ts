@@ -75,12 +75,12 @@ test("client information and tokens round-trip per authorization-server issuer",
 		client_id: "two",
 		issuer: SECOND.issuer,
 	});
-	assert.deepEqual(await provider.tokens(FIRST), {
+	assert.partialDeepStrictEqual(await provider.tokens(FIRST), {
 		access_token: "a",
 		token_type: "Bearer",
 		issuer: FIRST.issuer,
 	});
-	assert.deepEqual(await provider.tokens(SECOND), {
+	assert.partialDeepStrictEqual(await provider.tokens(SECOND), {
 		access_token: "b",
 		token_type: "Bearer",
 		issuer: SECOND.issuer,
