@@ -357,24 +357,25 @@ any `OAuthClientProvider` (an interactive one arms the `authorizing` flow; clien
 enterprise providers advertise their capability extension automatically); `headers` may not carry
 `Authorization` next to `auth`; `middlewares` composes SDK fetch middlewares (`withLogging`,
 `createMiddleware`, …) around the transport; `resume` adopts a server-side session once — the SDK
-then runs no handshake, so the `McpResumedSession` record (`sessionId`, `protocolVersion`,
-`capabilities`, `serverInfo`, `instructions`, all available on a snapshot) stands in for it, strict
-capability enforcement is off for that definition, the list verbs walk the pages themselves, and any
-later reconnect starts fresh; `reconnection` overrides `MCP_HTTP_RECONNECTION_DEFAULTS` (1 s → 30 s,
-factor 2, 10 retries for the server-to-client stream); `cachePartition` defaults to a digest of the
-credential identity. `stdioConnection` (`kmcp/node`) adds `onStderrLine` to receive the child's
-stderr line by line.
+then runs no handshake, so the `McpResumedSession` record (`resumedSessionFrom(snapshot)` builds it
+from a connection snapshot; `undefined` when the server issued no session id) stands in for it,
+strict capability enforcement is off for that definition, the list verbs walk the pages themselves,
+and any later reconnect starts fresh; `reconnection` overrides `MCP_HTTP_RECONNECTION_DEFAULTS` (1 s
+→ 30 s, factor 2, 10 retries for the server-to-client stream); `cachePartition` defaults to a digest
+of the credential identity. `stdioConnection` (`kmcp/node`) adds `onStderrLine` to receive the
+child's stderr line by line.
 
 Manager verbs take the SDK request option types plus `meta` (`_meta` passthrough) and an optional
 generation/fingerprint `control`: `callTool` (with `contract` it refuses the call when the
 advertised tool has drifted from an expected shape in a way that breaks it — see
 `checkToolContract`), `callToolParsed` (raises `McpToolCallError` on `isError` unless
 `raiseOnError: false`; the SDK has already validated `structuredContent`), `readResource`,
-`getPrompt`, `complete`, `listTools`, `listResources`, `listResourceTemplates`, `listPrompts`,
-`listSkills` / `readSkill` (SEP-2640: the `skill://index.json` index, then a scan of the resource
-list), `ping` (`server/discover` on modern, `ping` on legacy), `discover` (a live `server/discover`,
-modern only), `setLogLevel`, `subscribeResource` / `unsubscribeResource` (legacy sends the RPC;
-2026-07-28 has no `resources/subscribe`, so the subscription is expressed through the
+`getPrompt` (with `contract`, the prompt counterpart of the tool contract), `complete`,
+`checkToolContract` / `checkPromptContract`, `listTools`, `listResources`, `listResourceTemplates`,
+`listPrompts`, `listSkills` / `readSkill` (SEP-2640: the `skill://index.json` index, then a scan of
+the resource list), `ping` (`server/discover` on modern, `ping` on legacy), `discover` (a live
+`server/discover`, modern only), `setLogLevel`, `subscribeResource` / `unsubscribeResource` (legacy
+sends the RPC; 2026-07-28 has no `resources/subscribe`, so the subscription is expressed through the
 `subscriptions/listen` filter — updates surface as `resource.updated` events and subscriptions are
 generation-scoped, so re-subscribe after a reconnect), `notifyRootsChanged` (legacy-era only — the
 2026 wire removed roots), `connectAll`, `completeAuthorization`, and the task verbs below. The hub
@@ -462,7 +463,11 @@ the OAuth `state` parameter the SDK leaves to hosts (`AUTH_STATE_MISMATCH`; the 
 `completeAuthorization` verifies it before the code is exchanged), refreshes an access token before
 it expires through the SDK's `refreshAuthorization` (single-flight, 60 s buffer, off with
 `refresh: false`; a failed refresh falls back to the transport's 401 path), and reports what it
-holds through `status()`. `explainOAuthError` turns any error from the flow into a stable
+holds through `status()` (issuer, client id, scope, expiry, save time, display-only identity).
+`InMemoryKeyValueStore`, `FileKeyValueStore` (`kmcp/node`, mode `0600`, atomic) and
+`KeyringKeyValueStore` (an OS keyring through a host-supplied `(service, account)` entry factory
+such as `@napi-rs/keyring`'s `Entry`; kmcp itself never loads a native module) are the bundled
+stores. `explainOAuthError` turns any error from the flow into a stable
 `{ kind, message, remediation? }` — registration refused or unsupported, client rejected, access
 denied, issuer mix-up (never echoing the attacker-controlled issuer), insufficient scope — and
 `describeError` carries the same classification into snapshots. `openBrowser` / `browserOpenCommand`

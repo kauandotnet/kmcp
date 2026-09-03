@@ -91,6 +91,8 @@ export type {
 	McpValidateCredentialsOptions,
 	McpValidatedCredentials,
 } from "./client/oauth-flows.ts";
+export { KeyringKeyValueStore } from "./client/keyring.ts";
+export type { McpKeyringEntry, McpKeyringStoreOptions } from "./client/keyring.ts";
 export { decodeJwtClaims, jwtExpiresAt } from "./client/jwt.ts";
 export type { McpJwtClaims } from "./client/jwt.ts";
 export {
@@ -138,10 +140,12 @@ export {
 export type { McpProtocolEra, McpProtocolPin } from "./internal/protocol.ts";
 export {
 	McpConnectionManager,
+	McpPromptContractError,
 	McpToolCallError,
 	McpToolContractError,
 	describeError,
 	parseToolResult,
+	resumedSessionFrom,
 	throwIfToolError,
 } from "./client/manager.ts";
 export type {
@@ -159,11 +163,13 @@ export type {
 	McpConnectionSnapshot,
 	McpContractOptions,
 	McpErrorDetail,
+	McpGetPromptOptions,
 	McpKeepaliveSnapshot,
 	McpMetaOptions,
 	McpMrtrForwardOptions,
 	McpParsedToolResult,
 	McpPingResult,
+	McpPromptContractOption,
 	McpReadOptions,
 	McpRequestOptionsWithMeta,
 	McpToolContractOption,

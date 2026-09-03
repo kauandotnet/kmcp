@@ -56,6 +56,8 @@ export interface McpOAuthRefreshOptions {
 export type McpStoredOAuthTokens = StoredOAuthTokens & {
 	/** Unix time (seconds) the access token expires, derived from `expires_in` at save time. */
 	readonly expires_at?: number;
+	/** ISO timestamp of the save (an authorization, an exchange, or a refresh). */
+	readonly saved_at?: string;
 };
 
 /** A non-secret description of what a provider currently holds. Safe to log or display. */
@@ -70,6 +72,8 @@ export interface McpOAuthCredentialStatus {
 	readonly scope?: string;
 	/** ISO timestamp the access token expires, when the server reported a lifetime. */
 	readonly expiresAt?: string;
+	/** ISO timestamp the current token set was stored. */
+	readonly savedAt?: string;
 	/** Display-only identity claims decoded (unverified) from an OIDC `id_token`. */
 	readonly identity?: Readonly<{ subject?: string; email?: string; name?: string }>;
 }
@@ -450,6 +454,7 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 			...(tokens?.expires_at === undefined
 				? {}
 				: { expiresAt: new Date(tokens.expires_at * 1000).toISOString() }),
+			...(tokens?.saved_at === undefined ? {} : { savedAt: tokens.saved_at }),
 			...(identity === undefined ? {} : { identity }),
 		});
 	}
@@ -463,11 +468,12 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 	}
 
 	#stamp(tokens: StoredOAuthTokens): McpStoredOAuthTokens {
+		const saved_at = new Date(this.#now()).toISOString();
 		const existing = (tokens as McpStoredOAuthTokens).expires_at;
-		if (existing !== undefined) return tokens as McpStoredOAuthTokens;
+		if (existing !== undefined) return { ...tokens, saved_at };
 		const lifetime = tokens.expires_in;
-		if (typeof lifetime !== "number" || !Number.isFinite(lifetime)) return tokens;
-		return { ...tokens, expires_at: Math.floor(this.#now() / 1000) + lifetime };
+		if (typeof lifetime !== "number" || !Number.isFinite(lifetime)) return { ...tokens, saved_at };
+		return { ...tokens, expires_at: Math.floor(this.#now() / 1000) + lifetime, saved_at };
 	}
 
 	#expiresSoon(tokens: McpStoredOAuthTokens, bufferMs: number): boolean {
