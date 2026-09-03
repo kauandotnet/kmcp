@@ -41,6 +41,7 @@ import {
 	UnauthorizedError,
 	UnsupportedProtocolVersionError,
 	UrlElicitationRequiredError,
+	specTypeSchemas,
 } from "@modelcontextprotocol/client";
 
 import { KMCP_ERROR_CODES, KmcpError, errorCode } from "../errors.ts";
@@ -85,7 +86,7 @@ export type McpConnectionPhase =
 
 /** A classification of the last failure that is richer than `errorCode` (which only names kmcp codes). */
 export interface McpErrorDetail {
-	readonly kind: "http" | "kmcp" | "oauth" | "protocol" | "sdk" | "unknown";
+	readonly kind: "http" | "kmcp" | "network" | "oauth" | "protocol" | "sdk" | "unknown";
 	readonly code: string | number;
 	/** Present for HTTP-level failures (`kind: "http"` and OAuth registration rejections). */
 	readonly httpStatus?: number;
@@ -363,6 +364,8 @@ interface ManagedConnection<Id extends string> {
 	catalogRevision: number;
 	session?: McpClientSession<Id>;
 	transport?: Transport;
+	/** True while the current session was adopted through `definition.resumed` (no handshake ran). */
+	resumed: boolean;
 	connectTask?: Promise<McpConnectionSnapshot<Id>>;
 	disconnectTask?: Promise<McpConnectionSnapshot<Id>>;
 	removeTask?: Promise<void>;
@@ -473,6 +476,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			phase: "offline",
 			generation: 0,
 			activeOperations: 0,
+			resumed: false,
 			catalogRevision: 0,
 			lastTransitionAt: isoTimestamp(this.#now),
 			drainWaiters: new Set(),
@@ -796,8 +800,16 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 	/** Whether the upstream advertises task-augmented `tools/call` on a revision kmcp can drive. */
 	supportsToolTasks(id: Id): boolean {
-		const client = this.#entry(id).session?.client;
-		return client === undefined ? false : supportsToolTasks(client);
+		const entry = this.#entry(id);
+		const client = entry.session?.client;
+		return client === undefined
+			? false
+			: supportsToolTasks({
+					request: () => Promise.resolve(undefined),
+					getProtocolEra: () => this.#era(entry, client),
+					getNegotiatedProtocolVersion: () => client.getNegotiatedProtocolVersion(),
+					getServerCapabilities: () => this.#capabilities(entry, client),
+				});
 	}
 
 	/** Issues a task-augmented `tools/call` (2025-11-25); the tool keeps running after this resolves. */
@@ -811,7 +823,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				new McpTaskClient(client).createToolTask(name, arguments_, {
+				this.#taskClient(this.#entry(id), client).createToolTask(name, arguments_, {
 					...(options?.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
 					meta: this.#params(id, {}, options)._meta ?? {},
 					request: this.#requestOptions(id, "tool", this.#taskRequest(options)),
@@ -831,7 +843,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				new McpTaskClient(client).waitForTask(taskId, {
+				this.#taskClient(this.#entry(id), client).waitForTask(taskId, {
 					...options,
 					request: this.#requestOptions(id, "tool", options?.request),
 				}),
@@ -851,7 +863,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				new McpTaskClient(client).callToolViaTask(name, arguments_, {
+				this.#taskClient(this.#entry(id), client).callToolViaTask(name, arguments_, {
 					...options,
 					meta: this.#params(id, {}, options)._meta ?? {},
 					request: this.#requestOptions(id, "tool", this.#taskRequest(options)),
@@ -865,7 +877,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				new McpTaskClient(client).getTask(taskId, this.#requestOptions(id, "request", options)),
+				this.#taskClient(this.#entry(id), client).getTask(
+					taskId,
+					this.#requestOptions(id, "request", options),
+				),
 			options?.signal,
 		);
 	}
@@ -879,7 +894,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				new McpTaskClient(client).getTaskResult(taskId, this.#requestOptions(id, "tool", options)),
+				this.#taskClient(this.#entry(id), client).getTaskResult(
+					taskId,
+					this.#requestOptions(id, "tool", options),
+				),
 			options?.signal,
 		);
 	}
@@ -891,7 +909,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				new McpTaskClient(client).listTasks(
+				this.#taskClient(this.#entry(id), client).listTasks(
 					options?.cursor,
 					this.#requestOptions(id, "request", options),
 				),
@@ -907,7 +925,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				new McpTaskClient(client).cancelTask(taskId, this.#requestOptions(id, "request", options)),
+				this.#taskClient(this.#entry(id), client).cancelTask(
+					taskId,
+					this.#requestOptions(id, "request", options),
+				),
 			options?.signal,
 		);
 	}
@@ -933,7 +954,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			id,
 			async (client, session) => {
 				const entry = this.#entry(id);
-				if (client.getProtocolEra() === "modern") {
+				if (this.#era(entry, client) === "modern") {
 					// `resources/subscribe` does not exist on 2026-07-28: the subscription is
 					// expressed purely through the `subscriptions/listen` filter.
 					const uris = (entry.subscribedUris ??= new Set());
@@ -978,7 +999,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			id,
 			async (client, session) => {
 				const entry = this.#entry(id);
-				if (client.getProtocolEra() === "modern") {
+				if (this.#era(entry, client) === "modern") {
 					entry.subscribedUris?.delete(uri);
 					// Narrowing is best-effort: failure means over-notification, never silence.
 					await this.#relisten(entry, session).catch(() => undefined);
@@ -1006,7 +1027,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			async (client) => {
-				if (client.getProtocolEra() === "modern") {
+				if (this.#era(this.#entry(id), client) === "modern") {
 					throw new KmcpError(
 						KMCP_ERROR_CODES.OPERATION_FAILED,
 						"Roots are a legacy-era feature; the 2026-07-28 wire has no roots/list_changed.",
@@ -1088,7 +1109,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				client.listTools(
+				this.#list(
+					this.#entry(id),
+					client,
+					"tools",
 					this.#params(id, {}, options),
 					this.#requestOptions(id, "request", options),
 				),
@@ -1105,7 +1129,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				client.listResources(
+				this.#list(
+					this.#entry(id),
+					client,
+					"resources",
 					this.#params(id, {}, options),
 					this.#requestOptions(id, "request", options),
 				),
@@ -1122,7 +1149,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				client.listResourceTemplates(
+				this.#list(
+					this.#entry(id),
+					client,
+					"resourceTemplates",
 					this.#params(id, {}, options),
 					this.#requestOptions(id, "request", options),
 				),
@@ -1139,7 +1169,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			(client) =>
-				client.listPrompts(
+				this.#list(
+					this.#entry(id),
+					client,
+					"prompts",
 					this.#params(id, {}, options),
 					this.#requestOptions(id, "request", options),
 				),
@@ -1164,7 +1197,14 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				return discoverSkills({
 					readResource: (uri) =>
 						client.readResource(this.#params(id, { uri }, options), requestOptions),
-					listResources: () => client.listResources(this.#params(id, {}, options), requestOptions),
+					listResources: () =>
+						this.#list(
+							this.#entry(id),
+							client,
+							"resources",
+							this.#params(id, {}, options),
+							requestOptions,
+						),
 				});
 			},
 			options?.signal,
@@ -1187,7 +1227,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			async (client) => {
-				const era = client.getProtocolEra() ?? "legacy";
+				const era = this.#era(this.#entry(id), client) ?? "legacy";
 				const started = performance.now();
 				const options = this.#requestOptions(
 					id,
@@ -1212,7 +1252,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.withClient(
 			id,
 			async (client, session) => {
-				if (client.getProtocolEra() !== "modern") {
+				if (this.#era(this.#entry(id), client) !== "modern") {
 					throw new KmcpError(
 						KMCP_ERROR_CODES.OPERATION_FAILED,
 						`server/discover was introduced in MCP 2026-07-28; this connection negotiated ${client.getNegotiatedProtocolVersion() ?? "a legacy revision"}, whose initialize handshake carries the same information (see the connection snapshot).`,
@@ -1242,7 +1282,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		await this.withClient(
 			id,
 			async (client) => {
-				if (client.getProtocolEra() !== "modern") {
+				if (this.#era(entry, client) !== "modern") {
 					await client.setLoggingLevel(level, signal === undefined ? undefined : { signal });
 				}
 			},
@@ -1277,7 +1317,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					admittedCatalogRevision = entry.catalogRevision;
 					const generation = admittedGeneration;
 					const catalogRevision = admittedCatalogRevision;
-					const capabilities = client.getServerCapabilities();
+					const capabilities = this.#capabilities(entry, client);
 					const previous = entry.catalog?.generation === generation ? entry.catalog : undefined;
 					const listOptions = {
 						...this.#requestOptions(id, "request", signal === undefined ? undefined : { signal }),
@@ -1286,7 +1326,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					const discoveries = await Promise.allSettled([
 						discoverSection(
 							capabilities?.tools !== undefined,
-							() => client.listTools(this.#params(id, {}), listOptions).then((v) => v.tools),
+							() =>
+								this.#list(entry, client, "tools", this.#params(id, {}), listOptions).then(
+									(v) => v.tools,
+								),
 							previous?.tools,
 							this.#catalogBounds,
 							signal,
@@ -1294,7 +1337,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 						discoverSection(
 							capabilities?.resources !== undefined,
 							() =>
-								client.listResources(this.#params(id, {}), listOptions).then((v) => v.resources),
+								this.#list(entry, client, "resources", this.#params(id, {}), listOptions).then(
+									(v) => v.resources,
+								),
 							previous?.resources,
 							this.#catalogBounds,
 							signal,
@@ -1302,16 +1347,23 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 						discoverSection(
 							capabilities?.resources !== undefined,
 							() =>
-								client
-									.listResourceTemplates(this.#params(id, {}), listOptions)
-									.then((v) => v.resourceTemplates),
+								this.#list(
+									entry,
+									client,
+									"resourceTemplates",
+									this.#params(id, {}),
+									listOptions,
+								).then((v) => v.resourceTemplates),
 							previous?.resourceTemplates,
 							this.#catalogBounds,
 							signal,
 						),
 						discoverSection(
 							capabilities?.prompts !== undefined,
-							() => client.listPrompts(this.#params(id, {}), listOptions).then((v) => v.prompts),
+							() =>
+								this.#list(entry, client, "prompts", this.#params(id, {}), listOptions).then(
+									(v) => v.prompts,
+								),
 							previous?.prompts,
 							this.#catalogBounds,
 							signal,
@@ -1436,6 +1488,62 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		return this.close();
 	}
 
+	/**
+	 * The connection's era. A session adopted through `definition.resumed` ran no handshake, so
+	 * the SDK reports none; the resumed record's `protocolVersion` decides then.
+	 */
+	#era(entry: ManagedConnection<Id>, client: Client): ProtocolEra | undefined {
+		return client.getProtocolEra() ?? (entry.resumed ? entry.definition.resumed?.era : undefined);
+	}
+
+	/** Server capabilities, falling back to the resumed record for a session that ran no handshake. */
+	#capabilities(entry: ManagedConnection<Id>, client: Client): ServerCapabilities | undefined {
+		return (
+			client.getServerCapabilities() ??
+			(entry.resumed ? entry.definition.resumed?.capabilities : undefined)
+		);
+	}
+
+	/** The task seam over a client, with the resumed-session fallbacks applied. */
+	#taskClient(entry: ManagedConnection<Id>, client: Client): McpTaskClient {
+		return new McpTaskClient({
+			request: (request, schema, options) =>
+				client.request(request as never, schema as never, options),
+			getProtocolEra: () => this.#era(entry, client),
+			getNegotiatedProtocolVersion: () =>
+				client.getNegotiatedProtocolVersion() ??
+				(entry.resumed ? entry.definition.resumed?.protocolVersion : undefined),
+			getServerCapabilities: () => this.#capabilities(entry, client),
+		});
+	}
+
+	/**
+	 * The four list verbs. The SDK's own verbs auto-aggregate pages and feed its response cache,
+	 * but answer an empty list without a request when the server's capabilities are unknown — the
+	 * state a resumed session is in. There kmcp walks the pages itself with the SDK's validators.
+	 */
+	#list<Kind extends McpListKind>(
+		entry: ManagedConnection<Id>,
+		client: Client,
+		kind: Kind,
+		params: Record<string, unknown>,
+		options: CacheableRequestOptions,
+	): Promise<McpListResult<Kind>> {
+		if (!entry.resumed || client.getServerCapabilities() !== undefined) {
+			switch (kind) {
+				case "tools":
+					return client.listTools(params, options) as Promise<McpListResult<Kind>>;
+				case "resources":
+					return client.listResources(params, options) as Promise<McpListResult<Kind>>;
+				case "resourceTemplates":
+					return client.listResourceTemplates(params, options) as Promise<McpListResult<Kind>>;
+				default:
+					return client.listPrompts(params, options) as Promise<McpListResult<Kind>>;
+			}
+		}
+		return walkListPages(client, kind, params, options);
+	}
+
 	#params<Params extends Record<string, unknown>>(
 		id: Id,
 		params: Params,
@@ -1443,7 +1551,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	): Params & { _meta?: Record<string, unknown> } {
 		const entry = this.#entries.get(id);
 		const stampLevel =
-			entry?.logLevel !== undefined && entry.session?.client.getProtocolEra() === "modern"
+			entry?.logLevel !== undefined &&
+			entry.session !== undefined &&
+			this.#era(entry, entry.session.client) === "modern"
 				? { [LOG_LEVEL_META_KEY]: entry.logLevel }
 				: {};
 		const meta = { ...stampLevel, ...options?.meta };
@@ -1518,7 +1628,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		) {
 			return catalog.tools.items.find((tool) => tool.name === name);
 		}
-		const listed = await client.listTools(
+		const listed = await this.#list(
+			entry,
+			client,
+			"tools",
 			this.#params(id, {}),
 			this.#requestOptions(id, "request", signal === undefined ? undefined : { signal }),
 		);
@@ -1577,6 +1690,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			this.#generationSequence = generation;
 			entry.session = session;
 			entry.transport = transport;
+			// No negotiated revision after a successful connect means the SDK adopted the session
+			// the transport carried instead of running a handshake.
+			entry.resumed =
+				definition.resumed !== undefined &&
+				client.getProtocolEra() === undefined &&
+				transport.sessionId === definition.resumed.sessionId;
 			entry.generation = generation;
 			delete entry.catalog;
 			delete entry.autoRefresh;
@@ -1674,6 +1793,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		delete entry.session;
 		delete entry.transport;
 		delete entry.connectedAt;
+		entry.resumed = false;
 		entry.errorCode = code;
 		if (detail === undefined) delete entry.errorDetail;
 		else entry.errorDetail = detail;
@@ -1876,7 +1996,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			state.inFlight = true;
 			const client = session.client;
 			try {
-				if (client.getProtocolEra() === "modern") {
+				if (this.#era(entry, client) === "modern") {
 					await client.discover({ timeout: policy.timeoutMs });
 				} else {
 					await client.ping({ timeout: policy.timeoutMs });
@@ -1926,7 +2046,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		const client = session.client;
 		if (
 			entry.definition.autoRefreshCatalog === undefined ||
-			client.getProtocolEra() !== "modern" ||
+			this.#era(entry, client) !== "modern" ||
 			client.autoOpenedSubscription !== undefined
 		) {
 			return;
@@ -1941,7 +2061,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 	#listenFilter(entry: ManagedConnection<Id>, client: Client): SubscriptionFilter {
 		const auto = entry.definition.autoRefreshCatalog !== undefined;
-		const capabilities = client.getServerCapabilities();
+		const capabilities = this.#capabilities(entry, client);
 		return {
 			...(auto && capabilities?.tools?.listChanged === true ? { toolsListChanged: true } : {}),
 			...(auto && capabilities?.prompts?.listChanged === true ? { promptsListChanged: true } : {}),
@@ -1963,7 +2083,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	 */
 	async #relisten(entry: ManagedConnection<Id>, session: McpClientSession<Id>): Promise<void> {
 		const client = session.client;
-		if (client.getProtocolEra() !== "modern" || entry.session !== session) return;
+		if (this.#era(entry, client) !== "modern" || entry.session !== session) return;
 		const filter = this.#listenFilter(entry, client);
 		const previous = entry.listen;
 		if (Object.keys(filter).length === 0) {
@@ -2134,6 +2254,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			await this.#bounded(session.close(), entry.definition.disconnectTimeoutMs, "close");
 			delete entry.session;
 			delete entry.transport;
+			entry.resumed = false;
 			delete entry.connectedAt;
 			delete entry.errorCode;
 			delete entry.errorDetail;
@@ -2304,11 +2425,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 	#snapshotEntry(entry: ManagedConnection<Id>): McpConnectionSnapshot<Id> {
 		const client = entry.session?.client;
-		const serverInfo = client?.getServerVersion();
-		const protocolVersion = client?.getNegotiatedProtocolVersion();
-		const protocolEra = client?.getProtocolEra();
-		const capabilities = client?.getServerCapabilities();
-		const instructions = client?.getInstructions();
+		const resumed = entry.resumed ? entry.definition.resumed : undefined;
+		const serverInfo = client?.getServerVersion() ?? resumed?.serverInfo;
+		const protocolVersion = client?.getNegotiatedProtocolVersion() ?? resumed?.protocolVersion;
+		const protocolEra = client === undefined ? undefined : this.#era(entry, client);
+		const capabilities = client === undefined ? undefined : this.#capabilities(entry, client);
+		const instructions = client?.getInstructions() ?? resumed?.instructions;
 		const watch = client === undefined ? undefined : this.#watchSnapshot(entry, client);
 		const transportKind = this.#transportKind(entry);
 		const sessionId = client === undefined ? undefined : entry.transport?.sessionId;
@@ -2401,13 +2523,13 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				reason: "not-configured" as const,
 			});
 		}
-		const capabilities = client.getServerCapabilities();
+		const capabilities = this.#capabilities(entry, client);
 		const advertised: McpCatalogCapability[] = [];
 		if (capabilities?.tools?.listChanged === true) advertised.push("tools");
 		if (capabilities?.prompts?.listChanged === true) advertised.push("prompts");
 		if (capabilities?.resources?.listChanged === true)
 			advertised.push("resources", "resourceTemplates");
-		const era = client.getProtocolEra();
+		const era = this.#era(entry, client);
 		let honored: readonly McpCatalogCapability[];
 		if (era === "modern") {
 			const filter = (entry.listen ?? client.autoOpenedSubscription)?.honoredFilter;
@@ -2473,6 +2595,8 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 /** Classifies an error (walking `cause`) into a stable kind/code pair for snapshots. */
 export function describeError(error: unknown): McpErrorDetail {
+	// A transport-level cause is the most actionable classification, wherever it sits in the chain.
+	const network = deepNetworkErrorCode(error);
 	let current: unknown = error;
 	for (let depth = 0; depth < 8 && current !== undefined && current !== null; depth += 1) {
 		if (current instanceof KmcpError) {
@@ -2505,14 +2629,120 @@ export function describeError(error: unknown): McpErrorDetail {
 		} else if (current instanceof SdkHttpError) {
 			return { kind: "http", code: current.status, httpStatus: current.status };
 		} else if (current instanceof SdkError) {
-			return { kind: "sdk", code: current.code };
+			return network === undefined
+				? { kind: "sdk", code: current.code }
+				: { kind: "network", code: network };
 		} else if (current instanceof ProtocolError) {
 			return { kind: "protocol", code: current.code };
+		} else if (network !== undefined) {
+			return { kind: "network", code: network };
 		}
 		current = current instanceof Error ? current.cause : undefined;
 	}
+	if (network !== undefined) return { kind: "network", code: network };
 	if (error instanceof KmcpError) return { kind: "kmcp", code: error.code };
 	return { kind: "unknown", code: error instanceof Error ? error.name : typeof error };
+}
+
+function deepNetworkErrorCode(error: unknown): string | undefined {
+	let current: unknown = error;
+	for (let depth = 0; depth < 8 && current !== undefined && current !== null; depth += 1) {
+		const code = networkErrorCode(current);
+		if (code !== undefined) return code;
+		// The SDK attaches the underlying failure to `data.cause` on its typed errors.
+		const data = current instanceof SdkError ? current.data : undefined;
+		const dataCause =
+			typeof data === "object" && data !== null ? (data as { cause?: unknown }).cause : undefined;
+		current = current instanceof Error && current.cause !== undefined ? current.cause : dataCause;
+	}
+	return undefined;
+}
+
+type McpListKind = "prompts" | "resourceTemplates" | "resources" | "tools";
+
+type McpListResult<Kind extends McpListKind> = Kind extends "tools"
+	? ListToolsResult
+	: Kind extends "resources"
+		? ListResourcesResult
+		: Kind extends "resourceTemplates"
+			? ListResourceTemplatesResult
+			: ListPromptsResult;
+
+const LIST_METHODS = Object.freeze({
+	tools: "tools/list",
+	resources: "resources/list",
+	resourceTemplates: "resources/templates/list",
+	prompts: "prompts/list",
+} as const);
+
+const LIST_SCHEMAS = Object.freeze({
+	tools: specTypeSchemas.ListToolsResult,
+	resources: specTypeSchemas.ListResourcesResult,
+	resourceTemplates: specTypeSchemas.ListResourceTemplatesResult,
+	prompts: specTypeSchemas.ListPromptsResult,
+} as const);
+
+const LIST_MAX_PAGES = 64;
+
+/** Walks every page of a list verb through `Client.request()` (mirrors the SDK's aggregate walk). */
+async function walkListPages<Kind extends McpListKind>(
+	client: Client,
+	kind: Kind,
+	params: Record<string, unknown>,
+	options: RequestOptions,
+): Promise<McpListResult<Kind>> {
+	const method = LIST_METHODS[kind];
+	const schema = LIST_SCHEMAS[kind];
+	const items: unknown[] = [];
+	const seen = new Set<string>();
+	let cursor: string | undefined;
+	let first: Record<string, unknown> | undefined;
+	for (let page = 0; ; page += 1) {
+		if (page >= LIST_MAX_PAGES) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.OPERATION_FAILED,
+				`${method} exceeded ${LIST_MAX_PAGES} pages without a final cursor.`,
+			);
+		}
+		const result = (await client.request(
+			{ method, params: cursor === undefined ? params : { ...params, cursor } },
+			schema,
+			options,
+		)) as Record<string, unknown>;
+		first ??= result;
+		const pageItems = result[kind];
+		if (Array.isArray(pageItems)) items.push(...pageItems);
+		const next = result.nextCursor;
+		if (typeof next !== "string" || next.length === 0) break;
+		if (seen.has(next)) break;
+		seen.add(next);
+		cursor = next;
+	}
+	const { nextCursor: _nextCursor, ...rest } = first ?? {};
+	void _nextCursor;
+	return { ...rest, [kind]: items } as McpListResult<Kind>;
+}
+
+const NETWORK_ERROR_CODE =
+	/^(E[A-Z]{2,}|EAI_[A-Z]+|UND_ERR_[A-Z_]+|CERT_[A-Z_]+|ERR_TLS_[A-Z_]+|ERR_SSL_[A-Z_]+|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_[A-Z_]+)$/;
+
+/**
+ * A stable code for a transport-level failure: Node system errors (`ECONNREFUSED`, `ENOTFOUND`,
+ * `ETIMEDOUT`, ...), undici errors, TLS/certificate errors, and aborts / timeouts raised as
+ * `DOMException`s. `undefined` for anything else.
+ */
+function networkErrorCode(error: unknown): string | undefined {
+	if (error instanceof DOMException) {
+		return error.name === "AbortError" || error.name === "TimeoutError" ? error.name : undefined;
+	}
+	if (!(error instanceof Error)) return undefined;
+	// kmcp's and the SDK's own typed errors carry codes of their own vocabulary.
+	if (error instanceof KmcpError || error instanceof SdkError || error instanceof ProtocolError) {
+		return undefined;
+	}
+	const code = (error as { readonly code?: unknown }).code;
+	if (typeof code === "string" && NETWORK_ERROR_CODE.test(code)) return code;
+	return undefined;
 }
 
 function findCause<Found>(

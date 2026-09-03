@@ -2,8 +2,16 @@ import test, { type TestContext } from "node:test";
 import { PassThrough } from "node:stream";
 
 import { Client, type ClientOptions } from "@modelcontextprotocol/client";
-import type { AuthInfo, CreateMcpHandlerOptions } from "@modelcontextprotocol/server";
+import type {
+	AuthInfo,
+	CreateMcpHandlerOptions,
+	McpHttpHandler,
+} from "@modelcontextprotocol/server";
 
+import type {
+	McpServerDefinition,
+	McpServerRuntime,
+} from "../../src/authoring/server-definition.ts";
 import { inProcessConnection, type McpInProcessServer } from "../../src/client/connection.ts";
 import type { McpProtocolEra } from "../../src/internal/protocol.ts";
 
@@ -67,4 +75,31 @@ export function stdioPipePair(): {
 	readonly serverToClient: PassThrough;
 } {
 	return { clientToServer: new PassThrough(), serverToClient: new PassThrough() };
+}
+
+/** Wraps a definition so a test can push `resources/updated` from the live server side on either era. */
+export function observableServer(definition: McpServerDefinition): {
+	readonly server: McpInProcessServer;
+	resourceUpdated(uri: string): Promise<void>;
+} {
+	let handler: McpHttpHandler | undefined;
+	let runtime: McpServerRuntime | undefined;
+	const server: McpInProcessServer = {
+		handler(options?: CreateMcpHandlerOptions) {
+			handler = definition.handler(options);
+			return handler;
+		},
+		async instantiate(context) {
+			const created = await definition.instantiate(context);
+			runtime = created;
+			return created;
+		},
+	};
+	return {
+		server,
+		async resourceUpdated(uri: string) {
+			if (handler !== undefined) await handler.notify.resourceUpdated(uri);
+			else if (runtime !== undefined) await runtime.server.server.sendResourceUpdated({ uri });
+		},
+	};
 }

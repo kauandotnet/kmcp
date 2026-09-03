@@ -19,6 +19,7 @@ import {
 	type RequestTypeMap,
 	type ResponseCacheStore,
 	type Root,
+	type ServerCapabilities,
 	StreamableHTTPClientTransport,
 	type StreamableHTTPClientTransportOptions,
 	type StreamableHTTPReconnectionOptions,
@@ -37,7 +38,9 @@ import type {
 import { KMCP_ERROR_CODES, KmcpError } from "../errors.ts";
 import {
 	MCP_MODERN_PROTOCOL_VERSION,
+	MCP_SUPPORTED_PROTOCOL_VERSIONS,
 	type McpProtocolEra,
+	isModernProtocolVersion,
 	resolveProtocolPin,
 } from "../internal/protocol.ts";
 import { assertNonEmpty, type MaybePromise } from "../internal/value.ts";
@@ -174,6 +177,27 @@ export type McpResolvedKeepaliveOptions = Readonly<Required<McpKeepaliveOptions>
 /** The transport carrying a connection, as declared by the helper that built it. */
 export type McpTransportKind = "custom" | "in-process" | "sse" | "stdio" | "streamable-http";
 
+/**
+ * A server-side session adopted without a handshake. The SDK skips `initialize` / the
+ * `server/discover` probe when the transport already carries a session id, so the client learns
+ * neither the era nor the server's capabilities; this record supplies what the original handshake
+ * reported. Persist it from a connection snapshot (`sessionId`, `protocolVersion`, `capabilities`,
+ * `serverInfo`, `instructions`) and hand it back on the next start.
+ */
+export interface McpResumedSession {
+	readonly sessionId: string;
+	/** The revision the original handshake negotiated; drives the era and the wire header. */
+	readonly protocolVersion?: string;
+	readonly capabilities?: ServerCapabilities;
+	readonly serverInfo?: Implementation;
+	readonly instructions?: string;
+}
+
+/** `McpResumedSession` with the era resolved from `protocolVersion`. */
+export interface McpResolvedResumedSession extends McpResumedSession {
+	readonly era: McpProtocolEra | undefined;
+}
+
 /** The SDK's `capabilities.extensions` map: reverse-DNS extension ids to JSON option objects. */
 export type McpCapabilityExtensions = NonNullable<ClientCapabilities["extensions"]>;
 
@@ -228,6 +252,14 @@ export interface McpConnectionDefinitionOptions<Id extends string> {
 	 * expose task-augmented tool calls. Default: `true`.
 	 */
 	readonly tasks?: boolean;
+	/**
+	 * The session the FIRST transport this definition opens resumes (the transport factory must
+	 * carry the same `sessionId`). While that session lives, snapshots and era-dependent verbs use
+	 * this record in place of the handshake the SDK skipped, and strict capability enforcement is
+	 * off (there is nothing to enforce against) unless `clientOptions.enforceStrictCapabilities`
+	 * says otherwise. A later reconnect runs a full handshake.
+	 */
+	readonly resumed?: McpResumedSession;
 	/** Capability extensions (reverse-DNS keys) merged into `capabilities.extensions`. */
 	readonly extensions?: McpCapabilityExtensions;
 	/**
@@ -263,6 +295,7 @@ export class McpConnectionDefinition<const Id extends string = string> {
 	readonly protocolVersion: string | undefined;
 	readonly disconnectTimeoutMs: number | undefined;
 	readonly terminateSession: boolean;
+	readonly resumed: McpResolvedResumedSession | undefined;
 	readonly #transportFactory: McpTransportFactory;
 	readonly #requestHandlers: McpClientRequestHandlers;
 	readonly #notificationHandlers: McpClientNotificationHandlers;
@@ -335,6 +368,7 @@ export class McpConnectionDefinition<const Id extends string = string> {
 		}
 		this.disconnectTimeoutMs = options.disconnectTimeoutMs;
 		this.terminateSession = options.terminateSession !== false;
+		this.resumed = normalizeResumed(options.resumed);
 		const pin =
 			options.protocolVersion === undefined
 				? undefined
@@ -347,7 +381,9 @@ export class McpConnectionDefinition<const Id extends string = string> {
 		}
 		const extensions: McpCapabilityExtensions = { ...options.extensions };
 		this.clientOptions = Object.freeze({
-			enforceStrictCapabilities: true,
+			// A resumed session never re-learns the server's capabilities, so there is nothing to
+			// enforce against; the record supplied in `resumed` is display-only.
+			enforceStrictCapabilities: this.resumed === undefined,
 			...options.clientOptions,
 			versionNegotiation:
 				pin?.versionNegotiation ??
@@ -488,6 +524,31 @@ function normalizeReconnect(
 	});
 }
 
+function normalizeResumed(
+	value: McpResumedSession | undefined,
+): McpResolvedResumedSession | undefined {
+	if (value === undefined) return undefined;
+	assertNonEmpty(value.sessionId, "resumed.sessionId");
+	if (
+		value.protocolVersion !== undefined &&
+		!MCP_SUPPORTED_PROTOCOL_VERSIONS.includes(value.protocolVersion)
+	) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.PROTOCOL_VERSION_UNSUPPORTED,
+			`resumed.protocolVersion '${value.protocolVersion}' is not a revision kmcp can speak.`,
+		);
+	}
+	return Object.freeze({
+		...value,
+		era:
+			value.protocolVersion === undefined
+				? undefined
+				: isModernProtocolVersion(value.protocolVersion)
+					? "modern"
+					: "legacy",
+	});
+}
+
 function normalizeKeepalive(
 	value: boolean | McpKeepaliveOptions | undefined,
 ): McpResolvedKeepaliveOptions | undefined {
@@ -548,17 +609,13 @@ export function defineConnection<const Id extends string>(
 
 export type McpHttpAuth = string | AuthProvider | OAuthClientProvider;
 
-/** A server-side session to resume instead of running a fresh handshake (Streamable HTTP). */
-export interface McpHttpResumeOptions {
-	/** The `Mcp-Session-Id` the server issued. */
-	readonly sessionId: string;
-	/**
-	 * The revision negotiated by the original handshake. The SDK skips the handshake when a
-	 * session id is supplied, so without this the resumed transport cannot send the required
-	 * `MCP-Protocol-Version` header.
-	 */
-	readonly protocolVersion?: string;
-}
+/**
+ * A server-side session to resume instead of running a fresh handshake (Streamable HTTP). The
+ * SDK skips the handshake when a session id is supplied, so `protocolVersion` is needed for the
+ * `MCP-Protocol-Version` header and the era, and the remaining fields stand in for what the
+ * original handshake reported (see `McpResumedSession`).
+ */
+export type McpHttpResumeOptions = McpResumedSession;
 
 /**
  * kmcp's default Streamable HTTP reconnection policy for the server-to-client SSE stream:
@@ -574,7 +631,7 @@ export const MCP_HTTP_RECONNECTION_DEFAULTS: StreamableHTTPReconnectionOptions =
 
 export interface McpHttpConnectionOptions<Id extends string> extends Omit<
 	McpConnectionDefinitionOptions<Id>,
-	"transport" | "transportKind" | "oauth"
+	"transport" | "transportKind" | "oauth" | "resumed"
 > {
 	readonly url: string | URL;
 	readonly transportOptions?: StreamableHTTPClientTransportOptions;
@@ -591,7 +648,7 @@ export interface McpHttpConnectionOptions<Id extends string> extends Omit<
 	readonly headers?: Readonly<Record<string, string>>;
 	/** SDK fetch middlewares (`withLogging`, `createMiddleware`, ...) composed around the transport's fetch, outermost first. */
 	readonly middlewares?: readonly Middleware[];
-	/** Resume a server-side session once; a later reconnect always starts fresh. */
+	/** Resume a server-side session once (see `McpResumedSession`); a later reconnect always starts fresh. */
 	readonly resume?: McpHttpResumeOptions;
 	/** Overrides for the SSE stream reconnection policy (see `MCP_HTTP_RECONNECTION_DEFAULTS`). */
 	readonly reconnection?: Partial<StreamableHTTPReconnectionOptions>;
@@ -670,6 +727,7 @@ export function httpConnection<const Id extends string>(
 		clientOptions,
 		extensions: { ...grantExtensions, ...definition.extensions },
 		transportKind: "streamable-http",
+		...(resume === undefined ? {} : { resumed: resume }),
 		...(oauth === undefined ? {} : { oauth }),
 		transport: () => {
 			const resumed = pendingResume;

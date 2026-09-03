@@ -36,6 +36,8 @@ export type {
 	McpInProcessServer,
 	McpOfficialClientOverrides,
 	McpRequestDefaults,
+	McpResolvedResumedSession,
+	McpResumedSession,
 	McpRootsSource,
 	McpTransportFactory,
 	McpTransportKind,

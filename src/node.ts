@@ -252,5 +252,10 @@ export {
 	type McpServersConfig,
 	type McpStdioServerConfig,
 } from "./node/config.ts";
-export { writeDecodedResource, writeResourceToFile } from "./node/resources.ts";
-export type { McpWriteResourceFileOptions, McpWrittenResourceFile } from "./node/resources.ts";
+export { syncResourceToFile, writeDecodedResource, writeResourceToFile } from "./node/resources.ts";
+export type {
+	McpResourceFileSync,
+	McpResourceFileSyncOptions,
+	McpWriteResourceFileOptions,
+	McpWrittenResourceFile,
+} from "./node/resources.ts";

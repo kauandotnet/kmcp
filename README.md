@@ -292,8 +292,13 @@ namespace suggestions in `tags["kmcp.namespace"]`, honoring `timeout` (seconds),
 and `${VAR}` substitution when an `env` map is supplied; `standardMcpConfigPaths` /
 `discoverMcpConfigs` / `readMcpConfigFile` find and read the Claude Code, Claude Desktop, Cursor, VS
 Code, Windsurf and Kiro config locations. `decodeResourceContent` (`kmcp/client`) and
-`writeResourceToFile` (`kmcp/node`, atomic) materialize a `resources/read` result; pair the latter
-with `resource.updated` events to keep a file in sync.
+`writeResourceToFile` (`kmcp/node`, atomic) materialize a `resources/read` result;
+`syncResourceToFile(manager, id, uri, path)` keeps a file in step with a resource — one write up
+front, a coalesced rewrite on every `resource.updated`, and a re-subscribe after a reconnect.
+
+HTTP proxies: Node's `fetch` ignores `HTTP_PROXY` / `HTTPS_PROXY` unless the process runs with
+`NODE_USE_ENV_PROXY=1` (Node 24 and later); otherwise pass a proxy-aware `fetch` through
+`transportOptions.fetch`, which every OAuth helper also accepts as `fetch`.
 
 ## Connections and catalogs
 
@@ -351,11 +356,14 @@ extensions), and `configureClient` (a synchronous escape hatch over the freshly 
 any `OAuthClientProvider` (an interactive one arms the `authorizing` flow; client-credentials and
 enterprise providers advertise their capability extension automatically); `headers` may not carry
 `Authorization` next to `auth`; `middlewares` composes SDK fetch middlewares (`withLogging`,
-`createMiddleware`, …) around the transport; `resume` adopts a server-side session once (`sessionId`
-plus the negotiated `protocolVersion`) and any later reconnect starts fresh; `reconnection`
-overrides `MCP_HTTP_RECONNECTION_DEFAULTS` (1 s → 30 s, factor 2, 10 retries for the
-server-to-client stream); `cachePartition` defaults to a digest of the credential identity.
-`stdioConnection` (`kmcp/node`) adds `onStderrLine` to receive the child's stderr line by line.
+`createMiddleware`, …) around the transport; `resume` adopts a server-side session once — the SDK
+then runs no handshake, so the `McpResumedSession` record (`sessionId`, `protocolVersion`,
+`capabilities`, `serverInfo`, `instructions`, all available on a snapshot) stands in for it, strict
+capability enforcement is off for that definition, the list verbs walk the pages themselves, and any
+later reconnect starts fresh; `reconnection` overrides `MCP_HTTP_RECONNECTION_DEFAULTS` (1 s → 30 s,
+factor 2, 10 retries for the server-to-client stream); `cachePartition` defaults to a digest of the
+credential identity. `stdioConnection` (`kmcp/node`) adds `onStderrLine` to receive the child's
+stderr line by line.
 
 Manager verbs take the SDK request option types plus `meta` (`_meta` passthrough) and an optional
 generation/fingerprint `control`: `callTool` (with `contract` it refuses the call when the
@@ -374,8 +382,9 @@ mirrors `callToolParsed` and injects the resolved catalog `Tool` as `toolDefinit
 carry `transportKind`, `sessionId`, `connectionMode` (`stateful` / `stateless`), `supportedVersions`
 (from `server/discover`), `lastSeenAt`, `keepalive`, `instructions`, `serverInfo`,
 `errorDetail { kind, code, httpStatus? }` (so a panel can tell "server is 2025-only" from "401" from
-"registration rejected"), and `watch` (which list-changed sections are honored, why not, and how
-often the stream was re-opened).
+"registration rejected" from `ECONNREFUSED` — a transport-level cause classifies as `network`
+wherever it sits in the cause chain), and `watch` (which list-changed sections are honored, why not,
+and how often the stream was re-opened).
 
 Two resilience behaviors run without configuration. A modern `subscriptions/listen` stream that
 drops unexpectedly (`closed` resolving `'remote'`) is re-opened with 1 s → 30 s backoff for as long
@@ -446,9 +455,10 @@ try {
 }
 ```
 
-`McpOAuthClientProvider` stores credentials per authorization-server issuer (SEP-2352), persists
-PKCE and discovery state, never overwrites a pre-registered client id, issues and verifies the OAuth
-`state` parameter the SDK leaves to hosts (`AUTH_STATE_MISMATCH`; the manager's
+`McpOAuthClientProvider` stores credentials per authorization-server issuer (SEP-2352) and per
+optional `profile` (several identities for one server share a store without sharing anything else),
+persists PKCE and discovery state, never overwrites a pre-registered client id, issues and verifies
+the OAuth `state` parameter the SDK leaves to hosts (`AUTH_STATE_MISMATCH`; the manager's
 `completeAuthorization` verifies it before the code is exchanged), refreshes an access token before
 it expires through the SDK's `refreshAuthorization` (single-flight, 60 s buffer, off with
 `refresh: false`; a failed refresh falls back to the transport's 401 path), and reports what it

@@ -99,9 +99,12 @@ The manager guarantees:
 12. A modern `subscriptions/listen` stream that drops remotely is re-opened by the manager with
     backoff for as long as its generation lives; the SDK never re-listens on its own. `'local'` and
     `'graceful'` closes are deliberate and never trigger a re-open.
-13. A resumed Streamable HTTP session (`httpConnection({ resume })`) is consumed by the first
+13. A resumed session (`definition.resumed`, `httpConnection({ resume })`) is consumed by the first
     transport only: once the server declares it gone, the reconnect opens a fresh session rather
-    than resuming a dead one forever.
+    than resuming a dead one forever. While it lives, the SDK has run no handshake, so the manager
+    derives the era and capabilities from the resumed record, walks list pages itself (the SDK's
+    list verbs answer empty when capabilities are unknown), and strict capability enforcement is off
+    for that definition.
 
 The present implementation is process-local. Durable desired state and cross-process ownership must
 not be inferred from these guarantees.

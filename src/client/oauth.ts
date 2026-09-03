@@ -61,6 +61,7 @@ export type McpStoredOAuthTokens = StoredOAuthTokens & {
 /** A non-secret description of what a provider currently holds. Safe to log or display. */
 export interface McpOAuthCredentialStatus {
 	readonly serverUrl: string;
+	readonly profile?: string;
 	readonly issuer?: string;
 	readonly clientId?: string;
 	readonly hasTokens: boolean;
@@ -116,6 +117,12 @@ export interface McpOAuthClientProviderOptions {
 	/** Credential persistence. Default: a fresh {@link InMemoryKeyValueStore}. */
 	readonly store?: McpKeyValueStore;
 	/**
+	 * A named credential set. Two providers over one store with different profiles never share
+	 * tokens, client registrations, or flow state, so one host can hold several identities for the
+	 * same server (or the same authorization server). Default: the unnamed profile.
+	 */
+	readonly profile?: string;
+	/**
 	 * Hands the authorization URL to the host application. Required: kmcp never launches a
 	 * browser, prints to a terminal, or otherwise decides how a user is prompted.
 	 */
@@ -167,6 +174,8 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 	readonly serverUrl: string;
 	/** SEP-991 Client ID Metadata Document URL, when one was configured. */
 	readonly clientMetadataUrl?: string;
+	/** The credential profile this provider reads and writes, when one was configured. */
+	readonly profile?: string;
 	readonly #redirectUrl: URL;
 	readonly #clientId: string | undefined;
 	readonly #clientSecret: string | undefined;
@@ -213,6 +222,15 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 			this.clientMetadataUrl = options.clientMetadataUrl;
 		}
 		this.serverUrl = absoluteUrl(options.serverUrl, "serverUrl").href;
+		if (options.profile !== undefined) {
+			if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(options.profile)) {
+				throw new KmcpError(
+					KMCP_ERROR_CODES.INVALID_DEFINITION,
+					"profile must be 1-64 characters of letters, digits, '.', '_' or '-'.",
+				);
+			}
+			this.profile = options.profile;
+		}
 		this.#redirectUrl = absoluteUrl(options.redirectUrl, "redirectUrl");
 		this.#clientId = options.clientId;
 		this.#clientSecret = options.clientSecret;
@@ -422,6 +440,7 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 		const identity = claims === undefined ? undefined : identityFromClaims(claims);
 		return Object.freeze({
 			serverUrl: this.serverUrl,
+			...(this.profile === undefined ? {} : { profile: this.profile }),
 			...(issuer === undefined ? {} : { issuer }),
 			...(client?.client_id === undefined ? {} : { clientId: client.client_id }),
 			hasTokens: tokens !== undefined,
@@ -510,12 +529,17 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 	}
 
 	#key(kind: string, issuer?: string): string {
-		return issuer === undefined ? `${this.serverUrl}/${kind}` : `${issuer}/${kind}`;
+		return `${this.#prefix()}${issuer ?? this.serverUrl}/${kind}`;
 	}
 
 	/** Key of the "last issuer seen for this MCP server" pointer (SEP-2352). */
 	#issuerPointerKey(): string {
-		return `${this.serverUrl}/issuer`;
+		return `${this.#prefix()}${this.serverUrl}/issuer`;
+	}
+
+	/** Profiles partition the whole key space; the unnamed profile keeps the bare keys. */
+	#prefix(): string {
+		return this.profile === undefined ? "" : `profile:${this.profile}/`;
 	}
 
 	async #rememberIssuer(issuer: string | undefined): Promise<void> {

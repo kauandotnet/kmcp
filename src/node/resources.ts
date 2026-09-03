@@ -4,6 +4,7 @@ import { dirname, isAbsolute } from "node:path";
 
 import type { ReadResourceResult } from "@modelcontextprotocol/client";
 
+import type { McpConnectionManager } from "../client/manager.ts";
 import {
 	type McpDecodeResourceOptions,
 	type McpDecodedResourceContent,
@@ -81,5 +82,152 @@ export async function writeDecodedResource(
 	} catch (error) {
 		await rm(temporary, { force: true }).catch(() => undefined);
 		throw error;
+	}
+}
+
+export interface McpResourceFileSyncOptions extends McpWriteResourceFileOptions {
+	/** Observes every successful write, including the initial one. */
+	readonly onSynced?: (result: McpWrittenResourceFile) => void;
+	/** Observes a failed re-sync; the previous file content stays in place. */
+	readonly onError?: (error: unknown) => void;
+}
+
+/** A live resource-to-file synchronization (see {@link syncResourceToFile}). */
+export interface McpResourceFileSync extends AsyncDisposable {
+	readonly connectionId: string;
+	readonly uri: string;
+	readonly path: string;
+	/** ISO timestamp of the last successful write. */
+	readonly lastSyncedAt: string | undefined;
+	/** The last re-sync failure, cleared by the next success. */
+	readonly lastError: unknown;
+	/** Successful writes so far. */
+	readonly syncs: number;
+	/** Re-reads and rewrites now (coalesced with any in-flight sync). */
+	sync(): Promise<void>;
+	/** Stops following updates and drops the subscription; the file is kept. */
+	stop(): Promise<void>;
+}
+
+/**
+ * Keeps a local file in step with a resource: subscribes to it, writes it once, rewrites it on
+ * every `resource.updated` event for the URI (bursts coalesce into one follow-up sync), and
+ * re-subscribes after the connection comes back on a new generation (subscriptions are
+ * generation-scoped). A removed connection stops the sync. The initial write must succeed; a
+ * later failure is reported through `onError` and `lastError` while the previous file stays.
+ */
+export async function syncResourceToFile<Id extends string>(
+	manager: McpConnectionManager<Id>,
+	id: Id,
+	uri: string,
+	path: string,
+	options: McpResourceFileSyncOptions = {},
+): Promise<McpResourceFileSync> {
+	let generation = manager.state(id).generation;
+	let lastSyncedAt: string | undefined;
+	let lastError: unknown;
+	let syncs = 0;
+	let inFlight: Promise<void> | undefined;
+	let pending = false;
+	let stopped = false;
+
+	const write = async (): Promise<void> => {
+		const result = await manager.readResource(id, uri, { cacheMode: "refresh" });
+		const written = await writeResourceToFile(result, uri, path, options);
+		syncs += 1;
+		lastSyncedAt = new Date().toISOString();
+		lastError = undefined;
+		options.onSynced?.(written);
+	};
+
+	const run = (): Promise<void> => {
+		if (inFlight !== undefined) {
+			pending = true;
+			return inFlight;
+		}
+		inFlight = write()
+			.catch((error: unknown) => {
+				lastError = error;
+				options.onError?.(error);
+			})
+			.finally(() => {
+				inFlight = undefined;
+				if (pending && !stopped) {
+					pending = false;
+					void run();
+				}
+			});
+		return inFlight;
+	};
+
+	await manager.subscribeResource(id, uri);
+	try {
+		await write();
+	} catch (error) {
+		await manager.unsubscribeResource(id, uri).catch(() => undefined);
+		throw error;
+	}
+
+	const unsubscribe = manager.subscribe((event) => {
+		if (stopped || event.connection.id !== id) return;
+		if (event.type === "resource.updated") {
+			if (event.resource?.uri === uri) void run();
+			return;
+		}
+		if (event.type === "connection.removed") {
+			void stop();
+			return;
+		}
+		if (
+			event.type === "connection.state.changed" &&
+			(event.connection.phase === "online" || event.connection.phase === "degraded") &&
+			event.connection.generation !== generation
+		) {
+			generation = event.connection.generation;
+			void manager
+				.subscribeResource(id, uri)
+				.then(() => run())
+				.catch((error: unknown) => {
+					lastError = error;
+					options.onError?.(error);
+				});
+		}
+	});
+
+	async function stop(): Promise<void> {
+		if (stopped) return;
+		stopped = true;
+		unsubscribe();
+		await inFlight?.catch(() => undefined);
+		const phase = safeState(manager, id)?.phase;
+		if (phase === "online" || phase === "degraded") {
+			await manager.unsubscribeResource(id, uri).catch(() => undefined);
+		}
+	}
+
+	return Object.freeze({
+		connectionId: id,
+		uri,
+		path,
+		get lastSyncedAt() {
+			return lastSyncedAt;
+		},
+		get lastError() {
+			return lastError;
+		},
+		get syncs() {
+			return syncs;
+		},
+		sync: run,
+		stop,
+		[Symbol.asyncDispose]: stop,
+	});
+}
+
+function safeState<Id extends string>(manager: McpConnectionManager<Id>, id: Id) {
+	try {
+		return manager.state(id);
+	} catch {
+		return undefined;
 	}
 }
