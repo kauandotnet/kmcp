@@ -36,6 +36,10 @@ class ExternallyUnconstructableCapability extends McpCapabilityDefinition<"tool"
 	override withHandler(): never {
 		throw new Error("not decoratable");
 	}
+
+	override withAuth(): never {
+		throw new Error("not authorizable");
+	}
 }
 
 void ExternallyUnconstructableCapability;
@@ -192,3 +196,63 @@ void assertDeepReadonlyTypes;
 void InvalidDecoratedTool;
 void ExplicitlyInvalidDecoratedTool;
 void InvalidDecoratedOutput;
+
+// --- MCP v2 absorption surface (middleware, auth checks, reconnect, events) ---
+
+import type { CallToolResult } from "@modelcontextprotocol/server";
+import type {
+	McpAuthCheck,
+	McpCapabilityProvider,
+	McpConnectionDefinitionOptions,
+	McpConnectionEvent,
+	McpMiddleware,
+	McpParsedToolResult,
+} from "../src/index.ts";
+import { transformTool, type AnyMcpToolDefinition } from "../src/index.ts";
+
+const passthroughMiddleware: McpMiddleware = (context, next) => next(context);
+void passthroughMiddleware;
+
+async function middlewareResultIsUnknown(next: () => Promise<unknown>): Promise<void> {
+	// @ts-expect-error A middleware result is `unknown` until the caller narrows it.
+	const typed: CallToolResult = await next();
+	void typed;
+}
+void middlewareResultIsUnknown;
+
+const scopeAwareCheck: McpAuthCheck = () => ({
+	allowed: false,
+	reason: "no",
+	missingScopes: ["a"],
+});
+void scopeAwareCheck;
+// @ts-expect-error An auth check verdict cannot be a bare string.
+const invalidCheck: McpAuthCheck = () => "denied";
+void invalidCheck;
+
+// @ts-expect-error A capability provider must return capability definitions.
+const invalidProvider: McpCapabilityProvider = () => [{ name: "loose" }];
+void invalidProvider;
+
+function transformKeepsToolShape(tool: AnyMcpToolDefinition): AnyMcpToolDefinition {
+	return transformTool(tool, { description: "still a tool" });
+}
+void transformKeepsToolShape;
+
+function reconnectRequiresBackoff(): McpConnectionDefinitionOptions<"id">["reconnect"] {
+	// @ts-expect-error reconnect requires a backoff block.
+	return { maxAttempts: 3 };
+}
+void reconnectRequiresBackoff;
+
+function resourceEventUriIsOptional(event: McpConnectionEvent): string | undefined {
+	return event.resource?.uri;
+}
+void resourceEventUriIsOptional;
+
+function parsedResultIsFrozenShaped(result: McpParsedToolResult): boolean {
+	// @ts-expect-error Parsed results are read-only.
+	result.isError = false;
+	return result.isError;
+}
+void parsedResultIsFrozenShaped;

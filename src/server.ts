@@ -56,6 +56,7 @@ export {
 } from "./authoring/server-definition.ts";
 export type {
 	McpCapabilityDenial,
+	McpCapabilityProvider,
 	McpInstalledCapability,
 	McpServable,
 	McpMountOptions,
@@ -93,6 +94,49 @@ export type {
 	RateLimitOptions,
 } from "./authoring/handler-decorators.ts";
 export { withJsonSchema } from "./authoring/schema.ts";
+export {
+	logMiddleware,
+	maskErrorDetails,
+	middlewarePrincipal,
+	responseLimit,
+	timingMiddleware,
+	tokenBucketMiddleware,
+} from "./authoring/middleware.ts";
+export type {
+	MaskErrorOptions,
+	McpMiddleware,
+	McpMiddlewareContext,
+	McpMiddlewareKeyFn,
+	McpMiddlewareLogEntry,
+	McpMiddlewareNext,
+	McpTimingEntry,
+	TokenBucketOptions,
+} from "./authoring/middleware.ts";
+export {
+	McpInsufficientScopeError,
+	allOf,
+	anyOf,
+	authorize,
+	requireRoles,
+	restrictTag,
+} from "./authoring/authorization.ts";
+export type { McpAuthCheck } from "./authoring/authorization.ts";
+export { disable, enable, applyVisibility } from "./authoring/visibility.ts";
+export type { McpVisibilityRule, McpVisibilitySelector } from "./authoring/visibility.ts";
+export { transformTool, transformTools } from "./authoring/tool-transform.ts";
+export type { McpArgTransform, McpToolTransformOptions } from "./authoring/tool-transform.ts";
+export { namespaceUris } from "./authoring/uri-namespace.ts";
+export type { McpUriNamespaceOptions } from "./authoring/uri-namespace.ts";
+export { serveWithLifespan } from "./authoring/lifespan.ts";
+export type { McpLifespan } from "./authoring/lifespan.ts";
+export { searchTools } from "./discovery/search.ts";
+export type { McpSearchToolsOptions } from "./discovery/search.ts";
+export { promptsAsTools, resourcesAsTools } from "./discovery/as-tools.ts";
+export type {
+	McpAsToolsOptions,
+	McpPromptsAsToolsOptions,
+	McpResourcesAsToolsOptions,
+} from "./discovery/as-tools.ts";
 export { McpAuthorizationError, createMcpAuthGate, withMcpAuth } from "./auth/gate.ts";
 export type { McpAuthGate, McpAuthGateOptions, McpRequestVerifier } from "./auth/gate.ts";
 export {

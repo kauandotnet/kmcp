@@ -15,6 +15,8 @@ import { assertNonEmpty, immutableClone, type MaybePromise } from "../internal/v
 import type { McpCatalogSnapshot } from "../client/catalog.ts";
 import type {
 	McpCallToolOptions,
+	McpCallToolParsedOptions,
+	McpParsedToolResult,
 	McpConnectionEvent,
 	McpConnectionManagerSnapshot,
 	McpConnectionOperationControl,
@@ -285,6 +287,49 @@ export class McpHubManager<
 	): Promise<CallToolResult> {
 		this.#assertOpen();
 		throwIfAborted(options?.signal);
+		const resolved = this.#resolveToolCall(id, route);
+		return this.#connections.callTool(
+			resolved.connectionId,
+			resolved.sourceName,
+			arguments_,
+			options,
+			resolved.control,
+		);
+	}
+
+	/**
+	 * `callTool` with FastMCP-style ergonomics: raises `McpToolCallError` on an `isError` result
+	 * (opt out with `raiseOnError: false`) and returns the parsed shape. The resolved catalog
+	 * `Tool` is injected as `toolDefinition`, strengthening the SDK client's output-schema
+	 * validation and header recovery.
+	 */
+	async callToolParsed(
+		id: HubId,
+		route: McpHubToolRoute<ConnectionId> | string,
+		arguments_: Readonly<Record<string, unknown>> = {},
+		options?: McpCallToolParsedOptions,
+	): Promise<McpParsedToolResult> {
+		this.#assertOpen();
+		throwIfAborted(options?.signal);
+		const resolved = this.#resolveToolCall(id, route);
+		return this.#connections.callToolParsed(
+			resolved.connectionId,
+			resolved.sourceName,
+			arguments_,
+			{ ...options, toolDefinition: resolved.tool },
+			resolved.control,
+		);
+	}
+
+	#resolveToolCall(
+		id: HubId,
+		route: McpHubToolRoute<ConnectionId> | string,
+	): {
+		readonly connectionId: ConnectionId;
+		readonly sourceName: string;
+		readonly control: McpConnectionOperationControl;
+		readonly tool: Tool;
+	} {
 		const routeName = typeof route === "string" ? route : route.route;
 		const match = resolveRoute(this.#hub(id), routeName);
 		const identity = this.#catalogIdentity(match.connectionId, "tools");
@@ -304,13 +349,12 @@ export class McpHubManager<
 		) {
 			throw unknownRoute(routeName);
 		}
-		return this.#connections.callTool(
-			match.connectionId,
-			match.sourceName,
-			arguments_,
-			options,
-			identity.control,
-		);
+		return {
+			connectionId: match.connectionId,
+			sourceName: match.sourceName,
+			control: identity.control,
+			tool,
+		};
 	}
 
 	getPrompt(

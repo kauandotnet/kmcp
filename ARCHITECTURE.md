@@ -80,6 +80,15 @@ The manager guarantees:
 7. Catalog snapshots are valid only for their exact generation; reconnecting clears the published
    catalog rather than restamping prior data.
 8. Removal is single-flight and fences reconnects already queued behind an earlier disconnect.
+9. Opt-in automatic reconnection (definition `reconnect`) is invariant-preserving BECAUSE every
+   attempt re-enters the public `connect()`: it inherits 1–8 rather than re-implementing them. It
+   triggers only on an unexpected close of an online connection; deliberate lifecycle transitions
+   cancel the pending timer at the single `#transition` chokepoint.
+10. Resource subscriptions are generation-scoped and never auto-restored after a reconnect —
+    silently recreating server-side state would be an implicit reconnect side effect. On 2026-07-28
+    a subscription is expressed purely through the `subscriptions/listen` filter (the
+    `resources/subscribe` RPC no longer exists); the manager re-opens its listen stream with the
+    widened filter, new-before-old (over-delivery in the overlap, never a gap).
 
 The present implementation is process-local. Durable desired state and cross-process ownership must
 not be inferred from these guarantees.
@@ -93,6 +102,25 @@ kinds are pre-declared from the unfiltered definition so an empty admitted set y
 never `-32601`. The HTTP gate is the only `authInfo` producer; `withMcpAuth` discards
 caller-supplied `authInfo`. Clients receive opaque OAuth reasons; detailed causes go to `onerror` /
 `onCapabilityDenied`.
+
+Authorization checks compose (`allOf` / `anyOf` / `requireRoles` / `restrictTag`), and verdicts may
+carry `missingScopes`. Shortfall aggregation is conservative: `allOf` unions scope-shaped shortfalls
+but stops at the first opaque failure, so requirements behind a gate the request did not pass are
+never disclosed. `authorize()` re-enforces checks at call time (materialization already hides;
+call-time matters for long-lived instances) and raises `McpInsufficientScopeError` when the
+shortfall is scope-shaped.
+
+## Materialization pipeline
+
+`admit(context)` is now a three-stage pipeline: static capabilities plus every provider's
+per-request contribution (canonical, duplicate-checked, kinds constrained by the construction-time
+`declare`), filtered by the visibility rules (last match wins), minus auth denials. A throwing
+provider fails the whole materialization (`PROVIDER_FAILED`) — a silently shrunken catalog is
+indistinguishable from an authorization decision. Middleware reaches handlers through an
+install-time wrap that only `instantiate()` can supply: the public `definition.install(server)` path
+keeps arity one, so canonicality checks are unaffected and wrapped handlers can see the request
+context. Discovery transforms (`searchTools`, `resourcesAsTools`, `promptsAsTools`) are
+provider-backed so their proxies resolve against the same admitted set — never a wider one.
 
 ## Catalog model
 
