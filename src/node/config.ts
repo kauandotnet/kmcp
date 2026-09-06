@@ -1,6 +1,7 @@
+import { type FSWatcher, type Stats, unwatchFile, watch, watchFile } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, platform as osPlatform } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 import { getDefaultEnvironment } from "@modelcontextprotocol/client/stdio";
 
@@ -8,13 +9,31 @@ import {
 	McpConnectionDefinition,
 	type McpConnectionDefinitionOptions,
 	httpConnection,
+	sseConnection,
 } from "../client/connection.ts";
 import { KMCP_ERROR_CODES, KmcpError } from "../errors.ts";
 import { stdioConnection } from "../node.ts";
+import { parseCommandLine } from "./command.ts";
+
+/**
+ * The transport an entry may name in `type` (Cursor, VS Code and Claude Desktop) or in
+ * `transport` (some editors and registries). `streamable-http` / `streamableHttp` are spellings of
+ * `http`; `sse` selects the deprecated HTTP+SSE transport.
+ */
+export type McpConfigTransportType =
+	"stdio" | "http" | "streamable-http" | "streamableHttp" | "sse";
 
 /** A stdio entry of an `mcpServers` config (the shape desktop MCP clients and editors share). */
 export interface McpStdioServerConfig {
 	readonly type?: "stdio";
+	/** Same as `type`, for hosts that spell the field `transport`. Both must agree. */
+	readonly transport?: "stdio";
+	/**
+	 * The program to spawn. With NO `args` field, a command that carries whitespace is split as a
+	 * whole command line (see `parseCommandLine`) — the single-input-field shape hosts store —
+	 * so `"npx -y pkg"` becomes `npx` plus `["-y", "pkg"]`. An entry that has `args` (even `[]`)
+	 * is never re-split, which is also how a program whose path contains spaces is expressed.
+	 */
 	readonly command: string;
 	readonly args?: readonly string[];
 	/** Merged over the SDK's default inherited environment. Values are secrets: never logged. */
@@ -28,9 +47,11 @@ export interface McpStdioServerConfig {
 	readonly namespace?: string;
 }
 
-/** A remote (Streamable HTTP) entry of an `mcpServers` config. */
+/** A remote (Streamable HTTP, or legacy HTTP+SSE when `type` says so) `mcpServers` entry. */
 export interface McpHttpServerConfig {
-	readonly type?: "http" | "streamable-http";
+	readonly type?: "http" | "streamable-http" | "streamableHttp" | "sse";
+	/** Same as `type`, for hosts that spell the field `transport`. Both must agree. */
+	readonly transport?: "http" | "streamable-http" | "streamableHttp" | "sse";
 	readonly url: string;
 	/** Static headers; an `Authorization` header is forwarded verbatim (and never exposed in snapshots). */
 	readonly headers?: Readonly<Record<string, string>>;
@@ -86,6 +107,12 @@ export const MCP_CONFIG_TAGS = Object.freeze({
  * (`env`, `headers`) live only inside the transport factory — never in labels or tags. A
  * `timeout` (seconds) becomes the definition's default request timeout and a `protocolVersion`
  * pins the revision.
+ *
+ * The transport comes from the entry's `type` (or `transport`) when it declares one: `stdio`,
+ * `http`/`streamable-http`/`streamableHttp`, or the deprecated `sse`. An unknown value, or one
+ * that contradicts the entry's own fields, is refused instead of being guessed at. Entries
+ * without either field keep the old inference: a `url` means Streamable HTTP, a `command` means
+ * stdio.
  */
 export function connectionsFromMcpConfig<const Config extends McpServersConfig>(
 	config: Config,
@@ -117,49 +144,158 @@ export function connectionsFromMcpConfig<const Config extends McpServersConfig>(
 			// The entry's own `timeout` is the more specific value, so it wins; the loader's
 			// `defaults.timeoutMs` only fills in for entries that declare none.
 			...(timeoutMs === undefined ? {} : { defaults: { ...shared.defaults, timeoutMs } }),
-			...(entry.protocolVersion === undefined ? {} : { protocolVersion: entry.protocolVersion }),
 			id,
 			label: id,
 		};
-		const tagsFor = (transport: "http" | "stdio") => ({
+		// `sseConnection` takes no `protocolVersion` (that wire is legacy-era only), so the pin is
+		// applied per transport rather than in `base`.
+		const pin =
+			entry.protocolVersion === undefined ? {} : { protocolVersion: entry.protocolVersion };
+		const tagsFor = (transport: "http" | "sse" | "stdio") => ({
 			...options.tags,
 			[MCP_CONFIG_TAGS.source]: "mcp-config",
 			[MCP_CONFIG_TAGS.transport]: transport,
 			[MCP_CONFIG_TAGS.namespace]: namespace,
 		});
-		if ("url" in entry) {
-			if (typeof entry.url !== "string") {
-				throw new KmcpError(
-					KMCP_ERROR_CODES.INVALID_DEFINITION,
-					`Config entry '${id}' must have a string 'url'.`,
-				);
-			}
-			result[id] = httpConnection({
+		const transportType = entryTransportType(entry, id);
+		if (transportType === "stdio") {
+			const stdio = entry as McpStdioServerConfig;
+			result[id] = stdioConnection({
 				...base,
-				tags: tagsFor("http"),
-				url: entry.url,
-				...(entry.headers === undefined ? {} : { headers: entry.headers }),
+				...pin,
+				tags: tagsFor("stdio"),
+				stdio: {
+					...entryCommand(stdio, id),
+					env: { ...getDefaultEnvironment(), ...stdio.env },
+					...(stdio.cwd === undefined ? {} : { cwd: stdio.cwd }),
+				},
 			});
 			continue;
 		}
-		if (typeof entry.command !== "string" || entry.command.length === 0) {
+		const remote = entry as McpHttpServerConfig;
+		if (typeof remote.url !== "string") {
 			throw new KmcpError(
 				KMCP_ERROR_CODES.INVALID_DEFINITION,
-				`Config entry '${id}' must have a 'command' or a 'url'.`,
+				`Config entry '${id}' must have a string 'url'.`,
 			);
 		}
-		result[id] = stdioConnection({
+		const headers = remote.headers === undefined ? {} : { headers: remote.headers };
+		if (transportType === "sse") {
+			if (remote.protocolVersion !== undefined) {
+				throw new KmcpError(
+					KMCP_ERROR_CODES.INVALID_DEFINITION,
+					`Config entry '${id}' is 'sse', which negotiates the legacy era only and cannot pin 'protocolVersion'.`,
+				);
+			}
+			result[id] = sseConnection({ ...base, tags: tagsFor("sse"), url: remote.url, ...headers });
+			continue;
+		}
+		result[id] = httpConnection({
 			...base,
-			tags: tagsFor("stdio"),
-			stdio: {
-				command: entry.command,
-				args: [...(entry.args ?? [])],
-				env: { ...getDefaultEnvironment(), ...entry.env },
-				...(entry.cwd === undefined ? {} : { cwd: entry.cwd }),
-			},
+			...pin,
+			tags: tagsFor("http"),
+			url: remote.url,
+			...headers,
 		});
 	}
 	return Object.freeze(result) as McpConfigConnections<Config>;
+}
+
+/** The transports a config entry can resolve to, after aliases are folded together. */
+type McpConfigTransport = "http" | "sse" | "stdio";
+
+const TRANSPORT_ALIASES: Readonly<Record<string, McpConfigTransport>> = Object.freeze({
+	stdio: "stdio",
+	http: "http",
+	"streamable-http": "http",
+	streamablehttp: "http",
+	streamable_http: "http",
+	sse: "sse",
+});
+
+/**
+ * Reads the entry's declared transport (`type`, or the `transport` spelling), falling back to the
+ * historical inference. A declared value that is unknown, or that the entry's own fields
+ * contradict, is a definition error: guessing would silently connect a host to the wrong wire.
+ */
+function entryTransportType(entry: McpServerConfig, id: string): McpConfigTransport {
+	const record = entry as {
+		readonly type?: unknown;
+		readonly transport?: unknown;
+		readonly url?: unknown;
+		readonly command?: unknown;
+	};
+	let resolved: McpConfigTransport | undefined;
+	let declaredAs: string | undefined;
+	for (const field of ["type", "transport"] as const) {
+		const value = record[field];
+		if (value === undefined) continue;
+		if (typeof value !== "string") {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`Config entry '${id}' has a non-string '${field}'.`,
+			);
+		}
+		const kind = TRANSPORT_ALIASES[value.trim().toLowerCase()];
+		if (kind === undefined) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`Config entry '${id}' has an unknown ${field} '${value}'; expected 'stdio', 'http', 'streamable-http' or 'sse'.`,
+			);
+		}
+		if (resolved !== undefined && resolved !== kind) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`Config entry '${id}' declares type '${declaredAs}' and transport '${value}'; they must agree.`,
+			);
+		}
+		resolved = kind;
+		declaredAs = value;
+	}
+	const hasUrl = record.url !== undefined;
+	const hasCommand = record.command !== undefined;
+	if (resolved === undefined) return hasUrl ? "http" : "stdio";
+	if (resolved === "stdio" ? hasUrl && !hasCommand : hasCommand && !hasUrl) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			`Config entry '${id}' declares '${declaredAs}' but has ${
+				resolved === "stdio" ? "a 'url' and no 'command'" : "a 'command' and no 'url'"
+			}.`,
+		);
+	}
+	return resolved;
+}
+
+/**
+ * The `command`/`args` pair to spawn. A `command` that holds whitespace and comes WITHOUT `args`
+ * is one command line and is split (hosts with a single input field store it that way); note that
+ * `${VAR}` substitution happens first, so an expanded value with spaces splits too. Any `args`
+ * field — including `[]` — means the command is a program name and is passed through verbatim.
+ */
+function entryCommand(
+	entry: McpStdioServerConfig,
+	id: string,
+): { command: string; args: string[] } {
+	if (typeof entry.command !== "string" || entry.command.length === 0) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			`Config entry '${id}' must have a 'command' or a 'url'.`,
+		);
+	}
+	if (entry.args !== undefined) return { command: entry.command, args: [...entry.args] };
+	if (!/\s/.test(entry.command)) return { command: entry.command, args: [] };
+	try {
+		const parsed = parseCommandLine(entry.command);
+		return { command: parsed.command, args: [...parsed.args] };
+	} catch (error) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			`Config entry '${id}' has an unparseable 'command': ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+			{ cause: error },
+		);
+	}
 }
 
 function entryTimeoutMs(entry: McpServerConfig, id: string): number | undefined {
@@ -424,4 +560,277 @@ export async function discoverMcpConfigs(
 		configs.push({ ...candidate, config });
 	}
 	return Object.freeze({ configs: Object.freeze(configs), problems: Object.freeze(problems) });
+}
+
+/** One watched path changed; `configs` is what discovery would report for that path right now. */
+export interface McpConfigChange {
+	readonly path: string;
+	/**
+	 * The config at `path` as it stands: one entry, or none when the file was deleted or holds no
+	 * `mcpServers`/`servers` object (a `~/.claude.json` that carries only other settings). Feed the
+	 * entry's `config` to {@link connectionsFromMcpConfig} to rebuild connections.
+	 */
+	readonly configs: readonly McpDiscoveredConfig[];
+}
+
+export interface McpConfigWatchOptions {
+	/**
+	 * Files to watch — absolute or `cwd`-relative paths, or candidates from
+	 * {@link standardMcpConfigPaths}. Default: every standard location. Files that do not exist
+	 * yet are watched too: their creation is a change.
+	 */
+	readonly paths?: readonly (string | McpConfigCandidate)[];
+	/** Passed to {@link standardMcpConfigPaths} when `paths` is omitted; `cwd` also scopes strings. */
+	readonly pathOptions?: McpConfigPathOptions;
+	/** Called once per settled change, per path. Exceptions are routed to `onError`. */
+	readonly onChange: (change: McpConfigChange) => void;
+	/**
+	 * Receives read failures, unparseable JSON, and watch failures (a `KmcpError` for the first
+	 * two). The watch continues: one broken editor config never stops the others.
+	 */
+	readonly onError?: (error: unknown, path: string) => void;
+	/** Coalescing window for bursts (editors write-then-rename). Default: 250 ms. */
+	readonly debounceMs?: number;
+	/** Poll with `fs.watchFile` instead of `fs.watch` (network shares, containers). */
+	readonly poll?: boolean;
+	/** Polling interval for `poll` and for the automatic fallback. Default: 1000 ms. */
+	readonly pollIntervalMs?: number;
+	/** Whether the watch keeps the process alive. Default: `true`, as `fs.watch` itself. */
+	readonly persistent?: boolean;
+}
+
+export interface McpConfigWatcher {
+	/** The absolute paths being watched, in the order they were resolved. */
+	readonly paths: readonly string[];
+	/** Stops every watcher and settles in-flight reads. Idempotent: later calls await the first. */
+	close(): Promise<void>;
+}
+
+const DEFAULT_WATCH_DEBOUNCE_MS = 250;
+const DEFAULT_WATCH_POLL_MS = 1000;
+
+/**
+ * Watches MCP config files and reports each settled change with the freshly parsed content, so a
+ * long-lived host can pick up a server the user just added in another app without a restart.
+ *
+ * Watching happens on each file's PARENT directory (`fs.watch`), which is what makes creation,
+ * deletion and the write-to-temp-then-rename editors do observable; a platform where that throws
+ * (or fails later) falls back to `fs.watchFile` polling for the affected files. Only `node:fs` is
+ * used — no watcher dependency, no recursive watching, and no directory is walked.
+ */
+export function watchMcpConfigs(options: McpConfigWatchOptions): McpConfigWatcher {
+	if (typeof options?.onChange !== "function") {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			"watchMcpConfigs requires an 'onChange' callback.",
+		);
+	}
+	const debounceMs = watchInterval(options.debounceMs, DEFAULT_WATCH_DEBOUNCE_MS, "debounceMs", 0);
+	const pollIntervalMs = watchInterval(
+		options.pollIntervalMs,
+		DEFAULT_WATCH_POLL_MS,
+		"pollIntervalMs",
+		1,
+	);
+	const persistent = options.persistent ?? true;
+	const pathOptions = options.pathOptions ?? {};
+	const sources = options.paths ?? standardMcpConfigPaths(pathOptions);
+	const candidates = new Map<string, McpConfigCandidate>();
+	for (const source of sources) {
+		const candidate =
+			typeof source === "string"
+				? watchCandidate(source, pathOptions)
+				: { ...source, path: resolve(source.path) };
+		if (candidate.path.length === 0) continue;
+		candidates.set(candidate.path, Object.freeze(candidate));
+	}
+
+	const timers = new Map<string, NodeJS.Timeout>();
+	const watchers: FSWatcher[] = [];
+	const polling = new Map<string, () => void>();
+	let closed = false;
+	// Reads are chained so two quick edits can never deliver out of order, and so `close()` has
+	// something to await before it promises that no further callback will run.
+	let queue: Promise<void> = Promise.resolve();
+
+	const report = (error: unknown, path: string): void => {
+		if (options.onError === undefined) return;
+		try {
+			options.onError(error, path);
+		} catch {
+			// A throwing observer must not tear the watch down.
+		}
+	};
+
+	const deliver = (change: McpConfigChange): void => {
+		if (closed) return;
+		try {
+			options.onChange(Object.freeze(change));
+		} catch (error) {
+			report(error, change.path);
+		}
+	};
+
+	const emit = async (candidate: McpConfigCandidate): Promise<void> => {
+		if (closed) return;
+		let raw: string;
+		try {
+			raw = await readFile(candidate.path, "utf8");
+		} catch (error) {
+			if (isAbsentConfig(error)) {
+				deliver({ path: candidate.path, configs: Object.freeze([]) });
+				return;
+			}
+			report(
+				new KmcpError(
+					KMCP_ERROR_CODES.OPERATION_FAILED,
+					`Cannot read MCP config '${candidate.path}'.`,
+					{ cause: error },
+				),
+				candidate.path,
+			);
+			return;
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch (error) {
+			report(
+				new KmcpError(
+					KMCP_ERROR_CODES.INVALID_DEFINITION,
+					`MCP config '${candidate.path}' is not valid JSON.`,
+					{ cause: error },
+				),
+				candidate.path,
+			);
+			return;
+		}
+		const config = asMcpServersConfig(parsed);
+		deliver({
+			path: candidate.path,
+			configs: Object.freeze(config === undefined ? [] : [Object.freeze({ ...candidate, config })]),
+		});
+	};
+
+	const trigger = (path: string): void => {
+		if (closed) return;
+		const candidate = candidates.get(path);
+		if (candidate === undefined) return;
+		const pending = timers.get(path);
+		if (pending !== undefined) clearTimeout(pending);
+		const timer = setTimeout(() => {
+			timers.delete(path);
+			// The chain must never end up rejected: `close()` awaits it, and an unexpected failure
+			// belongs to the observer, not to the caller that happens to be closing the watch.
+			queue = queue
+				.then(() => emit(candidate))
+				.catch((error: unknown) => report(error, candidate.path));
+		}, debounceMs);
+		if (!persistent) timer.unref();
+		timers.set(path, timer);
+	};
+
+	const startPolling = (candidate: McpConfigCandidate): void => {
+		if (closed || polling.has(candidate.path)) return;
+		const listener = (current: Stats, previous: Stats): void => {
+			// `watchFile` polls a path that does not exist too; two absent stats are not a change.
+			if (current.mtimeMs === 0 && previous.mtimeMs === 0) return;
+			trigger(candidate.path);
+		};
+		watchFile(candidate.path, { interval: pollIntervalMs, persistent }, listener);
+		polling.set(candidate.path, () => unwatchFile(candidate.path, listener));
+	};
+
+	if (options.poll === true) {
+		for (const candidate of candidates.values()) startPolling(candidate);
+	} else {
+		const byDirectory = new Map<string, McpConfigCandidate[]>();
+		for (const candidate of candidates.values()) {
+			const directory = dirname(candidate.path);
+			const group = byDirectory.get(directory);
+			if (group === undefined) byDirectory.set(directory, [candidate]);
+			else group.push(candidate);
+		}
+		for (const [directory, group] of byDirectory) {
+			const byName = new Map(group.map((candidate) => [basename(candidate.path), candidate]));
+			const fallback = (error: unknown): void => {
+				// A directory that simply does not exist is the normal case for a standard location
+				// nobody has used yet, not a failure worth reporting; polling still sees it appear.
+				if (!isAbsentConfig(error)) report(error, directory);
+				for (const candidate of group) startPolling(candidate);
+			};
+			let watcher: FSWatcher;
+			try {
+				// The directory itself may not exist yet (`~/.cursor` before Cursor ran once).
+				watcher = watch(directory, { persistent });
+			} catch (error) {
+				fallback(error);
+				continue;
+			}
+			watcher.on("change", (_event, filename) => {
+				if (filename === null || filename === undefined) {
+					// Some platforms omit the name; re-check every file this directory holds.
+					for (const candidate of group) trigger(candidate.path);
+					return;
+				}
+				const name = typeof filename === "string" ? filename : filename.toString("utf8");
+				const candidate = byName.get(name);
+				if (candidate !== undefined) trigger(candidate.path);
+			});
+			watcher.on("error", (error) => {
+				// The directory was removed, or the platform dropped the handle: keep going by polling.
+				watcher.close();
+				fallback(error);
+			});
+			watchers.push(watcher);
+		}
+	}
+
+	let closing: Promise<void> | undefined;
+	return Object.freeze({
+		paths: Object.freeze([...candidates.keys()]),
+		close: (): Promise<void> => {
+			closing ??= (async () => {
+				closed = true;
+				for (const timer of timers.values()) clearTimeout(timer);
+				timers.clear();
+				for (const watcher of watchers) {
+					try {
+						watcher.close();
+					} catch {
+						// Already closed by an error handler.
+					}
+				}
+				watchers.length = 0;
+				for (const stop of polling.values()) stop();
+				polling.clear();
+				await queue;
+			})();
+			return closing;
+		},
+	});
+}
+
+function watchInterval(
+	value: number | undefined,
+	fallback: number,
+	field: string,
+	minimum: number,
+): number {
+	if (value === undefined) return fallback;
+	if (!Number.isFinite(value) || value < minimum) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			`watchMcpConfigs '${field}' must be a number >= ${minimum}.`,
+		);
+	}
+	return value;
+}
+
+/** A bare path gets the documented scope meaning: under the working directory is `project`. */
+function watchCandidate(path: string, options: McpConfigPathOptions): McpConfigCandidate {
+	const absolute = resolve(options.cwd ?? process.cwd(), path);
+	const cwd = resolve(options.cwd ?? process.cwd());
+	const inside = absolute === cwd || absolute.startsWith(cwd + sep);
+	return { path: absolute, scope: inside ? "project" : "global", client: "custom" };
 }
