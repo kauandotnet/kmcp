@@ -19,6 +19,8 @@ import {
 	type RequestTypeMap,
 	type ResponseCacheStore,
 	type Root,
+	SSEClientTransport,
+	type SSEClientTransportOptions,
 	type ServerCapabilities,
 	StreamableHTTPClientTransport,
 	type StreamableHTTPClientTransportOptions,
@@ -750,6 +752,96 @@ export function httpConnection<const Id extends string>(
 						}),
 			});
 		},
+	});
+}
+
+export interface McpSseConnectionOptions<Id extends string> extends Omit<
+	McpConnectionDefinitionOptions<Id>,
+	"transport" | "transportKind" | "oauth" | "resumed" | "protocolVersion"
+> {
+	/** The SSE endpoint (the `GET` that opens the event stream). */
+	readonly url: string | URL;
+	readonly transportOptions?: SSEClientTransportOptions;
+	/** See `McpHttpConnectionOptions.auth`. */
+	readonly auth?: McpHttpAuth;
+	/** Static extra headers for the `POST`s; an `Authorization` entry next to `auth` is rejected. */
+	readonly headers?: Readonly<Record<string, string>>;
+	readonly cachePartition?: string;
+	readonly responseCacheStore?: ResponseCacheStore;
+	readonly defaultCacheTtlMs?: number;
+}
+
+/**
+ * A connection over the deprecated HTTP+SSE transport (protocol revisions before 2025-03-26),
+ * for servers that never moved to Streamable HTTP. The connection negotiates the legacy era
+ * only — that wire has no `server/discover` — and everything else behaves as with
+ * `httpConnection`: interactive providers park in `authorizing`, non-interactive ones advertise
+ * their extension. Prefer `httpConnection`; the SDK keeps this transport for the migration period.
+ *
+ * @deprecated Along with the transport it wraps. Use `httpConnection` where the server allows.
+ */
+export function sseConnection<const Id extends string>(
+	options: McpSseConnectionOptions<Id>,
+): McpConnectionDefinition<Id> {
+	const {
+		url,
+		transportOptions,
+		auth,
+		headers,
+		cachePartition,
+		responseCacheStore,
+		defaultCacheTtlMs,
+		...definition
+	} = options;
+	const endpoint = typeof url === "string" ? new URL(url) : new URL(url.href);
+	if (headers !== undefined && auth !== undefined) {
+		for (const name of Object.keys(headers)) {
+			if (name.toLowerCase() === "authorization") {
+				throw new KmcpError(
+					KMCP_ERROR_CODES.INVALID_DEFINITION,
+					"headers.Authorization would silently override the auth provider; pass one or the other.",
+				);
+			}
+		}
+	}
+	if (definition.clientOptions?.versionNegotiation !== undefined) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			"sseConnection always negotiates the legacy era; clientOptions.versionNegotiation is not accepted.",
+		);
+	}
+	const authProvider = auth === undefined ? undefined : toAuthProvider(auth);
+	const oauthProvider = auth !== undefined && isOAuthClientProvider(auth) ? auth : undefined;
+	const grant = oauthProvider === undefined ? undefined : oauthGrantOf(oauthProvider);
+	const oauth = grant === "authorization_code" ? oauthProvider : undefined;
+	const grantExtensions =
+		grant === "client_credentials"
+			? { [MCP_CLIENT_CREDENTIALS_EXTENSION]: {} }
+			: grant === "jwt_bearer"
+				? { [MCP_ENTERPRISE_MANAGED_AUTH_EXTENSION]: {} }
+				: {};
+	const partition =
+		cachePartition ?? (auth === undefined ? undefined : `kmcp:${credentialIdentity(auth)}`);
+	return new McpConnectionDefinition({
+		...definition,
+		clientOptions: {
+			...definition.clientOptions,
+			versionNegotiation: { mode: "legacy" },
+			...(partition === undefined ? {} : { cachePartition: partition }),
+			...(responseCacheStore === undefined ? {} : { responseCacheStore }),
+			...(defaultCacheTtlMs === undefined ? {} : { defaultCacheTtlMs }),
+		},
+		extensions: { ...grantExtensions, ...definition.extensions },
+		transportKind: "sse",
+		...(oauth === undefined ? {} : { oauth }),
+		transport: () =>
+			new SSEClientTransport(endpoint, {
+				...transportOptions,
+				...(authProvider === undefined ? {} : { authProvider }),
+				...(headers === undefined
+					? {}
+					: { requestInit: { ...transportOptions?.requestInit, headers: { ...headers } } }),
+			}),
 	});
 }
 

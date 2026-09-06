@@ -1,0 +1,10 @@
+# Nightly CLIENT conformance baseline — `conformance-nightly.yml` runs the UNPINNED tool
+# (github:modelcontextprotocol/conformance) over every client scenario it lists, through
+# test/conformance/client-fixture.ts, and applies this file to each scenario run.
+#
+# Same semantics as conformance-baseline-client.yml: listed+failing = expected, listed+passing =
+# stale (exit 1), unlisted failure = regression (exit 1). WARNING counts as failing. Expect this
+# file to grow the day the working group lands a client scenario kmcp does not pass yet; that is
+# the signal the nightly exists for.
+
+client: []

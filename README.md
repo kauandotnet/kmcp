@@ -363,7 +363,11 @@ strict capability enforcement is off for that definition, the list verbs walk th
 and any later reconnect starts fresh; `reconnection` overrides `MCP_HTTP_RECONNECTION_DEFAULTS` (1 s
 → 30 s, factor 2, 10 retries for the server-to-client stream); `cachePartition` defaults to a digest
 of the credential identity. `stdioConnection` (`kmcp/node`) adds `onStderrLine` to receive the
-child's stderr line by line.
+child's stderr line by line. `sseConnection` reaches servers still on the deprecated HTTP+SSE
+transport (legacy era only; same `auth` and `headers` handling), for the migration period the SDK
+keeps that transport for. `kmcp/client` also re-exports the curated SDK client surface (`Client`,
+the transports, the OAuth providers and flow functions, the fetch middlewares, the error classes,
+`specTypeSchemas`) so application code imports one package.
 
 Manager verbs take the SDK request option types plus `meta` (`_meta` passthrough) and an optional
 generation/fingerprint `control`: `callTool` (with `contract` it refuses the call when the
@@ -565,7 +569,9 @@ forwarded.
   authorization URL and handing the callback to `completeAuthorization` — connect-time and
   mid-session step-up alike); `conformance-baseline-client.yml` lists expected failures. The two
   `auth/2025-03-26-*` scenarios need the SDK's `skipIssuerMetadataValidation` opt-out, which the
-  adapter enables for them only.
+  adapter enables for them only. The nightly workflow runs the same client scenarios against the
+  tool's git main with `conformance-baseline-client-main.yml`, so a scenario the working group lands
+  shows up there first.
 - `pnpm run conformance:server` and `pnpm run conformance:gateway` run the official
   `@modelcontextprotocol/conformance` suite against the everything-server fixture and the same
   fixture behind a gateway; `conformance-baseline*.yml` list the justified expected failures

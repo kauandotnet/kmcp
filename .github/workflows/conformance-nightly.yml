@@ -48,3 +48,12 @@ jobs:
           CONFORMANCE_SUITE: all
           CONFORMANCE_BASELINE: conformance-baseline-main.yml
         run: node scripts/conformance-server.mjs
+
+      # The client side against the same unpinned tool: every scenario its `list --client` prints,
+      # so a scenario the working group lands shows up here first. Its own baseline; empty today.
+      - name: Conformance (conformance main, client scenarios)
+        if: always()
+        env:
+          CONFORMANCE_PACKAGE: github:modelcontextprotocol/conformance
+          CONFORMANCE_BASELINE: conformance-baseline-client-main.yml
+        run: node scripts/conformance-client.mjs
