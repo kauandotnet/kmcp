@@ -208,6 +208,15 @@ export interface McpConnectionDefinitionOptions<Id extends string> {
 	readonly label?: string;
 	readonly tags?: Readonly<Record<string, string>>;
 	readonly clientInfo?: Implementation;
+	/**
+	 * Official `ClientOptions`, with the definition's derived values layered on top.
+	 *
+	 * `capabilities` goes through the SDK's `mergeCapabilities(yours, derived)`, which merges ONE
+	 * level deep: a top-level key present in both is `{ ...yours, ...derived }`, so second-level
+	 * detail under a derived key is REPLACED, not merged. Declaring `tasks: { list: { … } }`
+	 * alongside the derived `tasks: { list: {}, cancel: {} }` therefore loses the inner object.
+	 * Keys the definition derives nothing for pass through untouched.
+	 */
 	readonly clientOptions?: ClientOptions;
 	readonly connectOptions?: ConnectOptions;
 	readonly transport: McpTransportFactory;
@@ -255,11 +264,13 @@ export interface McpConnectionDefinitionOptions<Id extends string> {
 	 */
 	readonly tasks?: boolean;
 	/**
-	 * The session the FIRST transport this definition opens resumes (the transport factory must
+	 * The session the next transport this definition opens resumes (the transport factory must
 	 * carry the same `sessionId`). While that session lives, snapshots and era-dependent verbs use
 	 * this record in place of the handshake the SDK skipped, and strict capability enforcement is
-	 * off (there is nothing to enforce against) unless `clientOptions.enforceStrictCapabilities`
-	 * says otherwise. A later reconnect runs a full handshake.
+	 * off for that one generation (there is nothing to enforce against) unless
+	 * `clientOptions.enforceStrictCapabilities` says otherwise. The record is one-shot: it stays
+	 * available across failed connect attempts (`resumePending`) and is spent by `consumeResume()`
+	 * once a session has been adopted, after which every generation runs a full handshake.
 	 */
 	readonly resumed?: McpResumedSession;
 	/** Capability extensions (reverse-DNS keys) merged into `capabilities.extensions`. */
@@ -298,6 +309,8 @@ export class McpConnectionDefinition<const Id extends string = string> {
 	readonly disconnectTimeoutMs: number | undefined;
 	readonly terminateSession: boolean;
 	readonly resumed: McpResolvedResumedSession | undefined;
+	#resumePending: boolean;
+	readonly #pinnedStrictCapabilities: boolean | undefined;
 	readonly #transportFactory: McpTransportFactory;
 	readonly #requestHandlers: McpClientRequestHandlers;
 	readonly #notificationHandlers: McpClientNotificationHandlers;
@@ -381,12 +394,22 @@ export class McpConnectionDefinition<const Id extends string = string> {
 				"Pass either protocolVersion or clientOptions.versionNegotiation, not both.",
 			);
 		}
+		this.#resumePending = this.resumed !== undefined;
+		const pinnedStrictCapabilities = options.clientOptions?.enforceStrictCapabilities;
+		this.#pinnedStrictCapabilities = pinnedStrictCapabilities;
 		const extensions: McpCapabilityExtensions = { ...options.extensions };
 		this.clientOptions = Object.freeze({
-			// A resumed session never re-learns the server's capabilities, so there is nothing to
-			// enforce against; the record supplied in `resumed` is display-only.
-			enforceStrictCapabilities: this.resumed === undefined,
 			...options.clientOptions,
+			// kmcp enforces strict capabilities by default (the SDK does not). A definition holding
+			// a one-shot resumed record leaves the slot EMPTY rather than baking `false` into it:
+			// only the generation that actually adopts the session knows there are no capabilities
+			// to enforce against, and a baked value would outlive that generation. The per-generation
+			// answer is `enforceStrictCapabilities`, which `createOfficialClient` applies.
+			...(pinnedStrictCapabilities !== undefined
+				? { enforceStrictCapabilities: pinnedStrictCapabilities }
+				: this.resumed === undefined
+					? { enforceStrictCapabilities: true }
+					: {}),
 			versionNegotiation:
 				pin?.versionNegotiation ??
 				options.clientOptions?.versionNegotiation ??
@@ -402,6 +425,7 @@ export class McpConnectionDefinition<const Id extends string = string> {
 					options.advertise,
 					options.tasks !== false,
 					extensions,
+					options.clientOptions?.capabilities?.roots?.listChanged,
 				),
 			),
 			...(options.inputRequired === undefined
@@ -420,6 +444,35 @@ export class McpConnectionDefinition<const Id extends string = string> {
 		return this.#transportFactory();
 	}
 
+	/**
+	 * True while the one-shot `resumed` record has not been consumed — that is, while the NEXT
+	 * transport this definition opens should still adopt that server-side session. Building a
+	 * transport only peeks; a connect attempt that fails (a DNS blip, a 401 that arms an OAuth
+	 * round) leaves the record intact so the retry can still resume instead of orphaning the
+	 * session on the server.
+	 */
+	get resumePending(): boolean {
+		return this.#resumePending;
+	}
+
+	/**
+	 * Marks the one-shot `resumed` record used, after a session was actually adopted. Every later
+	 * generation runs a full handshake. A no-op when there is no record, or it is already spent.
+	 */
+	consumeResume(): void {
+		this.#resumePending = false;
+	}
+
+	/**
+	 * Strict capability enforcement for the NEXT client built from this definition. A pending
+	 * resumed session ran no handshake, so the SDK learned no server capabilities and has nothing
+	 * to enforce against; once the record is consumed, every later generation handshakes and
+	 * enforces normally. An explicit `clientOptions.enforceStrictCapabilities` overrides both.
+	 */
+	get enforceStrictCapabilities(): boolean {
+		return this.#pinnedStrictCapabilities ?? !this.#resumePending;
+	}
+
 	/** True when the definition carries an interactive OAuth provider (the manager may park it in `authorizing`). */
 	get interactiveOAuth(): boolean {
 		return this.#oauth !== undefined;
@@ -435,6 +488,15 @@ export class McpConnectionDefinition<const Id extends string = string> {
 		if (typeof verifier?.verifyCallbackState === "function") {
 			await verifier.verifyCallbackState(params);
 		}
+	}
+
+	/**
+	 * Ends an authorization round after the code was exchanged: the PKCE verifier and the OAuth
+	 * `state` it was bound to are single-use and must not outlive it. A no-op for providers
+	 * without `invalidateCredentials`.
+	 */
+	async finishAuthorizationRound(): Promise<void> {
+		await this.#oauth?.invalidateCredentials?.("verifier");
 	}
 
 	/** Registers this definition's server→client handlers and roots on a freshly constructed client. */
@@ -571,13 +633,20 @@ function normalizeKeepalive(
 	return Object.freeze({ intervalMs, timeoutMs, failureThreshold });
 }
 
-/** The minimal capability set implied by the configured handlers (see `McpClientAdvertise` for the opt-ins). */
+/**
+ * The minimal capability set implied by the configured handlers (see `McpClientAdvertise` for the
+ * opt-ins). It is the SECOND argument to `mergeCapabilities`, so it wins — which is why the one
+ * value a caller can reasonably know better, `roots.listChanged`, is threaded in rather than
+ * recomputed: only a callback source makes kmcp itself send the notification, but an application
+ * driving `notifications/roots/list_changed` by hand is entitled to advertise it.
+ */
 function derivedCapabilities(
 	handlers: McpClientRequestHandlers,
 	roots: McpRootsSource | undefined,
 	advertise: McpClientAdvertise | undefined,
 	tasks: boolean,
 	extensions: McpCapabilityExtensions,
+	declaredRootsListChanged: boolean | undefined,
 ): Partial<ClientCapabilities> {
 	return {
 		...(handlers["elicitation/create"] === undefined
@@ -588,17 +657,27 @@ function derivedCapabilities(
 			: { sampling: advertise?.samplingTools === true ? { tools: {} } : {} }),
 		...(handlers["roots/list"] === undefined && roots === undefined
 			? {}
-			: { roots: { listChanged: typeof roots === "function" } }),
+			: { roots: { listChanged: declaredRootsListChanged ?? typeof roots === "function" } }),
 		...(tasks ? { tasks: { list: {}, cancel: {} } } : {}),
 		...(Object.keys(extensions).length === 0 ? {} : { extensions: { ...extensions } }),
 	};
 }
 
-/** Bare paths become `file://` URIs; `Root` objects pass through. */
+/**
+ * A Windows drive-letter path (`C:\Users\me`, `D:/data`). Checked BEFORE the URI-scheme pattern,
+ * which a bare drive letter otherwise satisfies — advertising `C:\Users\me` as a root URI.
+ */
+const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
+const URI_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
+
+/** Bare paths (POSIX and Windows) become `file://` URIs; `Root` objects and real URIs pass through. */
 export function normalizeRoots(roots: readonly string[] | readonly Root[]): Root[] {
 	return roots.map((root) => {
 		if (typeof root !== "string") return { ...root };
-		if (/^[a-z][a-z0-9+.-]*:/i.test(root)) return { uri: root };
+		if (WINDOWS_DRIVE_PATH.test(root)) {
+			return { uri: new URL(`file:///${root.replaceAll("\\", "/")}`).href };
+		}
+		if (URI_SCHEME.test(root)) return { uri: root };
 		return { uri: new URL(`file://${root.startsWith("/") ? "" : "/"}${root}`).href };
 	});
 }
@@ -646,7 +725,12 @@ export interface McpHttpConnectionOptions<Id extends string> extends Omit<
 	readonly auth?: McpHttpAuth;
 	/** Per-request headers for schemes `AuthProvider` cannot express (non-Bearer token types, extra headers). */
 	readonly authHeaders?: () => MaybePromise<Readonly<Record<string, string>>>;
-	/** Static extra headers. An `Authorization` entry alongside `auth` is rejected: the SDK spreads `requestInit.headers` after the provider's header and would silently win. */
+	/**
+	 * Static extra headers, merged OVER `transportOptions.requestInit.headers`. An `Authorization`
+	 * entry alongside `auth` is rejected here and in `requestInit.headers`: the SDK's
+	 * `_commonHeaders()` spreads `requestInit.headers` after the provider's header, so either would
+	 * silently beat the auth provider.
+	 */
 	readonly headers?: Readonly<Record<string, string>>;
 	/** SDK fetch middlewares (`withLogging`, `createMiddleware`, ...) composed around the transport's fetch, outermost first. */
 	readonly middlewares?: readonly Middleware[];
@@ -654,8 +738,16 @@ export interface McpHttpConnectionOptions<Id extends string> extends Omit<
 	readonly resume?: McpHttpResumeOptions;
 	/** Overrides for the SSE stream reconnection policy (see `MCP_HTTP_RECONNECTION_DEFAULTS`). */
 	readonly reconnection?: Partial<StreamableHTTPReconnectionOptions>;
-	/** Principal id partitioning `'private'` cache entries. Defaults to a digest of the credential identity when `auth` is set. */
+	/**
+	 * Principal id partitioning `'private'` cache entries within the connected server's namespace.
+	 * Nothing is derived from the credential: a partition guessed from a token would let two
+	 * principals collide into each other's private entries. It matters only when a
+	 * `responseCacheStore` is SHARED across principals — the SDK's default store is per client, so
+	 * a connection that supplies neither is already isolated. Passing `auth` together with a
+	 * shared `responseCacheStore` and no `cachePartition` is therefore rejected.
+	 */
 	readonly cachePartition?: string;
+	/** A cache store shared with other clients. With `auth`, `cachePartition` becomes required. */
 	readonly responseCacheStore?: ResponseCacheStore;
 	readonly defaultCacheTtlMs?: number;
 }
@@ -678,16 +770,7 @@ export function httpConnection<const Id extends string>(
 		...definition
 	} = options;
 	const endpoint = typeof url === "string" ? new URL(url) : new URL(url.href);
-	if (headers !== undefined && auth !== undefined) {
-		for (const name of Object.keys(headers)) {
-			if (name.toLowerCase() === "authorization") {
-				throw new KmcpError(
-					KMCP_ERROR_CODES.INVALID_DEFINITION,
-					"headers.Authorization would silently override the auth provider; pass one or the other.",
-				);
-			}
-		}
-	}
+	assertNoAuthorizationOverride(auth, headers, transportOptions?.requestInit?.headers);
 	if (middlewares !== undefined && middlewares.some((entry) => typeof entry !== "function")) {
 		throw new TypeError("middlewares must be functions.");
 	}
@@ -701,11 +784,14 @@ export function httpConnection<const Id extends string>(
 			: grant === "jwt_bearer"
 				? { [MCP_ENTERPRISE_MANAGED_AUTH_EXTENSION]: {} }
 				: {};
-	const partition =
-		cachePartition ?? (auth === undefined ? undefined : `kmcp:${credentialIdentity(auth)}`);
+	assertCachePartitioned(
+		auth,
+		cachePartition,
+		responseCacheStore ?? definition.clientOptions?.responseCacheStore,
+	);
 	const clientOptions: ClientOptions = {
 		...definition.clientOptions,
-		...(partition === undefined ? {} : { cachePartition: partition }),
+		...(cachePartition === undefined ? {} : { cachePartition }),
 		...(responseCacheStore === undefined ? {} : { responseCacheStore }),
 		...(defaultCacheTtlMs === undefined ? {} : { defaultCacheTtlMs }),
 	};
@@ -714,17 +800,25 @@ export function httpConnection<const Id extends string>(
 		...transportOptions?.reconnectionOptions,
 		...reconnection,
 	};
-	// The resumed session is consumed by the first transport only: a reconnect after the server
-	// declared it gone must start a fresh session, or it would resume a dead one forever.
-	let pendingResume: McpHttpResumeOptions | undefined = resume;
 	const baseFetch = transportOptions?.fetch ?? ((input, init) => globalThis.fetch(input, init));
 	const wrappedFetch =
 		middlewares === undefined || middlewares.length === 0
 			? transportOptions?.fetch
-			: applyMiddlewares(...middlewares)(baseFetch);
+			: // `applyMiddlewares` wraps in argument order, which makes its LAST argument the
+				// outermost handler. kmcp documents the first entry as outermost, so the array is
+				// reversed on the way in and the documented order is what runs.
+				applyMiddlewares(...[...middlewares].reverse())(baseFetch);
 	const finalFetch =
 		authHeaders === undefined ? wrappedFetch : fetchWithAuthHeaders(authHeaders, wrappedFetch);
-	return new McpConnectionDefinition({
+	const requestInit =
+		headers === undefined
+			? undefined
+			: {
+					...transportOptions?.requestInit,
+					headers: mergeHeaders(transportOptions?.requestInit?.headers, headers),
+				};
+	let created: McpConnectionDefinition<Id> | undefined;
+	const built = new McpConnectionDefinition({
 		...definition,
 		clientOptions,
 		extensions: { ...grantExtensions, ...definition.extensions },
@@ -732,15 +826,16 @@ export function httpConnection<const Id extends string>(
 		...(resume === undefined ? {} : { resumed: resume }),
 		...(oauth === undefined ? {} : { oauth }),
 		transport: () => {
-			const resumed = pendingResume;
-			pendingResume = undefined;
+			// PEEK, never consume: a connect attempt can fail after the transport is built (a DNS
+			// blip, a 401 that arms the OAuth round) and the retry must be able to resume the same
+			// server-side session. The owner of the attempt calls `consumeResume()` once the
+			// session has actually been adopted.
+			const resumed = created?.resumePending === true ? created.resumed : undefined;
 			return new StreamableHTTPClientTransport(endpoint, {
 				...transportOptions,
 				reconnectionOptions,
 				...(authProvider === undefined ? {} : { authProvider }),
-				...(headers === undefined
-					? {}
-					: { requestInit: { ...transportOptions?.requestInit, headers: { ...headers } } }),
+				...(requestInit === undefined ? {} : { requestInit }),
 				...(finalFetch === undefined ? {} : { fetch: finalFetch }),
 				...(resumed === undefined
 					? {}
@@ -753,6 +848,8 @@ export function httpConnection<const Id extends string>(
 			});
 		},
 	});
+	created = built;
+	return built;
 }
 
 export interface McpSseConnectionOptions<Id extends string> extends Omit<
@@ -764,9 +861,14 @@ export interface McpSseConnectionOptions<Id extends string> extends Omit<
 	readonly transportOptions?: SSEClientTransportOptions;
 	/** See `McpHttpConnectionOptions.auth`. */
 	readonly auth?: McpHttpAuth;
-	/** Static extra headers for the `POST`s; an `Authorization` entry next to `auth` is rejected. */
+	/**
+	 * Static extra headers for the `POST`s, merged OVER `transportOptions.requestInit.headers`. An
+	 * `Authorization` entry next to `auth` is rejected in either place.
+	 */
 	readonly headers?: Readonly<Record<string, string>>;
+	/** See `McpHttpConnectionOptions.cachePartition`; nothing is derived from the credential. */
 	readonly cachePartition?: string;
+	/** A cache store shared with other clients. With `auth`, `cachePartition` becomes required. */
 	readonly responseCacheStore?: ResponseCacheStore;
 	readonly defaultCacheTtlMs?: number;
 }
@@ -794,16 +896,7 @@ export function sseConnection<const Id extends string>(
 		...definition
 	} = options;
 	const endpoint = typeof url === "string" ? new URL(url) : new URL(url.href);
-	if (headers !== undefined && auth !== undefined) {
-		for (const name of Object.keys(headers)) {
-			if (name.toLowerCase() === "authorization") {
-				throw new KmcpError(
-					KMCP_ERROR_CODES.INVALID_DEFINITION,
-					"headers.Authorization would silently override the auth provider; pass one or the other.",
-				);
-			}
-		}
-	}
+	assertNoAuthorizationOverride(auth, headers, transportOptions?.requestInit?.headers);
 	if (definition.clientOptions?.versionNegotiation !== undefined) {
 		throw new KmcpError(
 			KMCP_ERROR_CODES.INVALID_DEFINITION,
@@ -820,14 +913,24 @@ export function sseConnection<const Id extends string>(
 			: grant === "jwt_bearer"
 				? { [MCP_ENTERPRISE_MANAGED_AUTH_EXTENSION]: {} }
 				: {};
-	const partition =
-		cachePartition ?? (auth === undefined ? undefined : `kmcp:${credentialIdentity(auth)}`);
+	assertCachePartitioned(
+		auth,
+		cachePartition,
+		responseCacheStore ?? definition.clientOptions?.responseCacheStore,
+	);
+	const requestInit =
+		headers === undefined
+			? undefined
+			: {
+					...transportOptions?.requestInit,
+					headers: mergeHeaders(transportOptions?.requestInit?.headers, headers),
+				};
 	return new McpConnectionDefinition({
 		...definition,
 		clientOptions: {
 			...definition.clientOptions,
 			versionNegotiation: { mode: "legacy" },
-			...(partition === undefined ? {} : { cachePartition: partition }),
+			...(cachePartition === undefined ? {} : { cachePartition }),
 			...(responseCacheStore === undefined ? {} : { responseCacheStore }),
 			...(defaultCacheTtlMs === undefined ? {} : { defaultCacheTtlMs }),
 		},
@@ -838,16 +941,17 @@ export function sseConnection<const Id extends string>(
 			new SSEClientTransport(endpoint, {
 				...transportOptions,
 				...(authProvider === undefined ? {} : { authProvider }),
-				...(headers === undefined
-					? {}
-					: { requestInit: { ...transportOptions?.requestInit, headers: { ...headers } } }),
+				...(requestInit === undefined ? {} : { requestInit }),
 			}),
 	});
 }
 
 function toAuthProvider(auth: McpHttpAuth): AuthProvider | OAuthClientProvider {
 	if (typeof auth === "string") {
-		const token = auth.replace(/^Bearer\s+/i, "").trim();
+		const token = auth
+			.trim()
+			.replace(/^Bearer\s+/i, "")
+			.trim();
 		assertNonEmpty(token, "bearer token");
 		return { token: async () => token };
 	}
@@ -860,27 +964,67 @@ function isOAuthClientProvider(auth: McpHttpAuth): auth is OAuthClientProvider {
 	);
 }
 
-let anonymousCredentialCounter = 0;
-const credentialIdentities = new WeakMap<object, string>();
-
-/** A stable, non-secret identity for a credential: static tokens hash by content, providers by object identity. */
-function credentialIdentity(auth: McpHttpAuth): string {
-	if (typeof auth === "string") return `token:${fnv(auth.replace(/^Bearer\s+/i, "").trim())}`;
-	let identity = credentialIdentities.get(auth);
-	if (identity === undefined) {
-		anonymousCredentialCounter += 1;
-		identity = `provider:${anonymousCredentialCounter}`;
-		credentialIdentities.set(auth, identity);
-	}
-	return identity;
+/**
+ * Refuses the one configuration where an unset `cachePartition` is a data leak: credentials plus a
+ * response cache store SHARED with other clients. The SDK files `'private'`-scoped entries at
+ * `[serverIdentity, cachePartition]`, so with the default `''` every principal against that server
+ * reads and writes the same slot. kmcp deliberately derives nothing from the credential itself —
+ * any digest short enough to be a partition key can collide, and a collision here hands one
+ * principal another's private responses.
+ */
+function assertCachePartitioned(
+	auth: McpHttpAuth | undefined,
+	cachePartition: string | undefined,
+	sharedStore: ResponseCacheStore | undefined,
+): void {
+	if (auth === undefined || cachePartition !== undefined || sharedStore === undefined) return;
+	throw new KmcpError(
+		KMCP_ERROR_CODES.INVALID_DEFINITION,
+		"A shared responseCacheStore next to auth needs an explicit cachePartition: private cache entries are isolated by cachePartition alone, so without one every principal shares this server's slot. Pass a stable id for the authorization context (the auth subject), or drop responseCacheStore to get the SDK's per-client cache.",
+	);
 }
 
-function fnv(value: string): string {
-	let hash = 0x811c9dc5;
-	for (let index = 0; index < value.length; index += 1) {
-		hash = Math.imul(hash ^ value.charCodeAt(index), 0x01000193);
+/**
+ * Every header name in a `HeadersInit`, lowercased. `Headers`, `[name, value]` arrays and plain
+ * records all reach the SDK through `normalizeHeaders`, so all three have to be inspected.
+ */
+function headerEntries(init: HeadersInit | undefined): [string, string][] {
+	if (init === undefined) return [];
+	if (init instanceof Headers) return [...init.entries()];
+	if (Array.isArray(init)) return init.map(([name, value]) => [String(name).toLowerCase(), value]);
+	return Object.entries(init).map(([name, value]) => [name.toLowerCase(), value]);
+}
+
+/** `requestInit.headers` first, the definition's static `headers` over them. Names are lowercased. */
+function mergeHeaders(
+	base: HeadersInit | undefined,
+	extra: Readonly<Record<string, string>>,
+): Record<string, string> {
+	const merged: Record<string, string> = {};
+	for (const [name, value] of headerEntries(base)) merged[name] = value;
+	for (const [name, value] of Object.entries(extra)) merged[name.toLowerCase()] = value;
+	return merged;
+}
+
+/**
+ * Rejects an `Authorization` header supplied next to `auth`, wherever it was written. The SDK's
+ * `_commonHeaders()` spreads `requestInit.headers` AFTER the provider's `Authorization`, so either
+ * spelling silently wins over the credential the connection was configured with — a stale token
+ * that fails closed, or a stronger one that fails open.
+ */
+function assertNoAuthorizationOverride(
+	auth: McpHttpAuth | undefined,
+	headers: Readonly<Record<string, string>> | undefined,
+	requestInitHeaders: HeadersInit | undefined,
+): void {
+	if (auth === undefined) return;
+	const supplied = [...headerEntries(headers), ...headerEntries(requestInitHeaders)];
+	if (supplied.some(([name]) => name === "authorization")) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			"An Authorization header (in headers or transportOptions.requestInit.headers) would silently override the auth provider; pass one or the other.",
+		);
 	}
-	return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 function fetchWithAuthHeaders(
@@ -969,11 +1113,14 @@ function inProcessNegotiation(
 		era === "modern" ? { mode: { pin: MCP_MODERN_PROTOCOL_VERSION } } : { mode: "legacy" as const };
 	if (supplied === undefined) return expected;
 	const mode = supplied.mode;
+	// An omitted `mode` means "the era decides" on BOTH arms: a `versionNegotiation` that only
+	// carries probe options is compatible with either era, not just the legacy one.
 	const compatible =
-		era === "modern"
+		mode === undefined ||
+		(era === "modern"
 			? mode === "auto" ||
 				(typeof mode === "object" && mode !== null && mode.pin === MCP_MODERN_PROTOCOL_VERSION)
-			: mode === "legacy" || mode === undefined;
+			: mode === "legacy");
 	if (!compatible) {
 		throw new KmcpError(
 			KMCP_ERROR_CODES.INVALID_DEFINITION,
@@ -1083,6 +1230,13 @@ export interface McpOfficialClientOverrides {
 	readonly onResourceUpdated?: (
 		notification: NotificationTypeMap["notifications/resources/updated"],
 	) => void;
+	/**
+	 * Strict capability enforcement for THIS generation, overriding the definition's own
+	 * `enforceStrictCapabilities`. The caller that knows whether the generation about to be built
+	 * adopts a resumed session (and therefore learns no server capabilities) sets it; absent, the
+	 * definition decides from its own pending resume state.
+	 */
+	readonly enforceStrictCapabilities?: boolean;
 }
 
 /** Constructs the official `Client` for a definition and installs its handlers; the single seam the manager uses. */
@@ -1092,6 +1246,8 @@ export function createOfficialClient(
 ): Client {
 	const client = new Client(definition.clientInfo, {
 		...definition.clientOptions,
+		enforceStrictCapabilities:
+			overrides.enforceStrictCapabilities ?? definition.enforceStrictCapabilities,
 		...(overrides.listChanged === undefined ? {} : { listChanged: overrides.listChanged }),
 	});
 	definition.installHandlers(client, overrides);

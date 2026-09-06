@@ -129,6 +129,13 @@ export interface McpLoopbackOAuthCallbackOptions {
 	readonly hostname?: "127.0.0.1" | "localhost";
 	/** How long {@link McpLoopbackOAuthCallback.waitForCallback} waits. Default: 5 minutes. */
 	readonly timeoutMs?: number;
+	/**
+	 * Decides whether a callback carrying a `code` is the one being waited for — typically the
+	 * provider's `matchesIssuedState(params)`. A refused callback is answered 400 and the endpoint
+	 * keeps listening, so a stray or hostile local request cannot consume the round before the
+	 * genuine redirect arrives. Default: accept the first callback with a `code`.
+	 */
+	readonly accept?: (params: URLSearchParams) => boolean | Promise<boolean>;
 }
 
 /** A listening loopback redirect endpoint. Close it when the authorization attempt is over. */
@@ -188,8 +195,8 @@ export async function loopbackOAuthCallback(
 	let authorizationUrl: URL | undefined;
 	let closing: Promise<void> | undefined;
 
-	const server = createServer((request, response) => {
-		handleCallback(request, response, path, {
+	const onRequest = (request: IncomingMessage, response: ServerResponse): void => {
+		void handleCallback(request, response, path, options.accept, {
 			resolve: (params) => {
 				settle?.(params);
 				void close();
@@ -199,7 +206,10 @@ export async function loopbackOAuthCallback(
 				void close();
 			},
 		});
-	});
+	};
+	const server = createServer(onRequest);
+	// `localhost` may resolve to ::1 first; a second listener on the same port covers it.
+	let ipv6: Server | undefined;
 
 	const timer = setTimeout(() => {
 		fail?.(
@@ -223,10 +233,16 @@ export async function loopbackOAuthCallback(
 					"The loopback OAuth callback endpoint was closed before a callback arrived.",
 				),
 			);
-			await new Promise<void>((resolve) => {
-				server.close(() => resolve());
-				server.closeAllConnections();
-			});
+			await Promise.all(
+				[server, ipv6].map(
+					(listener) =>
+						new Promise<void>((resolve) => {
+							if (listener === undefined) return resolve();
+							listener.close(() => resolve());
+							listener.closeAllConnections();
+						}),
+				),
+			);
 		})();
 		return closing;
 	}
@@ -267,6 +283,16 @@ export async function loopbackOAuthCallback(
 			"The loopback OAuth callback server did not bind a TCP port.",
 		);
 	}
+	if (options.hostname === "localhost") {
+		// Best-effort: an IPv6-less host, or a port taken on ::1, keeps the IPv4 listener only.
+		const candidate = createServer(onRequest);
+		try {
+			await listen(candidate, address.port, "::1");
+			ipv6 = candidate;
+		} catch {
+			candidate.close();
+		}
+	}
 	const redirectUrl = new URL(`http://${options.hostname ?? "127.0.0.1"}:${address.port}${path}`);
 
 	return Object.freeze({
@@ -285,26 +311,42 @@ export async function loopbackOAuthCallback(
 	});
 }
 
-function listen(server: Server, port: number): Promise<void> {
+function listen(server: Server, port: number, host = "127.0.0.1"): Promise<void> {
 	return new Promise<void>((resolve, reject) => {
 		const onError = (error: unknown): void => reject(error);
 		server.once("error", onError);
-		server.listen(port, "127.0.0.1", () => {
+		server.listen(port, host, () => {
 			server.removeListener("error", onError);
 			resolve();
 		});
 	});
 }
 
-function handleCallback(
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/** Bounds and sanitizes authorization-server text (control characters become spaces). */
+function boundedText(text: string, max = 400): string {
+	// eslint-disable-next-line no-control-regex
+	const sanitized = text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+	return sanitized.length > max ? `${sanitized.slice(0, max)}…` : sanitized;
+}
+
+async function handleCallback(
 	request: IncomingMessage,
 	response: ServerResponse,
 	path: string,
+	accept: ((params: URLSearchParams) => boolean | Promise<boolean>) | undefined,
 	settlers: { resolve(params: URLSearchParams): void; reject(error: unknown): void },
-): void {
-	// Only loopback names may address this endpoint (DNS-rebinding defense).
-	const host = (request.headers.host ?? "").split(":")[0] ?? "";
-	if (host !== "127.0.0.1" && host !== "localhost" && host !== "[::1]") {
+): Promise<void> {
+	// Only loopback names may address this endpoint (DNS-rebinding defense). The `Host` header
+	// is parsed as an authority so a bracketed IPv6 literal keeps its brackets.
+	let hostname = "";
+	try {
+		hostname = new URL(`http://${request.headers.host ?? ""}`).hostname;
+	} catch {
+		hostname = "";
+	}
+	if (!LOOPBACK_HOSTNAMES.has(hostname)) {
 		respond(response, 403, "Forbidden", "This endpoint only accepts loopback requests.");
 		return;
 	}
@@ -313,12 +355,24 @@ function handleCallback(
 		respond(response, 404, "Not found", "This is not the OAuth callback endpoint.");
 		return;
 	}
+	// The redirect is a top-level navigation. A sub-resource load from another local page (an
+	// <img> pointing at this port, say) declares itself through the fetch metadata headers.
+	const mode = request.headers["sec-fetch-mode"];
+	const destination = request.headers["sec-fetch-dest"];
+	if (
+		request.method !== "GET" ||
+		(typeof mode === "string" && mode !== "navigate") ||
+		(typeof destination === "string" && destination !== "document")
+	) {
+		respond(response, 405, "Not allowed", "The OAuth callback must be a top-level navigation.");
+		return;
+	}
 
 	const error = url.searchParams.get("error");
 	if (error !== null) {
 		// `error_description` is authorization-server text. It reaches the host application as
-		// diagnostic detail only; nothing here reads it to make a decision.
-		const description = url.searchParams.get("error_description") ?? error;
+		// bounded diagnostic detail only; nothing here reads it to make a decision.
+		const description = boundedText(url.searchParams.get("error_description") ?? error);
 		respond(response, 200, "Authorization denied", "You may close this tab.", () => {
 			settlers.reject(
 				new KmcpError(
@@ -330,12 +384,28 @@ function handleCallback(
 		return;
 	}
 
-	if (url.searchParams.get("code") === null) {
+	const params = url.searchParams;
+	if (params.get("code") === null) {
 		respond(response, 400, "Missing authorization code", "This request carried no code parameter.");
 		return;
 	}
-
-	const params = url.searchParams;
+	if (accept !== undefined) {
+		let accepted = false;
+		try {
+			accepted = await accept(params);
+		} catch {
+			accepted = false;
+		}
+		if (!accepted) {
+			respond(
+				response,
+				400,
+				"Unexpected callback",
+				"This callback does not belong to the pending authorization.",
+			);
+			return;
+		}
+	}
 	respond(response, 200, "Authorization complete", "You may close this tab.", () => {
 		settlers.resolve(params);
 	});

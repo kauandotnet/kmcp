@@ -130,9 +130,13 @@ shortfall is scope-shaped.
 
 `McpOAuthClientProvider` implements the SDK's `OAuthClientProvider` and nothing more: the SDK owns
 discovery, registration, PKCE, the redirect, the exchange, the 401 retry and the 403 step-up. kmcp
-adds the three things the SDK leaves to hosts — issuing and verifying the callback `state`,
-refreshing an expiring token before a request fails (through the SDK's `refreshAuthorization`,
-single-flight, falling back to the 401 path on failure), and a non-secret `status()`. The
+adds the three things the SDK leaves to hosts — issuing and verifying the callback `state` (fail
+closed: no pending state means no callback is ours, and a state is spent on first use, as is the
+PKCE verifier once a round ends), refreshing an expiring token before a request fails (through the
+SDK's `refreshAuthorization`, single-flight, only on the provider's own reads, fenced against an
+`invalidateCredentials` that lands mid-refresh, falling back to the 401 path on failure), and a
+non-secret `status()`. Loopback callbacks accept top-level navigations from loopback hosts only, and
+every token or authorization endpoint the flows talk to must be `https` or loopback. The
 non-interactive grants reuse the SDK's providers verbatim (`clientCredentialsAuth`,
 `enterpriseManagedAuth`); `httpConnection` derives the capability extension to advertise from the
 provider's grant. Tasks are the one place kmcp speaks a wire vocabulary the SDK has no runtime for:

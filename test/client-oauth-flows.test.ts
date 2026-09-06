@@ -27,6 +27,8 @@ import {
 	jwtExpiresAt,
 	oauthGrantOf,
 	oauthServerUrl,
+	pinnedDiscoveryState,
+	refreshIdpTokens,
 	validateOAuthCredentials,
 	type McpIdpTokens,
 } from "../src/index.ts";
@@ -531,4 +533,243 @@ test("JWT helpers decode without verifying and reject malformed input", () => {
 	assert.equal(decodeJwtClaims("not-a-jwt"), undefined);
 	assert.equal(decodeJwtClaims("a.b.c"), undefined);
 	assert.equal(oauthServerUrl("https://mcp.example.com/mcp?x=1#y"), "https://mcp.example.com/mcp");
+});
+
+test("state verification fails closed: no pending state, a consumed state, and a non-consuming match", async () => {
+	const store = new InMemoryKeyValueStore();
+	const provider = new McpOAuthClientProvider({
+		serverUrl: SERVER_URL,
+		redirectUrl: "http://127.0.0.1:1/callback",
+		store,
+		onRedirect: () => undefined,
+	});
+	await assert.rejects(
+		provider.verifyCallbackState(new URLSearchParams({ code: "x" })),
+		(error: unknown) =>
+			error instanceof KmcpError && error.code === KMCP_ERROR_CODES.AUTH_STATE_MISMATCH,
+	);
+	const state = await provider.state();
+	assert.equal(await provider.matchesIssuedState(new URLSearchParams({ state })), true);
+	assert.equal(await provider.matchesIssuedState(new URLSearchParams({ state: "other" })), false);
+	assert.equal(await provider.matchesIssuedState(new URLSearchParams()), false);
+	await provider.verifyCallbackState(new URLSearchParams({ state }));
+	// One-time use: the same state cannot be presented twice.
+	await assert.rejects(
+		provider.verifyCallbackState(new URLSearchParams({ state })),
+		(error: unknown) =>
+			error instanceof KmcpError && error.code === KMCP_ERROR_CODES.AUTH_STATE_MISMATCH,
+	);
+	const off = new McpOAuthClientProvider({
+		serverUrl: SERVER_URL,
+		redirectUrl: "http://127.0.0.1:1/callback",
+		state: false,
+		onRedirect: () => undefined,
+	});
+	await off.verifyCallbackState(new URLSearchParams({ code: "x" }));
+	assert.equal(await off.matchesIssuedState(new URLSearchParams()), true);
+});
+
+test("a successful authorization discards the PKCE verifier and state", async () => {
+	const server = fakeAuthorizationServer();
+	const store = new InMemoryKeyValueStore();
+	let authorizationUrl: URL | undefined;
+	const provider = new McpOAuthClientProvider({
+		serverUrl: SERVER_URL,
+		redirectUrl: "http://127.0.0.1:1/callback",
+		store,
+		fetch: server.fetch,
+		onRedirect: (url) => {
+			authorizationUrl = url;
+		},
+	});
+	await authorizeOAuth(provider, {
+		serverUrl: SERVER_URL,
+		fetch: server.fetch,
+		waitForCallback: async () =>
+			new URLSearchParams({
+				code: "code-1",
+				state: authorizationUrl?.searchParams.get("state") ?? "",
+				iss: AS,
+			}),
+	});
+	assert.equal(await store.get(`${SERVER_URL}/code_verifier`), undefined);
+	assert.equal(await store.get(`${SERVER_URL}/state`), undefined);
+	assert.ok(await store.get(`${AS}/tokens`));
+});
+
+test("invalidating tokens clears every issuer ever written and fences an in-flight refresh", async () => {
+	const store = new InMemoryKeyValueStore();
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let now = Date.UTC(2026, 0, 1);
+	const provider = new McpOAuthClientProvider({
+		serverUrl: SERVER_URL,
+		redirectUrl: "http://127.0.0.1:1/callback",
+		clientId: "static-client",
+		store,
+		now: () => now,
+		fetch: async () => {
+			await gate;
+			return new Response(
+				JSON.stringify({ access_token: "late", token_type: "Bearer", expires_in: 3600 }),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		},
+		onRedirect: () => undefined,
+	});
+	const first = { issuer: "https://as-one.example.com" };
+	const second = { issuer: "https://as-two.example.com" };
+	await provider.saveTokens(
+		{ access_token: "a", token_type: "Bearer", refresh_token: "ra" },
+		first,
+	);
+	await provider.saveTokens(
+		{ access_token: "b", token_type: "Bearer", refresh_token: "rb" },
+		second,
+	);
+	await provider.invalidateCredentials("tokens");
+	assert.equal(await provider.tokens(first), undefined, "the earlier issuer's tokens are gone too");
+	assert.equal(await provider.tokens(second), undefined);
+
+	// A refresh that started before an invalidation must not re-persist what was dropped.
+	await provider.saveDiscoveryState({
+		authorizationServerUrl: second.issuer,
+		authorizationServerMetadata: {
+			issuer: second.issuer,
+			authorization_endpoint: `${second.issuer}/authorize`,
+			token_endpoint: `${second.issuer}/token`,
+			response_types_supported: ["code"],
+		},
+	});
+	await provider.saveTokens(
+		{ access_token: "old", token_type: "Bearer", expires_in: 1, refresh_token: "rb" },
+		second,
+	);
+	now += 10_000;
+	const refreshing = provider.tokens();
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	await provider.invalidateCredentials("tokens");
+	release();
+	const served = await refreshing;
+	assert.equal(served?.access_token, "late", "the caller still gets the fresh set");
+	assert.equal(await store.get(`${second.issuer}/tokens`), undefined, "but nothing was re-stored");
+	// A contextual read (the SDK's own auth() orchestration) never refreshes proactively.
+	await provider.saveTokens(
+		{ access_token: "old", token_type: "Bearer", expires_in: 1, refresh_token: "rb" },
+		second,
+	);
+	assert.equal((await provider.tokens(second))?.access_token, "old");
+});
+
+test("client credentials post form-encoded Basic credentials only to secure endpoints", async () => {
+	const seen: { url: string; authorization: string | undefined }[] = [];
+	const fetchFn: FetchLike = async (input, init) => {
+		const headers = new Headers(init?.headers);
+		seen.push({ url: String(input), authorization: headers.get("authorization") ?? undefined });
+		return new Response(JSON.stringify({ id_token: unsignedJwt({ sub: "s", exp: 9e9 }) }), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+	};
+	await refreshIdpTokens({
+		tokenEndpoint: "https://idp.example.com/token",
+		clientId: "id:with:colons",
+		clientSecret: "pässword:1",
+		refreshToken: "r",
+		fetch: fetchFn,
+	});
+	const header = seen[0]?.authorization ?? "";
+	assert.ok(header.startsWith("Basic "));
+	const decoded = Buffer.from(header.slice("Basic ".length), "base64").toString("utf8");
+	assert.equal(
+		decoded,
+		`${encodeURIComponent("id:with:colons")}:${encodeURIComponent("pässword:1")}`,
+	);
+	await assert.rejects(
+		refreshIdpTokens({
+			tokenEndpoint: "http://idp.example.com/token",
+			clientId: "c",
+			refreshToken: "r",
+			fetch: fetchFn,
+		}),
+		/https|secure|insecure/i,
+	);
+	// Loopback stays allowed for local development.
+	await refreshIdpTokens({
+		tokenEndpoint: "http://127.0.0.1:9/token",
+		clientId: "c",
+		refreshToken: "r",
+		fetch: fetchFn,
+	});
+	assert.equal(seen.length, 2);
+});
+
+test("the IdP sign-in refuses a plaintext authorization endpoint and an ID token without the nonce", async () => {
+	const plaintext: FetchLike = async (input) => {
+		if (String(input).includes("well-known")) {
+			return new Response(
+				JSON.stringify({
+					issuer: "https://idp.example.com",
+					authorization_endpoint: "http://idp.example.com/authorize",
+					token_endpoint: "https://idp.example.com/token",
+					response_types_supported: ["code"],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}
+		return new Response("nope", { status: 404 });
+	};
+	await assert.rejects(
+		authorizeEnterpriseIdp({
+			issuer: "https://idp.example.com",
+			clientId: "c",
+			redirectUrl: "http://127.0.0.1:1/callback",
+			fetch: plaintext,
+			onRedirect: () => undefined,
+			waitForCallback: async () => new URLSearchParams(),
+		}),
+		(error: unknown) =>
+			error instanceof KmcpError && error.code === KMCP_ERROR_CODES.AUTH_FORBIDDEN,
+	);
+	// The scenario server mints ID tokens without a nonce claim; that must be refused now.
+	const server = fakeAuthorizationServer();
+	let authorization: URL | undefined;
+	await assert.rejects(
+		authorizeEnterpriseIdp({
+			issuer: IDP,
+			clientId: "idp-client",
+			redirectUrl: "http://127.0.0.1:1/callback",
+			fetch: server.fetch,
+			onRedirect: (url) => {
+				authorization = url;
+			},
+			waitForCallback: async () =>
+				new URLSearchParams({
+					code: "idp-code",
+					state: authorization?.searchParams.get("state") ?? "",
+				}),
+		}),
+		(error: unknown) =>
+			error instanceof KmcpError && error.code === KMCP_ERROR_CODES.AUTH_STATE_MISMATCH,
+	);
+});
+
+test("pinned discovery state keeps the caller's issuer and explanations strip control characters", () => {
+	const pinned = pinnedDiscoveryState(
+		"https://x.okta.com/oauth2/default/v1/token",
+		"https://x.okta.com/oauth2/default",
+	);
+	assert.equal(pinned.authorizationServerUrl, "https://x.okta.com/oauth2/default");
+	assert.equal(pinned.authorizationServerMetadata?.issuer, "https://x.okta.com/oauth2/default");
+	assert.equal(
+		pinnedDiscoveryState("https://as.example.com/token").authorizationServerUrl,
+		"https://as.example.com",
+	);
+	assert.throws(() => pinnedDiscoveryState("http://as.example.com/token"));
+	const hostile = new OAuthError(OAuthErrorCode.ServerError, "bad\u001b[31m\nfake log line");
+	const explained = explainOAuthError(hostile);
+	assert.ok(!/[\u0000-\u001f]/.test(explained.message), "no control characters survive");
+	assert.ok(explained.message.includes("bad"));
 });

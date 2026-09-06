@@ -114,9 +114,9 @@ export function connectionsFromMcpConfig<const Config extends McpServersConfig>(
 		const timeoutMs = entryTimeoutMs(entry, id);
 		const base = {
 			...shared,
-			...(timeoutMs === undefined
-				? {}
-				: { defaults: { ...shared.defaults, timeoutMs: shared.defaults?.timeoutMs ?? timeoutMs } }),
+			// The entry's own `timeout` is the more specific value, so it wins; the loader's
+			// `defaults.timeoutMs` only fills in for entries that declare none.
+			...(timeoutMs === undefined ? {} : { defaults: { ...shared.defaults, timeoutMs } }),
 			...(entry.protocolVersion === undefined ? {} : { protocolVersion: entry.protocolVersion }),
 			id,
 			label: id,
@@ -359,6 +359,19 @@ export function standardMcpConfigPaths(
 	return Object.freeze(unique);
 }
 
+/**
+ * Errno codes that mean "there is no config file here", not "the file is broken": the path itself
+ * is missing (`ENOENT`), a path component is not a directory (`ENOTDIR`, e.g. `~/.cursor` is a
+ * file), or the candidate is a directory (`EISDIR`). Everything else — a permission denial, a
+ * dangling symlink loop, an I/O error — is a real access failure worth reporting.
+ */
+const ABSENT_CONFIG_CODES: ReadonlySet<string> = new Set(["ENOENT", "ENOTDIR", "EISDIR"]);
+
+function isAbsentConfig(error: unknown): boolean {
+	const code = (error as { code?: unknown }).code;
+	return typeof code === "string" && ABSENT_CONFIG_CODES.has(code);
+}
+
 /** A config found at a standard location, with its parsed content. */
 export interface McpDiscoveredConfig extends McpConfigCandidate {
 	readonly config: McpServersConfig;
@@ -388,7 +401,7 @@ export async function discoverMcpConfigs(
 		try {
 			raw = await readFile(candidate.path, "utf8");
 		} catch (error) {
-			if ((error as { code?: unknown }).code === "ENOENT") continue;
+			if (isAbsentConfig(error)) continue;
 			problems.push({ ...candidate, error: "unreadable" });
 			continue;
 		}

@@ -424,16 +424,22 @@ test("a mid-session authorization round is announced and completed on the live t
 		(event) => event.type === "connection.authorization.required",
 	);
 	assert.equal(required.connection.phase, "online", "the connection stays online during a step-up");
-	// The provider issued no state for this round, so any callback passes state verification.
 	await assert.rejects(
 		manager.completeAuthorization("live", new URLSearchParams({ error: "access_denied" })),
 		(error: unknown) =>
 			error instanceof KmcpError && error.code === KMCP_ERROR_CODES.AUTH_FORBIDDEN,
 	);
 	assert.equal(manager.state("live").phase, "online");
+	// A callback that carries no pending state is refused; the SDK issued one through state().
+	await assert.rejects(
+		manager.completeAuthorization("live", new URLSearchParams({ code: "forged" })),
+		(error: unknown) =>
+			error instanceof KmcpError && error.code === KMCP_ERROR_CODES.AUTH_STATE_MISMATCH,
+	);
+	const state = await provider.state();
 	const snapshot = await manager.completeAuthorization(
 		"live",
-		new URLSearchParams({ code: "c-1" }),
+		new URLSearchParams({ code: "c-1", state }),
 	);
 	assert.equal(snapshot.phase, "online");
 	assert.equal(finished.length, 1);

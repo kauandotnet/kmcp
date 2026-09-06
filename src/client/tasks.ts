@@ -33,18 +33,27 @@ export interface McpTaskUpdate {
 }
 
 export interface McpTaskPollOptions {
-	/** Delay between two `tasks/get` polls (ms). Default: 2000. */
+	/**
+	 * Delay between two `tasks/get` polls (ms). Absent: the server's own `task.pollInterval` from
+	 * the latest snapshot, re-read on every poll; absent there too, 2000.
+	 */
 	readonly pollIntervalMs?: number;
 	/** Called after every poll, including the terminal one. */
 	readonly onUpdate?: (update: McpTaskUpdate) => void;
+	/** Aborts the poll loop AND the task request in flight when it fires. */
 	readonly signal?: AbortSignal;
 	/** Per-request options applied to every task request. */
 	readonly request?: RequestOptions;
 }
 
-/** Extra params for a task-augmented `tools/call` (`task.ttl` is the requested retention, ms). */
+/**
+ * Extra params for a task-augmented `tools/call` (`task.ttl` is the requested retention, ms, and
+ * `task.pollInterval` the requested poll cadence, ms — both are hints the server may ignore).
+ */
 export interface McpCreateToolTaskOptions {
 	readonly ttlMs?: number;
+	/** Poll cadence to ask the server for, sent as `task.pollInterval` (ms). */
+	readonly pollIntervalMs?: number;
 	readonly meta?: Readonly<Record<string, unknown>>;
 	readonly request?: RequestOptions;
 }
@@ -127,7 +136,10 @@ export class McpTaskClient {
 		const params: Record<string, unknown> = {
 			name,
 			arguments: { ...arguments_ },
-			task: options.ttlMs === undefined ? {} : { ttl: options.ttlMs },
+			task: {
+				...(options.ttlMs === undefined ? {} : { ttl: options.ttlMs }),
+				...(options.pollIntervalMs === undefined ? {} : { pollInterval: options.pollIntervalMs }),
+			},
 		};
 		if (options.meta !== undefined) params._meta = { ...options.meta };
 		return (await this.#requester.request(
@@ -178,24 +190,33 @@ export class McpTaskClient {
 	 * Polls `tasks/get` until the task is terminal. A `completed` task resolves with its
 	 * `tasks/result`; `failed` and `cancelled` reject with {@link McpTaskFailedError}. An
 	 * `input_required` task delegates to `tasks/result`, which delivers the queued server
-	 * messages and blocks until the task settles.
+	 * messages and blocks until the task settles. `options.signal` aborts the loop AND the
+	 * request in flight.
 	 */
 	async waitForTask(taskId: string, options: McpTaskPollOptions = {}): Promise<CallToolResult> {
 		assertTasksAvailable(this.#requester);
-		const interval = options.pollIntervalMs ?? 2000;
-		if (!Number.isFinite(interval) || interval < 0) {
+		const requested = options.pollIntervalMs;
+		if (requested !== undefined && (!Number.isFinite(requested) || requested < 0)) {
 			throw new RangeError("pollIntervalMs must be a non-negative number.");
 		}
+		const signal = options.signal;
+		const request = withSignal(options.request, signal);
 		let pollCount = 0;
 		for (;;) {
-			throwIfAborted(options.signal);
-			const task = await this.getTask(taskId, options.request);
+			throwIfAborted(signal);
+			const task = await preferAbortReason(this.getTask(taskId, request), signal);
 			pollCount += 1;
 			options.onUpdate?.(toUpdate(task, pollCount));
-			if (task.status === "completed") return this.getTaskResult(taskId, options.request);
+			if (task.status === "completed") {
+				return preferAbortReason(this.getTaskResult(taskId, request), signal);
+			}
 			if (MCP_TASK_TERMINAL_STATUSES.has(task.status)) throw new McpTaskFailedError(task);
-			if (task.status === "input_required") return this.getTaskResult(taskId, options.request);
-			await sleep(interval, options.signal);
+			if (task.status === "input_required") {
+				return preferAbortReason(this.getTaskResult(taskId, request), signal);
+			}
+			// Re-read the cadence from the latest snapshot: a server may slow a long task down (or
+			// speed a nearly-done one up) between polls. An explicit caller value always wins.
+			await sleep(requested ?? serverPollInterval(task) ?? 2000, signal);
 		}
 	}
 
@@ -205,10 +226,48 @@ export class McpTaskClient {
 		arguments_: Readonly<Record<string, unknown>> = {},
 		options: McpCreateToolTaskOptions & McpTaskPollOptions = {},
 	): Promise<CallToolResult> {
-		const created = await this.createToolTask(name, arguments_, options);
+		const request = withSignal(options.request, options.signal);
+		const created = await preferAbortReason(
+			this.createToolTask(name, arguments_, {
+				...options,
+				...(request === undefined ? {} : { request }),
+			}),
+			options.signal,
+		);
 		options.onUpdate?.(toUpdate(created.task, 0));
 		return this.waitForTask(created.task.taskId, options);
 	}
+}
+
+/**
+ * Prefers the caller's own abort reason over whatever the SDK raised. Forwarding the signal into
+ * the request is what makes an abort land promptly instead of at the end of a poll interval, but
+ * the SDK reports the cancellation as its own transport error; a caller who supplied a reason
+ * should still see that reason.
+ */
+async function preferAbortReason<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	try {
+		return await work;
+	} catch (error) {
+		throwIfAborted(signal);
+		throw error;
+	}
+}
+
+/** Per-request options carrying the caller's abort signal (the SDK aborts the in-flight request). */
+function withSignal(
+	request: RequestOptions | undefined,
+	signal: AbortSignal | undefined,
+): RequestOptions | undefined {
+	if (signal === undefined) return request;
+	return { ...request, signal };
+}
+
+/** A `task.pollInterval` a server may be trusted with: a finite, non-negative number of ms. */
+function serverPollInterval(task: Task): number | undefined {
+	const interval = task.pollInterval;
+	if (typeof interval !== "number" || !Number.isFinite(interval) || interval < 0) return undefined;
+	return interval;
 }
 
 function toUpdate(task: Task, pollCount: number): McpTaskUpdate {
@@ -222,21 +281,30 @@ function toUpdate(task: Task, pollCount: number): McpTaskUpdate {
 	});
 }
 
+function abortReason(signal: AbortSignal | undefined): unknown {
+	return signal?.reason ?? new DOMException("The operation was aborted.", "AbortError");
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
-	if (signal?.aborted === true) {
-		throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
-	}
+	if (signal?.aborted === true) throw abortReason(signal);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
+		// An `abort` listener never fires on a signal that is ALREADY aborted, so a signal that
+		// fired while the previous `tasks/get` was in flight has to be answered here directly —
+		// otherwise the loop waits out a whole poll interval before noticing.
+		if (signal?.aborted === true) {
+			reject(abortReason(signal));
+			return;
+		}
 		const timer = setTimeout(() => {
 			signal?.removeEventListener("abort", onAbort);
 			resolve();
 		}, ms);
 		const onAbort = (): void => {
 			clearTimeout(timer);
-			reject(signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+			reject(abortReason(signal));
 		};
 		signal?.addEventListener("abort", onAbort, { once: true });
 	});

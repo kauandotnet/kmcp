@@ -103,7 +103,11 @@ export interface McpResourceFileSync extends AsyncDisposable {
 	readonly lastError: unknown;
 	/** Successful writes so far. */
 	readonly syncs: number;
-	/** Re-reads and rewrites now (coalesced with any in-flight sync). */
+	/**
+	 * Re-reads and rewrites now, resolving on a read taken no earlier than this call. Concurrent
+	 * callers coalesce into ONE follow-up run rather than joining the read already in flight. A
+	 * no-op after `stop()`.
+	 */
 	sync(): Promise<void>;
 	/** Stops following updates and drops the subscription; the file is kept. */
 	stop(): Promise<void>;
@@ -128,7 +132,8 @@ export async function syncResourceToFile<Id extends string>(
 	let lastError: unknown;
 	let syncs = 0;
 	let inFlight: Promise<void> | undefined;
-	let pending = false;
+	let pending: PromiseWithResolvers<void> | undefined;
+	let resubscribing: Promise<void> | undefined;
 	let stopped = false;
 
 	const write = async (): Promise<void> => {
@@ -141,9 +146,12 @@ export async function syncResourceToFile<Id extends string>(
 	};
 
 	const run = (): Promise<void> => {
+		if (stopped) return Promise.resolve();
 		if (inFlight !== undefined) {
-			pending = true;
-			return inFlight;
+			// The in-flight read was taken BEFORE this caller asked, so its result cannot answer
+			// them. Hand back the coalesced follow-up instead, which reads after this moment.
+			pending ??= Promise.withResolvers<void>();
+			return pending.promise;
 		}
 		inFlight = write()
 			.catch((error: unknown) => {
@@ -152,10 +160,12 @@ export async function syncResourceToFile<Id extends string>(
 			})
 			.finally(() => {
 				inFlight = undefined;
-				if (pending && !stopped) {
-					pending = false;
-					void run();
-				}
+				const waiting = pending;
+				pending = undefined;
+				if (waiting === undefined) return;
+				// Not awaited: the follow-up must not extend the run its waiters are chained off.
+				const settle = (): void => waiting.resolve();
+				void run().then(settle, settle);
 			});
 		return inFlight;
 	};
@@ -184,10 +194,17 @@ export async function syncResourceToFile<Id extends string>(
 			event.connection.generation !== generation
 		) {
 			generation = event.connection.generation;
-			void manager
+			// Held so `stop()` can await it: the re-subscribe resolves on the manager's turn, and
+			// without the handle a `stop()` in between would rewrite the file and strand the
+			// server-side subscription this call just opened.
+			resubscribing = manager
 				.subscribeResource(id, uri)
-				.then(() => run())
+				.then(async () => {
+					if (stopped) return;
+					await run();
+				})
 				.catch((error: unknown) => {
+					if (stopped) return;
 					lastError = error;
 					options.onError?.(error);
 				});
@@ -199,6 +216,7 @@ export async function syncResourceToFile<Id extends string>(
 		stopped = true;
 		unsubscribe();
 		await inFlight?.catch(() => undefined);
+		await resubscribing?.catch(() => undefined);
 		const phase = safeState(manager, id)?.phase;
 		if (phase === "online" || phase === "degraded") {
 			await manager.unsubscribeResource(id, uri).catch(() => undefined);

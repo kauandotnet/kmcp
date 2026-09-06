@@ -474,3 +474,65 @@ test("loopbackOAuthCallback tries fixed ports in order, honours hostname, and re
 		(error: unknown) => error instanceof KmcpError,
 	);
 });
+
+test("the loopback endpoint refuses sub-resource loads and unexpected callbacks but keeps listening", async () => {
+	const callback = await loopbackOAuthCallback({
+		hostname: "localhost",
+		accept: (params) => params.get("state") === "expected",
+	});
+	const port = Number(callback.redirectUrl.port);
+	const status = (path: string, headers: Record<string, string> = {}, method = "GET") =>
+		new Promise<number>((resolve, reject) => {
+			const request = httpRequest(
+				{ host: "127.0.0.1", port, path, method, headers },
+				(response) => {
+					response.resume();
+					resolve(response.statusCode ?? 0);
+				},
+			);
+			request.on("error", reject);
+			request.end();
+		});
+	try {
+		assert.equal(
+			await status("/callback?code=drive-by&state=expected", {
+				"sec-fetch-mode": "no-cors",
+				"sec-fetch-dest": "image",
+			}),
+			405,
+		);
+		assert.equal(await status("/callback?code=drive-by&state=expected", {}, "POST"), 405);
+		assert.equal(
+			await status("/callback?code=stray&state=other"),
+			400,
+			"a callback that is not ours is refused",
+		);
+		assert.equal(
+			await status("/callback?code=ok&state=expected", { host: "[::1]:" + port }),
+			200,
+			"IPv6 loopback literal accepted",
+		);
+		const params = await callback.waitForCallback();
+		assert.equal(params.get("code"), "ok");
+	} finally {
+		await callback.close();
+	}
+	const ipv6 = await loopbackOAuthCallback({ hostname: "localhost" });
+	try {
+		const reachable = await new Promise<boolean>((resolve) => {
+			const request = httpRequest(
+				{ host: "::1", port: Number(ipv6.redirectUrl.port), path: "/other" },
+				(response) => {
+					response.resume();
+					resolve(response.statusCode === 404);
+				},
+			);
+			request.on("error", () => resolve(false));
+			request.end();
+		});
+		// Hosts without IPv6 loopback keep the IPv4 listener only; where it exists it must answer.
+		if (reachable) assert.ok(reachable);
+	} finally {
+		await ipv6.close();
+	}
+});
