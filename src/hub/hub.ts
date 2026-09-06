@@ -716,7 +716,8 @@ export class McpHubManager<
 	}
 
 	#onConnectionEvent(event: McpConnectionEvent<ConnectionId>): void {
-		if (this.#closed) return;
+		// Diagnostics never change a member's phase or catalog, so they are not a topology change.
+		if (this.#closed || event.type === "connection.error") return;
 		for (const hub of this.#hubs.values()) {
 			if (hub.members.some((member) => member.connectionId === event.connection.id)) {
 				if (event.type === "connection.removed") {

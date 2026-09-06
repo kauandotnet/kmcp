@@ -111,6 +111,21 @@ export interface McpWatchSnapshot {
 /** Whether the connection carries server-side session state (derived from transport and session id). */
 export type McpConnectionMode = "stateful" | "stateless";
 
+/**
+ * One SDK-level failure the manager observed on a connection's client or transport (a malformed
+ * message, a stream error that did not close the transport, reconnect noise). Non-secret and
+ * bounded: `message` is stripped of control characters and capped, and never carries headers,
+ * tokens or request bodies.
+ */
+export interface McpConnectionDiagnostic {
+	readonly at: string;
+	readonly kind: McpErrorDetail["kind"];
+	readonly code?: string;
+	readonly message: string;
+	/** The generation that was current when the error arrived (`0` before the first connect). */
+	readonly generation: number;
+}
+
 export interface McpKeepaliveSnapshot {
 	/** Consecutive failed probes. */
 	readonly failures: number;
@@ -144,6 +159,12 @@ export interface McpConnectionSnapshot<Id extends string = string> {
 	readonly logLevel?: LoggingLevel;
 	readonly errorCode?: string;
 	readonly errorDetail?: McpErrorDetail;
+	/**
+	 * The most recent SDK-level failures observed on this connection's client or transport, oldest
+	 * first, bounded by the manager's `diagnostics.keep` (default 20). They are diagnostics only:
+	 * none of them changed the phase by itself. Absent while nothing has been recorded.
+	 */
+	readonly diagnostics?: readonly McpConnectionDiagnostic[];
 	readonly watch?: McpWatchSnapshot;
 	readonly keepalive?: McpKeepaliveSnapshot;
 	/** URIs with an active `resources/subscribe` on the current generation (sorted). */
@@ -164,6 +185,7 @@ export type McpConnectionEventType =
 	| "catalog.failed"
 	| "catalog.refreshed"
 	| "connection.authorization.required"
+	| "connection.error"
 	| "connection.keepalive.failed"
 	| "connection.listen.dropped"
 	| "connection.listen.reopened"
@@ -182,6 +204,12 @@ export interface McpConnectionEvent<Id extends string = string> {
 	readonly connection: McpConnectionSnapshot<Id>;
 	/** Present only on `resource.updated`: the URI the upstream reported as changed. */
 	readonly resource?: Readonly<{ uri: string }>;
+	/**
+	 * Present only on `connection.error`: the SDK-level failure that was observed, classified and
+	 * bounded. The connection's id and generation ride on `connection`; the timestamp on
+	 * `occurredAt`. The phase did not change because of it.
+	 */
+	readonly error?: McpConnectionDiagnostic;
 }
 
 export type McpConnectionListener<Id extends string = string> = (
@@ -203,6 +231,36 @@ export interface McpConnectionManagerOptions {
 	readonly terminateSessionTimeoutMs?: number;
 	readonly now?: () => number;
 	readonly onListenerError?: (error: unknown, event: McpConnectionEvent) => MaybePromise<void>;
+	/**
+	 * The per-connection ring of SDK-level diagnostics kept on the snapshot. `keep` bounds it
+	 * (default 20); `false` keeps no ring at all — `connection.error` and `onError` still fire, so a
+	 * host that streams the events into its own log pays nothing for the snapshot copy.
+	 */
+	readonly diagnostics?: Readonly<{ keep: number }> | false;
+	/**
+	 * Called for every SDK-level failure the manager observed on a connection's client or transport,
+	 * with the ORIGINAL error (the snapshot and the event carry only the bounded, non-secret form).
+	 * Mirrors the server's `onerror`: best-effort, never awaited, and its own failures are swallowed.
+	 */
+	readonly onError?: (id: string, error: unknown) => MaybePromise<void>;
+}
+
+/** Options for {@link McpConnectionManager.reconcile}. */
+export interface McpReconcileOptions {
+	/** Remove connections that the supplied set no longer names. Default: `true`. */
+	readonly remove?: boolean;
+}
+
+/** What {@link McpConnectionManager.reconcile} did, as id lists in the order the work was applied. */
+export interface McpReconcileResult<Id extends string = string> {
+	/** Newly registered — and deliberately NOT connected: the caller decides when they come up. */
+	readonly added: readonly Id[];
+	/** Swapped through `replace`, keeping the connect state they had. */
+	readonly replaced: readonly Id[];
+	/** Already registered with an equivalent definition; left untouched, generation included. */
+	readonly unchanged: readonly Id[];
+	/** Disconnected and unregistered. Empty when `remove: false`. */
+	readonly removed: readonly Id[];
 }
 
 /** Optional stale-work fences for an operation admitted to an already-online connection. */
@@ -399,8 +457,18 @@ interface ListenWatchState {
 	reopens: number;
 }
 
+/**
+ * The dedupe/staleness window one connect attempt owns. `client.onerror` and `transport.onerror`
+ * see the SAME error object for a transport-raised failure (the SDK chains a pre-set handler and
+ * then calls its own), so the set collapses them to one report; comparing the scope by identity
+ * also silences a transport that keeps talking after its generation was abandoned.
+ */
+interface ErrorScope {
+	readonly seen: WeakSet<object>;
+}
+
 interface ManagedConnection<Id extends string> {
-	readonly definition: McpConnectionDefinition<Id>;
+	definition: McpConnectionDefinition<Id>;
 	phase: McpConnectionPhase;
 	generation: number;
 	activeOperations: number;
@@ -418,6 +486,10 @@ interface ManagedConnection<Id extends string> {
 	connectTask?: Promise<McpConnectionSnapshot<Id>>;
 	disconnectTask?: Promise<McpConnectionSnapshot<Id>>;
 	removeTask?: Promise<void>;
+	/** Serializes `replace` on this id: a second swap queues behind the one in flight. */
+	swapTask?: Promise<McpConnectionSnapshot<Id>>;
+	errorScope?: ErrorScope;
+	diagnostics?: McpConnectionDiagnostic[];
 	quarantinedCleanup?: () => Promise<void>;
 	pendingAuthorization?: PendingAuthorization;
 	discover?: DiscoverResult;
@@ -460,6 +532,8 @@ const CATALOG_SECTIONS: readonly McpCatalogCapability[] = Object.freeze([
 const LISTEN_REOPEN_INITIAL_MS = 1000;
 const LISTEN_REOPEN_MAX_MS = 30_000;
 const MAX_SUPPORTED_VERSIONS = 32;
+const DEFAULT_DIAGNOSTICS_KEEP = 20;
+const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 512;
 
 export class McpConnectionManager<Id extends string = string> implements AsyncDisposable {
 	readonly #entries = new Map<Id, ManagedConnection<Id>>();
@@ -471,6 +545,8 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	readonly #now: () => number;
 	readonly #onListenerError:
 		((error: unknown, event: McpConnectionEvent<Id>) => MaybePromise<void>) | undefined;
+	readonly #onError: ((id: string, error: unknown) => MaybePromise<void>) | undefined;
+	readonly #diagnosticsKeep: number;
 	#revision = 0;
 	#generationSequence = 0;
 	#closed = false;
@@ -509,6 +585,14 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		);
 		this.#now = safeClock(options.now ?? Date.now);
 		this.#onListenerError = options.onListenerError;
+		this.#onError = options.onError;
+		this.#diagnosticsKeep =
+			options.diagnostics === false
+				? 0
+				: positiveInteger(
+						options.diagnostics?.keep ?? DEFAULT_DIAGNOSTICS_KEEP,
+						"diagnostics.keep",
+					);
 	}
 
 	register(definition: McpConnectionDefinition<Id>): McpConnectionSnapshot<Id> {
@@ -536,6 +620,126 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		this.#entries.set(definition.id, entry);
 		this.#publish("connection.registered", entry);
 		return this.#snapshotEntry(entry);
+	}
+
+	/**
+	 * Swaps the definition registered under `definition.id` — a host applying a config edit to one
+	 * server without losing its identity, its diagnostics or its place in the snapshot.
+	 *
+	 * - Registered as `offline` or `failed`: swapped in place, staying down (a recorded failure
+	 *   belonged to the OLD definition, so it is cleared).
+	 * - Live (`online`, `degraded`, `authorizing`, or a connect/disconnect still settling):
+	 *   disconnected first — draining in-flight work exactly as `disconnect` does — then swapped,
+	 *   then reconnected only if it was `online`, on a NEW generation talking to the new server.
+	 * - `quarantined`: refused; the failed cleanup has to be resolved (`disconnect`) first.
+	 *
+	 * A definition equivalent to the registered one (same `fingerprint` when the definition exposes
+	 * one, else the same object) is a no-op. Concurrent swaps on one id serialize.
+	 */
+	replace(definition: McpConnectionDefinition<Id>): Promise<McpConnectionSnapshot<Id>> {
+		this.#assertOpen();
+		if (!(definition instanceof McpConnectionDefinition)) {
+			throw new TypeError("replace requires an McpConnectionDefinition.");
+		}
+		const entry = this.#entry(definition.id);
+		const previous = entry.swapTask;
+		const task = (async () => {
+			await previous?.catch(() => undefined);
+			this.#assertOpen();
+			if (this.#entries.get(definition.id) !== entry) {
+				throw new KmcpError(
+					KMCP_ERROR_CODES.CONNECTION_UNKNOWN,
+					`Unknown connection '${definition.id}'.`,
+				);
+			}
+			if (sameDefinition(entry.definition, definition)) return this.#snapshotEntry(entry);
+			return this.#performReplace(entry, definition);
+		})();
+		entry.swapTask = task;
+		void task
+			.catch(() => undefined)
+			.then(() => {
+				if (entry.swapTask === task) delete entry.swapTask;
+			});
+		return task;
+	}
+
+	/**
+	 * Applies a whole desired set of definitions at once — the operation a host performs when the
+	 * user edits their server list: registers what is new (WITHOUT connecting it, so the caller
+	 * decides when it comes up), `replace`s what changed (keeping the connect state), leaves
+	 * equivalent entries completely untouched (generation included), and removes what the set no
+	 * longer names unless `remove: false`.
+	 *
+	 * Reconnecting a replaced connection is best-effort: a server that is down afterwards is left in
+	 * the `failed` phase with its reason on the snapshot and still counted under `replaced`, exactly
+	 * as `connectAll` without `atomic` reports one bad member. Failures that leave the registry
+	 * inconsistent (a quarantined entry, a close that did not complete) are collected and thrown as
+	 * an `AggregateError` once every other step has been attempted.
+	 */
+	async reconcile(
+		definitions: readonly McpConnectionDefinition<Id>[],
+		options: McpReconcileOptions = {},
+	): Promise<McpReconcileResult<Id>> {
+		this.#assertOpen();
+		const desired = new Map<Id, McpConnectionDefinition<Id>>();
+		for (const definition of definitions) {
+			if (!(definition instanceof McpConnectionDefinition)) {
+				throw new TypeError("reconcile requires McpConnectionDefinition values.");
+			}
+			if (desired.has(definition.id)) {
+				throw new KmcpError(
+					KMCP_ERROR_CODES.CONNECTION_DUPLICATE,
+					`Connection '${definition.id}' appears twice in the reconciled set.`,
+				);
+			}
+			desired.set(definition.id, definition);
+		}
+		const added: Id[] = [];
+		const replaced: Id[] = [];
+		const unchanged: Id[] = [];
+		const removed: Id[] = [];
+		const failures: unknown[] = [];
+		// Removals run first so the capacity they free is available to the additions below.
+		if (options.remove !== false) {
+			for (const id of [...this.#entries.keys()]) {
+				if (desired.has(id)) continue;
+				try {
+					await this.remove(id);
+					removed.push(id);
+				} catch (error) {
+					failures.push(error);
+				}
+			}
+		}
+		for (const [id, definition] of desired) {
+			const entry = this.#entries.get(id);
+			try {
+				if (entry === undefined) {
+					this.register(definition);
+					added.push(id);
+				} else if (sameDefinition(entry.definition, definition)) {
+					unchanged.push(id);
+				} else {
+					await this.replace(definition).catch((error: unknown) => {
+						// The swap itself landed whenever the failure is only the reconnect's verdict.
+						if (!isReconnectVerdict(error)) throw error;
+					});
+					replaced.push(id);
+				}
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length > 0) {
+			throw new AggregateError(failures, `${failures.length} connections failed to reconcile.`);
+		}
+		return Object.freeze({
+			added: Object.freeze(added),
+			replaced: Object.freeze(replaced),
+			unchanged: Object.freeze(unchanged),
+			removed: Object.freeze(removed),
+		});
 	}
 
 	remove(id: Id): Promise<void> {
@@ -1828,6 +2032,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	async #performConnect(entry: ManagedConnection<Id>): Promise<McpConnectionSnapshot<Id>> {
 		if (entry.activeOperations > 0) await this.#waitUntilDrained(entry);
 		this.#transition(entry, "connecting");
+		// A fresh dedupe/staleness window per attempt: whatever the abandoned transport of the
+		// previous attempt still emits is no longer this connection's story.
+		const scope: ErrorScope = { seen: new WeakSet() };
+		entry.errorScope = scope;
 		let transport: Transport | undefined;
 		let session: McpClientSession<Id> | undefined;
 		const definition = entry.definition;
@@ -1837,6 +2045,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		const resuming = definition.resumePending;
 		try {
 			transport = await definition.openTransport();
+			// Armed BEFORE `client.connect`, which chains a pre-set `transport.onerror` ahead of its
+			// own: that covers the probe/handshake window too, where the client is not attached yet.
+			this.#watchErrors(entry, scope, transport);
 			let liveSession: McpClientSession<Id> | undefined;
 			const listChanged = this.#listChangedHandlers(entry, () => liveSession);
 			const client = this.#createClient(entry, resuming, {
@@ -1848,6 +2059,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					});
 				},
 			});
+			this.#watchErrors(entry, scope, client);
 			session = new McpClientSession(definition.id, client);
 			liveSession = session;
 			const closingSession = session;
@@ -1996,6 +2208,8 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		delete entry.session;
 		delete entry.transport;
 		delete entry.connectedAt;
+		// The generation is over: whatever the dead transport still emits is not this connection's.
+		delete entry.errorScope;
 		// The stream belongs to the dead client; closing it would only talk to a closed transport.
 		// Dropping the handle keeps `#watchListen` free to arm for the next session.
 		delete entry.listen;
@@ -2459,6 +2673,109 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		delete entry.listenWatch;
 	}
 
+	/**
+	 * Routes every SDK-level failure of one generation's transport or client into `#reportError`,
+	 * chaining any handler already installed (a definition's `configureClient` may set one; the SDK
+	 * chains the transport's own inside `Protocol.connect`). Reporting runs FIRST so a throwing
+	 * downstream handler cannot swallow the diagnostic, and behaves exactly as it did before
+	 * otherwise.
+	 */
+	#watchErrors(
+		entry: ManagedConnection<Id>,
+		scope: ErrorScope,
+		target: { onerror?: ((error: Error) => void) | undefined },
+	): void {
+		const existing = target.onerror;
+		target.onerror = (error: Error) => {
+			this.#reportError(entry, scope, error);
+			existing?.(error);
+		};
+	}
+
+	/**
+	 * The one path every observed SDK-level error takes. It announces `connection.error`, keeps the
+	 * bounded ring the snapshot exposes, and calls `onError` with the original error — and it never
+	 * throws, never changes the phase and never schedules anything. A transport that goes on to
+	 * close still reaches `#handleUnexpectedClose` through its own `onclose`, which is what actually
+	 * fails the connection.
+	 */
+	#reportError(entry: ManagedConnection<Id>, scope: ErrorScope, error: unknown): void {
+		// A generation whose window is closed no longer speaks for this connection.
+		if (entry.errorScope !== scope) return;
+		if (typeof error === "object" && error !== null) {
+			if (scope.seen.has(error)) return;
+			scope.seen.add(error);
+		}
+		try {
+			const detail = describeError(error);
+			const diagnostic: McpConnectionDiagnostic = Object.freeze({
+				at: isoTimestamp(this.#now),
+				kind: detail.kind,
+				code: String(detail.code).slice(0, 64),
+				message: diagnosticMessage(error),
+				generation: entry.generation,
+			});
+			if (this.#diagnosticsKeep > 0) {
+				const ring = entry.diagnostics ?? (entry.diagnostics = []);
+				ring.push(diagnostic);
+				if (ring.length > this.#diagnosticsKeep) {
+					ring.splice(0, ring.length - this.#diagnosticsKeep);
+				}
+			}
+			this.#publish("connection.error", entry, { error: diagnostic });
+		} catch {
+			// A diagnostic is never the reason a connection breaks.
+		}
+		try {
+			void Promise.resolve(this.#onError?.(entry.definition.id, error)).catch(() => undefined);
+		} catch {
+			// The host's error hook is deliberately best-effort, like `onListenerError`.
+		}
+	}
+
+	async #performReplace(
+		entry: ManagedConnection<Id>,
+		definition: McpConnectionDefinition<Id>,
+	): Promise<McpConnectionSnapshot<Id>> {
+		const id = definition.id;
+		if (entry.phase === "quarantined") {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.CONNECTION_QUARANTINED,
+				`Connection '${id}' is quarantined after a cleanup failure; disconnect it before replacing it.`,
+			);
+		}
+		if (entry.removeTask !== undefined) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE,
+				`Connection '${id}' is being removed.`,
+			);
+		}
+		// Let a connect already in flight settle: the state this swap preserves must be the real one.
+		if (entry.connectTask !== undefined) await entry.connectTask.catch(() => undefined);
+		const wasOnline = entry.phase === "online";
+		if (entry.phase !== "offline" && entry.phase !== "failed") await this.disconnect(id);
+		if (this.#entries.get(id) !== entry) {
+			throw new KmcpError(KMCP_ERROR_CODES.CONNECTION_UNKNOWN, `Unknown connection '${id}'.`);
+		}
+		entry.definition = definition;
+		// Everything derived from the OLD definition goes with it: the cached era verdict belongs to
+		// the previous endpoint, the recorded failure to the previous server, and so do the
+		// diagnostics a host renders under this id.
+		delete entry.discover;
+		delete entry.errorCode;
+		delete entry.errorDetail;
+		delete entry.diagnostics;
+		delete entry.errorScope;
+		if (definition.logLevel === undefined) delete entry.logLevel;
+		else entry.logLevel = definition.logLevel;
+		this.#cancelReconnectTimer(entry);
+		delete entry.reconnect;
+		if (entry.phase === "failed") this.#transition(entry, "offline");
+		this.#publish("connection.registered", entry);
+		if (!wasOnline) return this.#snapshotEntry(entry);
+		return this.connect(id);
+	}
+
 	async #performRemove(entry: ManagedConnection<Id>): Promise<void> {
 		await this.disconnect(entry.definition.id);
 		if (this.#entries.get(entry.definition.id) !== entry) return;
@@ -2531,6 +2848,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			await this.#bounded(session.close(), entry.definition.disconnectTimeoutMs, "close");
 			delete entry.session;
 			delete entry.transport;
+			delete entry.errorScope;
 			entry.resumed = false;
 			delete entry.connectedAt;
 			delete entry.errorCode;
@@ -2674,7 +2992,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	#publish(
 		type: McpConnectionEventType,
 		entry: ManagedConnection<Id>,
-		extra: Pick<McpConnectionEvent<Id>, "resource"> = {},
+		extra: Pick<McpConnectionEvent<Id>, "error" | "resource"> = {},
 	): void {
 		this.#revision += 1;
 		const event: McpConnectionEvent<Id> = Object.freeze({
@@ -2683,6 +3001,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			occurredAt: isoTimestamp(this.#now),
 			connection: this.#snapshotEntry(entry),
 			...(extra.resource === undefined ? {} : { resource: extra.resource }),
+			...(extra.error === undefined ? {} : { error: extra.error }),
 		});
 		for (const listener of this.#listeners) {
 			try {
@@ -2748,6 +3067,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			...(entry.logLevel === undefined ? {} : { logLevel: entry.logLevel }),
 			...(entry.errorCode === undefined ? {} : { errorCode: entry.errorCode }),
 			...(entry.errorDetail === undefined ? {} : { errorDetail: entry.errorDetail }),
+			...(entry.diagnostics === undefined || entry.diagnostics.length === 0
+				? {}
+				: { diagnostics: Object.freeze([...entry.diagnostics]) }),
 			...(watch === undefined ? {} : { watch }),
 			...(keepalive === undefined
 				? {}
@@ -2926,6 +3248,59 @@ export function describeError(error: unknown): McpErrorDetail {
 	if (network !== undefined) return { kind: "network", code: network };
 	if (error instanceof KmcpError) return { kind: "kmcp", code: error.code };
 	return { kind: "unknown", code: error instanceof Error ? error.name : typeof error };
+}
+
+const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F-\u009F]+/g;
+
+/**
+ * The bounded, non-secret summary a diagnostic carries. Upstream text reaches this unfiltered, so
+ * control characters are collapsed (no terminal escapes in a host's log) and the result is capped.
+ */
+function diagnosticMessage(error: unknown): string {
+	let raw: string;
+	try {
+		raw =
+			error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
+	} catch {
+		raw = "";
+	}
+	const cleaned = raw.replace(CONTROL_CHARACTERS, " ").trim();
+	if (cleaned.length === 0) return error instanceof Error ? error.name : "Unknown error.";
+	return cleaned.length > MAX_DIAGNOSTIC_MESSAGE_LENGTH
+		? `${cleaned.slice(0, MAX_DIAGNOSTIC_MESSAGE_LENGTH - 1)}…`
+		: cleaned;
+}
+
+/**
+ * Whether two definitions describe the same connection for `replace`/`reconcile`: the same object,
+ * or the same `fingerprint` when a definition exposes one. Definitions carry live closures
+ * (transport factories, request handlers), so there is no structural comparison to fall back on.
+ */
+function sameDefinition(
+	left: McpConnectionDefinition<string>,
+	right: McpConnectionDefinition<string>,
+): boolean {
+	if (left === right) return true;
+	const leftPrint = definitionFingerprint(left);
+	return leftPrint !== undefined && leftPrint === definitionFingerprint(right);
+}
+
+function definitionFingerprint(definition: McpConnectionDefinition<string>): string | undefined {
+	const value = (definition as { readonly fingerprint?: unknown }).fingerprint;
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Whether a failure is only the reconnect's verdict — the swap itself landed and the entry now
+ * holds the new definition. A close that failed (`CONNECTION_CLOSE_FAILED`, i.e. a quarantine) is
+ * deliberately NOT one of these: it happens before the swap, so nothing was replaced.
+ */
+function isReconnectVerdict(error: unknown): boolean {
+	const code = errorCode(error);
+	return (
+		code === KMCP_ERROR_CODES.CONNECTION_CONNECT_FAILED ||
+		code === KMCP_ERROR_CODES.CONNECTION_AUTHORIZING
+	);
 }
 
 function deepNetworkErrorCode(error: unknown): string | undefined {

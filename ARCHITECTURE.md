@@ -106,7 +106,9 @@ The manager guarantees:
     list verbs answer empty when capabilities are unknown), and strict capability enforcement is off
     for that definition.
 
-The present implementation is process-local. Durable desired state and cross-process ownership must
+The present implementation is process-local. `replace` and `reconcile` apply a desired set of
+definitions to the registry (swap under an id, add without connecting, remove after draining;
+unchanged entries keep their generation), but durable desired state and cross-process ownership must
 not be inferred from these guarantees.
 
 ## Auth model

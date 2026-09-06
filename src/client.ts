@@ -74,11 +74,14 @@ export {
 	oauthGrantOf,
 	oauthServerUrl,
 	pinnedDiscoveryState,
+	probeServerAuth,
 	refreshIdpTokens,
 	serverAcceptsIdJag,
+	suggestAuth,
 	validateOAuthCredentials,
 } from "./client/oauth-flows.ts";
 export type {
+	McpAuthSuggestion,
 	McpAuthorizeOAuthOptions,
 	McpAuthorizeOAuthResult,
 	McpClientCredentialsOptions,
@@ -89,7 +92,19 @@ export type {
 	McpOAuthFailure,
 	McpOAuthFailureKind,
 	McpOAuthGrant,
+	McpOAuthGrantType,
+	McpOAuthRegistrationSupport,
+	McpProbeServerAuthOptions,
 	McpRefreshIdpTokensOptions,
+	McpServerAuthProbe,
+	McpServerAuthProbeBearer,
+	McpServerAuthProbeCommon,
+	McpServerAuthProbeError,
+	McpServerAuthProbeNotMcp,
+	McpServerAuthProbeOAuth,
+	McpServerAuthProbeOpen,
+	McpServerAuthProbeRedirect,
+	McpServerAuthProbeUnreachable,
 	McpValidateCredentialsOptions,
 	McpValidatedCredentials,
 } from "./client/oauth-flows.ts";
@@ -120,6 +135,8 @@ export {
 	skillsFromResources,
 } from "./client/skills.ts";
 export type { McpSkill, McpSkillReader, McpSkillType } from "./client/skills.ts";
+export { explainConnectionError } from "./client/explain.ts";
+export type { McpConnectionErrorKind, McpConnectionExplanation } from "./client/explain.ts";
 export { decodeResourceContent } from "./client/resources.ts";
 export type { McpDecodeResourceOptions, McpDecodedResourceContent } from "./client/resources.ts";
 export { checkPromptContract, checkToolContract } from "./client/contract.ts";
@@ -154,6 +171,7 @@ export type {
 	McpCallToolOptions,
 	McpCallToolParsedOptions,
 	McpConnectAllOptions,
+	McpConnectionDiagnostic,
 	McpConnectionEvent,
 	McpConnectionEventType,
 	McpConnectionListener,
@@ -173,6 +191,8 @@ export type {
 	McpPingResult,
 	McpPromptContractOption,
 	McpReadOptions,
+	McpReconcileOptions,
+	McpReconcileResult,
 	McpRequestOptionsWithMeta,
 	McpToolContractOption,
 	McpWatchSnapshot,

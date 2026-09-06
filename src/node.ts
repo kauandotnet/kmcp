@@ -239,19 +239,26 @@ export {
 	mcpConfigNamespace,
 	readMcpConfigFile,
 	standardMcpConfigPaths,
+	watchMcpConfigs,
 	type McpConfigCandidate,
+	type McpConfigChange,
 	type McpConfigConnectionDefaults,
 	type McpConfigConnections,
 	type McpConfigDiscovery,
 	type McpConfigLoaderOptions,
 	type McpConfigPathOptions,
 	type McpConfigProblem,
+	type McpConfigTransportType,
+	type McpConfigWatchOptions,
+	type McpConfigWatcher,
 	type McpDiscoveredConfig,
 	type McpHttpServerConfig,
 	type McpServerConfig,
 	type McpServersConfig,
 	type McpStdioServerConfig,
 } from "./node/config.ts";
+export { parseCommandLine, resolveExecutable } from "./node/command.ts";
+export type { McpParsedCommandLine, McpResolveExecutableOptions } from "./node/command.ts";
 export { syncResourceToFile, writeDecodedResource, writeResourceToFile } from "./node/resources.ts";
 export type {
 	McpResourceFileSync,
