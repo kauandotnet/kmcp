@@ -58,6 +58,7 @@ import type { McpCatalogCapability, McpCatalogSection, McpCatalogSnapshot } from
 import {
 	McpClientSession,
 	McpConnectionDefinition,
+	type McpOfficialClientOverrides,
 	type McpResumedSession,
 	type McpTransportKind,
 	createOfficialClient,
@@ -422,6 +423,8 @@ interface ManagedConnection<Id extends string> {
 	discover?: DiscoverResult;
 	logLevel?: LoggingLevel;
 	listen?: McpSubscription;
+	/** Tail of the `#relisten` chain; a turn awaits it so two openers can never overlap. */
+	relistenTask?: Promise<void>;
 	listenWatch?: ListenWatchState;
 	autoRefresh?: AutoRefreshState;
 	keepalive?: KeepaliveState;
@@ -695,14 +698,21 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		try {
 			await transport.finishAuth(callbackParams);
 		} catch (error) {
+			// The code is spent and the verifier with it: this round is over. Fail the connection
+			// so the next connect() starts a fresh challenge instead of leaving it parked forever.
+			await this.#releasePendingAuthorization(entry);
+			await entry.definition.finishAuthorizationRound().catch(() => undefined);
+			entry.errorCode = KMCP_ERROR_CODES.CONNECTION_CONNECT_FAILED;
+			entry.errorDetail = describeError(error);
+			this.#transition(entry, "failed");
 			throw new KmcpError(
 				KMCP_ERROR_CODES.CONNECTION_CONNECT_FAILED,
 				`Authorization of '${id}' could not be completed.`,
 				{ cause: error },
 			);
-		} finally {
-			await this.#releasePendingAuthorization(entry);
 		}
+		await this.#releasePendingAuthorization(entry);
+		await entry.definition.finishAuthorizationRound().catch(() => undefined);
 		this.#transition(entry, "offline");
 		return this.connect(id);
 	}
@@ -738,6 +748,8 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				`Authorization of '${id}' could not be completed.`,
 				{ cause: error },
 			);
+		} finally {
+			await entry.definition.finishAuthorizationRound().catch(() => undefined);
 		}
 		this.#publish("connection.state.changed", entry);
 		return this.#snapshotEntry(entry);
@@ -893,6 +905,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			(client) =>
 				this.#taskClient(this.#entry(id), client).createToolTask(name, arguments_, {
 					...(options?.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+					...(options?.pollIntervalMs === undefined
+						? {}
+						: { pollIntervalMs: options.pollIntervalMs }),
 					meta: this.#params(id, {}, options)._meta ?? {},
 					request: this.#requestOptions(id, "tool", this.#taskRequest(options)),
 				}),
@@ -1028,14 +1043,24 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					const uris = (entry.subscribedUris ??= new Set());
 					const added = !uris.has(uri);
 					uris.add(uri);
+					let applied: boolean;
 					try {
-						await this.#relisten(entry, session);
+						applied = await this.#relisten(entry, session);
 					} catch (error) {
 						if (added) uris.delete(uri);
 						throw new KmcpError(
 							KMCP_ERROR_CODES.OPERATION_FAILED,
 							`Updates for '${uri}' could not be honored on the modern listen stream.`,
 							{ cause: error },
+						);
+					}
+					if (!applied) {
+						// The session was replaced under the call: no live listen filter carries this
+						// URI, so reporting success would leave the caller believing it is subscribed.
+						if (added) uris.delete(uri);
+						throw new KmcpError(
+							KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE,
+							`Connection '${id}' changed while subscribing to '${uri}'; subscribe again on the new generation.`,
 						);
 					}
 				} else {
@@ -1377,7 +1402,6 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	 */
 	async setLogLevel(id: Id, level: LoggingLevel, signal?: AbortSignal): Promise<void> {
 		const entry = this.#entry(id);
-		entry.logLevel = level;
 		await this.withClient(
 			id,
 			async (client) => {
@@ -1387,6 +1411,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			},
 			signal,
 		);
+		// Recorded only once the upstream accepted it: a snapshot must not claim a level the server
+		// never took, and on the modern era `#params` would start stamping the failed level.
+		entry.logLevel = level;
 		this.#publish("connection.state.changed", entry);
 	}
 
@@ -1804,11 +1831,15 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		let transport: Transport | undefined;
 		let session: McpClientSession<Id> | undefined;
 		const definition = entry.definition;
+		// Noted BEFORE the transport is opened: the factory only PEEKS at the one-shot resume
+		// record, so this generation owns the decision to consume it (after a successful connect)
+		// or to burn it (after the server declared the session gone).
+		const resuming = definition.resumePending;
 		try {
 			transport = await definition.openTransport();
 			let liveSession: McpClientSession<Id> | undefined;
 			const listChanged = this.#listChangedHandlers(entry, () => liveSession);
-			const client = createOfficialClient(definition, {
+			const client = this.#createClient(entry, resuming, {
 				...(listChanged === undefined ? {} : { listChanged }),
 				onResourceUpdated: (notification) => {
 					if (liveSession === undefined || entry.session !== liveSession) return;
@@ -1824,20 +1855,26 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				this.#handleUnexpectedClose(entry, closingSession, KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE);
 			};
 			await client.connect(transport, this.#connectOptions(entry));
+			// The one-shot resume is spent only once a connect actually succeeded with it; a failed
+			// attempt leaves it pending so the retry resumes rather than handshaking blind.
+			if (resuming) definition.consumeResume();
 			const generation = nextGeneration(this.#generationSequence);
 			this.#generationSequence = generation;
 			entry.session = session;
 			entry.transport = transport;
-			// No negotiated revision after a successful connect means the SDK adopted the session
-			// the transport carried instead of running a handshake.
-			entry.resumed =
-				definition.resumed !== undefined &&
-				client.getProtocolEra() === undefined &&
-				transport.sessionId === definition.resumed.sessionId;
+			// No negotiated revision after a successful connect means the SDK adopted the session the
+			// transport carried instead of running a handshake (it skips one whenever the transport
+			// already has a session id) — whatever the definition's `resumed` record says. The
+			// era/capability fallbacks and the page-walking list verbs hang off this flag, so it must
+			// track what the SDK actually did, not what the definition intended.
+			entry.resumed = client.getProtocolEra() === undefined;
 			entry.generation = generation;
 			delete entry.catalog;
 			delete entry.autoRefresh;
 			delete entry.subscribedUris;
+			// A handle from the previous generation belongs to a closed client: dropping it lets
+			// `#watchListen` arm for the new session instead of guarding against a dead stream.
+			delete entry.listen;
 			delete entry.listenWatch;
 			if (entry.reconnect !== undefined) {
 				entry.reconnect.lastSuccessAt = this.#now();
@@ -1859,6 +1896,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			this.#startKeepalive(entry, session);
 			return this.#snapshotEntry(entry);
 		} catch (error) {
+			// A resume the server refused as gone (404 / expired session) must not be replayed: burn
+			// it here so the reconnect this failure schedules runs a fresh handshake.
+			if (resuming && isSessionExpiryVerdict(error)) definition.consumeResume();
 			if (
 				transport !== undefined &&
 				session !== undefined &&
@@ -1883,7 +1923,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				} catch (cleanupError) {
 					entry.quarantinedCleanup = cleanup;
 					entry.errorCode = KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED;
-					entry.errorDetail = describeError(error);
+					// The reported code is the CLEANUP failure's, so the detail must describe that one
+					// too; the connect error travels on as the AggregateError's first cause.
+					entry.errorDetail = describeError(cleanupError);
 					this.#transition(entry, "quarantined");
 					throw new KmcpError(
 						KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED,
@@ -1903,6 +1945,29 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				{ cause: error },
 			);
 		}
+	}
+
+	/**
+	 * The official client for one generation. Strict capability enforcement is a PER-GENERATION
+	 * decision: a generation that adopts a server-side session runs no handshake, so the client
+	 * learns no capabilities and every verb would fail `assertCapabilityForMethod` (kmcp walks the
+	 * list verbs' pages itself instead). The definition already resolves that for a resume it still
+	 * holds — honoring an explicit `clientOptions.enforceStrictCapabilities` pin — and the manager
+	 * adds the case only it can see: a definition whose one-shot record is already spent while its
+	 * transport keeps handing back the same session id, so the SDK skips the handshake again.
+	 */
+	#createClient(
+		entry: ManagedConnection<Id>,
+		resuming: boolean,
+		overrides: McpOfficialClientOverrides,
+	): Client {
+		const definition = entry.definition;
+		const pinned = resuming && definition.enforceStrictCapabilities;
+		const adopting = resuming || definition.resumed !== undefined;
+		return createOfficialClient(definition, {
+			...overrides,
+			...(adopting && !pinned ? { enforceStrictCapabilities: false } : {}),
+		});
 	}
 
 	#connectOptions(entry: ManagedConnection<Id>) {
@@ -1931,6 +1996,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		delete entry.session;
 		delete entry.transport;
 		delete entry.connectedAt;
+		// The stream belongs to the dead client; closing it would only talk to a closed transport.
+		// Dropping the handle keeps `#watchListen` free to arm for the next session.
+		delete entry.listen;
 		entry.resumed = false;
 		entry.errorCode = code;
 		if (detail === undefined) delete entry.errorDetail;
@@ -2039,7 +2107,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			state.count += 1;
 			state.inFlight = true;
 			void this.refreshCatalog(entry.definition.id)
-				.catch(() => undefined)
+				.catch((error: unknown) => {
+					// A refresh that never committed a catalog — the connection flapped, or a newer
+					// generation/catalog fenced it — must not burn the generation's budget, or the cap
+					// would report `CATALOG_STALE` for a catalog nothing ever tried to refresh.
+					if (entry.autoRefresh === state && !refreshWasAttempted(error)) state.count -= 1;
+				})
 				.finally(() => {
 					state.inFlight = false;
 					if (state.pending) {
@@ -2181,12 +2254,17 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		schedule();
 	}
 
+	/**
+	 * Stops the probe timer but KEEPS the counters: the very snapshot that reports
+	 * `CONNECTION_KEEPALIVE_FAILED` is published from inside the transition this call belongs to,
+	 * and it must still carry the `failures`/`lastFailureAt` that explain the verdict. The next
+	 * successful connect installs a fresh state; a deliberate disconnect to `offline` drops it.
+	 */
 	#stopKeepalive(entry: ManagedConnection<Id>): void {
 		const state = entry.keepalive;
 		if (state === undefined) return;
 		if (state.timer !== undefined) clearTimeout(state.timer);
 		delete state.timer;
-		delete entry.keepalive;
 	}
 
 	/**
@@ -2207,6 +2285,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			await this.#relisten(entry, session);
 		} catch {
 			delete entry.listen;
+			// This is the ONLY opener for such a generation (the SDK re-listens for nobody), so a
+			// failed open must arm the same backoff a mid-session drop gets; otherwise every
+			// list-change and resource update is silently dead until the next reconnect.
+			const state = (entry.listenWatch ??= { reopening: false, attempts: 0, reopens: 0 });
+			delete state.subscription;
+			this.#scheduleRelisten(entry, session, state);
 		}
 	}
 
@@ -2231,27 +2315,57 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	 * never widens the filter, so a modern subscription delivers nothing without this). The new
 	 * stream opens BEFORE the old one closes — over-delivery in the overlap, never a gap — and
 	 * the SDK's own auto-opened stream is closed so list changes are not double-delivered.
+	 *
+	 * SERIALIZED per connection: two overlapping calls (two `subscribeResource`s, or one racing the
+	 * drop retry) would each read `entry.listen`, open a stream, and close only what they read —
+	 * orphaning one open stream for the life of the generation (duplicate notifications, double
+	 * auto-refresh). Resolves `true` when the filter was applied to the live session, `false` when
+	 * the call was short-circuited because the session moved on (or the era is not modern).
 	 */
-	async #relisten(entry: ManagedConnection<Id>, session: McpClientSession<Id>): Promise<void> {
+	async #relisten(entry: ManagedConnection<Id>, session: McpClientSession<Id>): Promise<boolean> {
+		const previousTurn = entry.relistenTask;
+		let release!: () => void;
+		const turn = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		entry.relistenTask = turn;
+		try {
+			// Never rejects: each turn settles its gate in `finally`.
+			if (previousTurn !== undefined) await previousTurn;
+			return await this.#applyListenFilter(entry, session);
+		} finally {
+			release();
+			if (entry.relistenTask === turn) delete entry.relistenTask;
+		}
+	}
+
+	/** One serialized turn of `#relisten`; never call it outside that gate. */
+	async #applyListenFilter(
+		entry: ManagedConnection<Id>,
+		session: McpClientSession<Id>,
+	): Promise<boolean> {
 		const client = session.client;
-		if (this.#era(entry, client) !== "modern" || entry.session !== session) return;
+		if (this.#era(entry, client) !== "modern" || entry.session !== session) return false;
 		const filter = this.#listenFilter(entry, client);
 		const previous = entry.listen;
 		if (Object.keys(filter).length === 0) {
 			delete entry.listen;
 			this.#watchListen(entry, session, undefined);
 			await previous?.close().catch(() => undefined);
-			return;
+			return true;
 		}
 		const next = await client.listen(filter);
-		if (entry.session !== session) {
+		if (entry.session !== session || entry.listen !== previous) {
+			// The session was replaced (or, defensively, another opener won) while the stream was
+			// opening: this one is nobody's and would deliver duplicates forever.
 			await next.close().catch(() => undefined);
-			return;
+			return false;
 		}
 		entry.listen = next;
 		this.#watchListen(entry, session, next);
 		await previous?.close().catch(() => undefined);
 		await client.autoOpenedSubscription?.close().catch(() => undefined);
+		return true;
 	}
 
 	/**
@@ -2276,10 +2390,14 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			if (reason !== "remote") return;
 			if (entry.session !== session || entry.listenWatch !== state) return;
 			if (state.subscription !== subscription) return;
-			if (!isUsable(entry) || entry.disconnectTask !== undefined || this.#closed) return;
+			// The dead stream is cleared BEFORE any other verdict: the watch is armed while the
+			// connect is still in its `connecting` phase, and leaving a closed stream in
+			// `state.subscription` would make `#scheduleRelisten`'s guard refuse to re-open forever.
 			delete state.subscription;
 			if (entry.listen === subscription) delete entry.listen;
+			if (this.#closed || entry.disconnectTask !== undefined) return;
 			this.#publish("connection.listen.dropped", entry);
+			// Scheduled even from a not-yet-`online` phase; the timer re-checks when it fires.
 			this.#scheduleRelisten(entry, session, state);
 		});
 	}
@@ -2298,12 +2416,19 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		const timer = setTimeout(() => {
 			delete state.retryTimer;
 			if (entry.session !== session || entry.listenWatch !== state) return;
-			if (!isUsable(entry) || entry.disconnectTask !== undefined || this.#closed) return;
+			if (entry.disconnectTask !== undefined || this.#closed) return;
 			if (state.subscription !== undefined) return;
+			if (!isUsable(entry)) {
+				// The session is still current but its connect has not reached `online` yet: keep the
+				// backoff alive rather than abandoning the stream for the rest of the generation.
+				this.#scheduleRelisten(entry, session, state);
+				return;
+			}
 			state.reopening = true;
 			void this.#relisten(entry, session)
-				.then(() => {
+				.then((applied) => {
 					if (entry.session !== session || entry.listenWatch !== state) return;
+					if (!applied) return;
 					if (state.subscription === undefined) {
 						// Nothing to listen for any more (filter emptied); stop retrying.
 						state.attempts = 0;
@@ -2363,7 +2488,8 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		if (quarantinedCleanup !== undefined) {
 			this.#transition(entry, "draining");
 			try {
-				await quarantinedCleanup();
+				// Same bound as the connect path: a hung close must not hang disconnect() or close().
+				await this.#bounded(quarantinedCleanup(), entry.definition.disconnectTimeoutMs, "close");
 				delete entry.quarantinedCleanup;
 				delete entry.errorCode;
 				delete entry.errorDetail;
@@ -2536,6 +2662,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			this.#stopKeepalive(entry);
 			this.#stopListenWatch(entry);
 		}
+		// A deliberate disconnect ends the story the keepalive counters were telling; an unexpected
+		// close (`failed`) keeps them so the snapshot explains why the connection went down.
+		if (phase === "offline") delete entry.keepalive;
 		if (phase !== "failed") this.#cancelReconnectTimer(entry);
 		entry.phase = phase;
 		entry.lastTransitionAt = isoTimestamp(this.#now);
@@ -2683,7 +2812,11 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		const era = this.#era(entry, client);
 		let honored: readonly McpCatalogCapability[];
 		if (era === "modern") {
-			const filter = (entry.listen ?? client.autoOpenedSubscription)?.honoredFilter;
+			// The watched stream is the single source of truth: it is set when a stream is armed and
+			// cleared the moment one drops. `client.autoOpenedSubscription` keeps answering with its
+			// handle (and its `honoredFilter`) long after the manager replaced and closed it, which
+			// would report a dead subscription as live.
+			const filter = entry.listenWatch?.subscription?.honoredFilter;
 			honored =
 				filter === undefined
 					? []
@@ -3282,6 +3415,43 @@ function cleanupAfterFailedConnect<Id extends string>(
 
 function isUsable(entry: ManagedConnection<string>): boolean {
 	return entry.phase === "online" || entry.phase === "degraded";
+}
+
+/**
+ * Whether a failure is the server declaring a Streamable HTTP session gone (HTTP 404 on a request
+ * that carried a session id, or the manager's own verdict for one).
+ */
+function isSessionExpiryVerdict(error: unknown): boolean {
+	const expired = findCause(
+		error,
+		(candidate): candidate is KmcpError =>
+			candidate instanceof KmcpError &&
+			candidate.code === KMCP_ERROR_CODES.CONNECTION_SESSION_EXPIRED,
+	);
+	if (expired !== undefined) return true;
+	const http = findCause(
+		error,
+		(candidate): candidate is SdkHttpError => candidate instanceof SdkHttpError,
+	);
+	return http?.status === 404;
+}
+
+/**
+ * Whether a rejected catalog refresh actually reached the upstream. A refresh fenced out by a
+ * newer generation/catalog, or refused because the connection is no longer online, never ran —
+ * it must not spend the generation's refresh budget.
+ */
+function refreshWasAttempted(error: unknown): boolean {
+	switch (errorCode(error)) {
+		case KMCP_ERROR_CODES.CONNECTION_NOT_ONLINE:
+		case KMCP_ERROR_CODES.CONNECTION_GENERATION_STALE:
+		case KMCP_ERROR_CODES.CATALOG_STALE:
+		case KMCP_ERROR_CODES.MANAGER_CLOSED:
+		case KMCP_ERROR_CODES.CONNECTION_UNKNOWN:
+			return false;
+		default:
+			return true;
+	}
 }
 
 function positiveInteger(value: number, name: string): number {

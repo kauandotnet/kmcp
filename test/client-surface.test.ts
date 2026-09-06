@@ -414,9 +414,11 @@ test("interactive OAuth parks the connection in 'authorizing' and completes on t
 		assert.equal(manager.state("alpha").phase, "authorizing");
 		assert.ok(events.includes("connection.authorization.required"));
 		await assert.rejects(async () => manager.connect("alpha"), /authorization/i);
+		// The fake transport never ran the SDK's auth(), so issue the round's state by hand.
+		const state = await provider.state();
 		const online = await manager.completeAuthorization(
 			"alpha",
-			new URLSearchParams({ code: "abc" }),
+			new URLSearchParams({ code: "abc", state }),
 		);
 		assert.equal(online.phase, "online");
 		assert.deepEqual(finishCalls, ["abc"]);

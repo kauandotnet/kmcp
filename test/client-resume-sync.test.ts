@@ -85,7 +85,11 @@ test("httpConnection({ resume }) resolves the era and relaxes strict enforcement
 		resume: { sessionId: "s", protocolVersion: "2026-07-28" },
 	});
 	assert.equal(modern.resumed?.era, "modern");
-	assert.equal(modern.clientOptions.enforceStrictCapabilities, false);
+	// Nothing is baked into clientOptions; the relaxation is per generation and one-shot.
+	assert.equal(modern.clientOptions.enforceStrictCapabilities, undefined);
+	assert.equal(modern.enforceStrictCapabilities, false);
+	modern.consumeResume();
+	assert.equal(modern.enforceStrictCapabilities, true);
 	const explicit = httpConnection({
 		id: "e",
 		url: "https://mcp.example.com/mcp",

@@ -17,6 +17,7 @@ import {
 	StaticPrivateKeyJwtProvider,
 	type StoredOAuthTokens,
 	UnauthorizedError,
+	assertSecureTokenEndpoint,
 	auth,
 	discoverAndRequestJwtAuthGrant,
 	discoverAuthorizationServerMetadata,
@@ -25,7 +26,7 @@ import {
 } from "@modelcontextprotocol/client";
 
 import { KMCP_ERROR_CODES, KmcpError } from "../errors.ts";
-import { encodeBase64Url } from "../internal/base64.ts";
+import { encodeBase64, encodeBase64Url } from "../internal/base64.ts";
 import type { MaybePromise } from "../internal/value.ts";
 import { decodeJwtClaims, jwtExpiresAt, type McpJwtClaims } from "./jwt.ts";
 import { type McpCallbackStateVerifier, normalizeScope } from "./oauth.ts";
@@ -143,6 +144,8 @@ export async function authorizeOAuth(
 			"The authorization server asked for a second redirect while exchanging the code.",
 		);
 	}
+	// The verifier and state were bound to the code just redeemed; neither may serve twice.
+	await provider.invalidateCredentials?.("verifier");
 	return Object.freeze({ redirected: true, tokens: await provider.tokens() });
 }
 
@@ -335,8 +338,15 @@ function explainOne(error: unknown): McpOAuthFailure | undefined {
 	return undefined;
 }
 
+/**
+ * Bounds and sanitizes text that originated at an authorization server (or any remote party):
+ * C0/C1 control characters — terminal escapes, newlines that forge log lines — become spaces, and
+ * the result is capped so a hostile error body cannot flood a message.
+ */
 function bounded(text: string, max = 400): string {
-	return text.length > max ? `${text.slice(0, max)}…` : text;
+	// eslint-disable-next-line no-control-regex
+	const sanitized = text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+	return sanitized.length > max ? `${sanitized.slice(0, max)}…` : sanitized;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -431,7 +441,7 @@ export function clientCredentialsAuth(options: McpClientCredentialsOptions): OAu
 		provider = new ClientCredentialsProvider({ ...common, clientSecret: options.clientSecret });
 	}
 	if (options.tokenEndpoint !== undefined) {
-		const pinned = pinnedDiscoveryState(options.tokenEndpoint);
+		const pinned = pinnedDiscoveryState(options.tokenEndpoint, options.expectedIssuer);
 		provider.discoveryState = () => pinned;
 	}
 	return provider;
@@ -440,15 +450,21 @@ export function clientCredentialsAuth(options: McpClientCredentialsOptions): OAu
 /**
  * Discovery state that pins a known token endpoint, bypassing RFC 9728 / RFC 8414 discovery. The
  * authorization endpoint and response types are unused by the client-credentials grant but the
- * SDK's metadata validation requires them.
+ * SDK's metadata validation requires them. `issuer` is the identifier the SDK binds stored
+ * credentials to (SEP-2352); pass the authorization server's real issuer (Okta and Auth0 issuers
+ * carry a path or a trailing slash) — it defaults to the endpoint's origin only when unknown.
  */
-export function pinnedDiscoveryState(tokenEndpoint: string | URL): OAuthDiscoveryState {
-	const endpoint = typeof tokenEndpoint === "string" ? new URL(tokenEndpoint) : tokenEndpoint;
+export function pinnedDiscoveryState(
+	tokenEndpoint: string | URL,
+	issuer?: string,
+): OAuthDiscoveryState {
+	const endpoint = assertSecureTokenEndpoint(tokenEndpoint);
 	const origin = endpoint.origin;
+	const boundIssuer = issuer ?? origin;
 	return Object.freeze({
-		authorizationServerUrl: origin,
+		authorizationServerUrl: boundIssuer,
 		authorizationServerMetadata: {
-			issuer: origin,
+			issuer: boundIssuer,
 			authorization_endpoint: `${origin}/authorize`,
 			token_endpoint: endpoint.href,
 			response_types_supported: ["code"],
@@ -602,7 +618,7 @@ export function enterpriseManagedAuth(
 				`The enterprise IdP at ${String(options.idp.issuer)} exposes no token endpoint.`,
 			);
 		}
-		tokenEndpoint = metadata.token_endpoint;
+		tokenEndpoint = assertSecureTokenEndpoint(metadata.token_endpoint).href;
 		return tokenEndpoint;
 	};
 
@@ -771,10 +787,10 @@ export async function authorizeEnterpriseIdp(
 	const redirectUri = String(options.redirectUrl);
 	const scope = normalizeScope(options.scope) ?? MCP_DEFAULT_IDP_SCOPE;
 	const authorizationUrl = new URL(authorizationEndpoint);
-	if (authorizationUrl.protocol !== "https:" && authorizationUrl.protocol !== "http:") {
+	if (!isSecureOrLoopback(authorizationUrl)) {
 		throw new KmcpError(
 			KMCP_ERROR_CODES.AUTH_FORBIDDEN,
-			`The IdP authorization endpoint uses the unsupported scheme '${authorizationUrl.protocol}'.`,
+			`The IdP authorization endpoint must use https (or http on loopback); got '${authorizationUrl.origin}'.`,
 		);
 	}
 	authorizationUrl.searchParams.set("response_type", "code");
@@ -837,7 +853,8 @@ export async function authorizeEnterpriseIdp(
 		);
 	}
 	const claims: McpJwtClaims = decodeJwtClaims(parsed.id_token) ?? Object.freeze({});
-	if (typeof claims.nonce === "string" && claims.nonce !== nonce) {
+	// OIDC Core §3.1.3.7: a nonce was sent, so the ID token MUST carry the same one.
+	if (claims.nonce !== nonce) {
 		throw new KmcpError(
 			KMCP_ERROR_CODES.AUTH_STATE_MISMATCH,
 			"The enterprise IdP returned an ID token whose nonce does not match this sign-in.",
@@ -884,6 +901,24 @@ function randomToken(bytes: number): string {
 	return encodeBase64Url(buffer);
 }
 
+/** `https:` anywhere, or `http:` on a loopback host (the same rule the SDK applies to token endpoints). */
+function isSecureOrLoopback(url: URL): boolean {
+	if (url.protocol === "https:") return true;
+	if (url.protocol !== "http:") return false;
+	const host = url.hostname;
+	return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+}
+
+/**
+ * RFC 6749 §2.3.1 `client_secret_basic`: both halves form-urlencoded, then the UTF-8 bytes
+ * base64-encoded — a secret containing `:` or non-ASCII survives, where `btoa` on the raw string
+ * would throw or split it.
+ */
+function basicAuthorization(clientId: string, clientSecret: string): string {
+	const credentials = `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`;
+	return `Basic ${encodeBase64(new TextEncoder().encode(credentials))}`;
+}
+
 async function postForm(
 	endpoint: string | URL,
 	body: URLSearchParams,
@@ -891,13 +926,14 @@ async function postForm(
 	clientSecret: string | undefined,
 	fetchFn: FetchLike | undefined,
 ): Promise<Response> {
+	// Codes, verifiers, refresh tokens and client secrets travel in this body: never in the clear.
+	const target = assertSecureTokenEndpoint(endpoint);
 	const headers: Record<string, string> = {
 		"content-type": "application/x-www-form-urlencoded",
 		accept: "application/json",
 	};
-	if (clientSecret !== undefined) {
-		headers.authorization = `Basic ${globalThis.btoa(`${clientId}:${clientSecret}`)}`;
-	}
+	if (clientSecret !== undefined)
+		headers.authorization = basicAuthorization(clientId, clientSecret);
 	const send = fetchFn ?? ((url, init) => globalThis.fetch(url, init));
-	return send(endpoint, { method: "POST", headers, body: body.toString() });
+	return send(target, { method: "POST", headers, body: body.toString() });
 }

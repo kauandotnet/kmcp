@@ -196,6 +196,8 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 	readonly #useState: boolean;
 	readonly #now: () => number;
 	readonly #refreshing = new Map<string, Promise<McpStoredOAuthTokens>>();
+	/** Bumped by every token invalidation so a refresh that started earlier cannot re-persist. */
+	#epoch = 0;
 
 	/**
 	 * Persists a dynamically registered client under `ctx.issuer`.
@@ -312,14 +314,21 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 
 	/**
 	 * Verifies the `state` of an authorization callback against the value issued by
-	 * {@link state} and forgets it (one-time use). Passes when no state was recorded (a callback
-	 * for a redirect this process never issued cannot be checked) or when `state` is disabled.
+	 * {@link state} and forgets it (one-time use, whether or not it matched). A callback that
+	 * arrives while no state is recorded — none was issued, or one was already consumed — is
+	 * refused: it cannot be one of this provider's, and accepting it would let any code reach
+	 * the exchange. Disabled `state` skips the check entirely.
 	 */
 	async verifyCallbackState(params: URLSearchParams): Promise<void> {
 		if (!this.#useState) return;
 		const key = this.#key("state");
 		const expected = await this.#store.get(key);
-		if (expected === undefined) return;
+		if (expected === undefined) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.AUTH_STATE_MISMATCH,
+				"No OAuth state is pending for this server; start a new authorization round.",
+			);
+		}
 		await this.#store.delete(key);
 		const received = params.get("state");
 		if (received === null || !constantTimeEqual(received, expected)) {
@@ -328,6 +337,18 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 				"The OAuth callback state does not match the value issued for this authorization.",
 			);
 		}
+	}
+
+	/**
+	 * Whether a callback carries the `state` currently issued, WITHOUT consuming it. For a
+	 * loopback endpoint that must ignore stray requests (`loopbackOAuthCallback({ accept })`) and
+	 * keep listening for the genuine redirect. `true` when `state` is disabled.
+	 */
+	async matchesIssuedState(params: URLSearchParams): Promise<boolean> {
+		if (!this.#useState) return true;
+		const expected = await this.#store.get(this.#key("state"));
+		const received = params.get("state");
+		return expected !== undefined && received !== null && constantTimeEqual(received, expected);
 	}
 
 	/**
@@ -351,14 +372,16 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 	/**
 	 * Returns the token set for `ctx.issuer`. A context-less call is the transport's per-request
 	 * bearer-token read, which SEP-2352 requires to resolve the most recently saved set — hence
-	 * the last-issuer pointer rather than `undefined`. An access token inside the refresh buffer
-	 * is refreshed first when a refresh token and discovery state are on hand; a refresh failure
-	 * returns the stale set so the transport's 401 path can recover.
+	 * the last-issuer pointer rather than `undefined`. On that context-less read an access token
+	 * inside the refresh buffer is refreshed first when a refresh token and discovery state are
+	 * on hand; a refresh failure returns the stale set so the transport's 401 path can recover.
+	 * A read WITH a context comes from the SDK's own `auth()` orchestration, which refreshes on
+	 * its own — refreshing there too would spend the same refresh token twice.
 	 */
 	async tokens(ctx?: OAuthClientInformationContext): Promise<McpStoredOAuthTokens | undefined> {
 		const issuer = ctx?.issuer ?? (await this.#lastIssuer());
 		const stored = await this.#readTokens(issuer);
-		if (stored === undefined || this.#refresh === undefined) return stored;
+		if (stored === undefined || this.#refresh === undefined || ctx !== undefined) return stored;
 		if (!this.#expiresSoon(stored, this.#refresh.bufferMs) || stored.refresh_token === undefined) {
 			return stored;
 		}
@@ -416,14 +439,15 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 	async invalidateCredentials(
 		scope: "all" | "client" | "tokens" | "verifier" | "discovery",
 	): Promise<void> {
-		const issuer = await this.#lastIssuer();
+		// Every issuer ever written for this server: a migrated or second authorization server
+		// must not leave a live refresh token behind under the previous one.
+		const issuers = new Set<string | undefined>([undefined, ...(await this.#knownIssuers())]);
 		if (scope === "all" || scope === "tokens") {
-			await this.#store.delete(this.#key("tokens", issuer));
-			await this.#store.delete(this.#key("tokens"));
+			this.#epoch += 1;
+			for (const issuer of issuers) await this.#store.delete(this.#key("tokens", issuer));
 		}
 		if (scope === "all" || scope === "client") {
-			await this.#store.delete(this.#key("client_info", issuer));
-			await this.#store.delete(this.#key("client_info"));
+			for (const issuer of issuers) await this.#store.delete(this.#key("client_info", issuer));
 		}
 		if (scope === "all" || scope === "verifier") {
 			await this.#store.delete(this.#key("code_verifier"));
@@ -499,6 +523,7 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 		issuer: string | undefined,
 		stale: McpStoredOAuthTokens,
 	): Promise<McpStoredOAuthTokens> {
+		const epoch = this.#epoch;
 		try {
 			const discovery = await this.discoveryState();
 			const refreshToken = stale.refresh_token;
@@ -522,7 +547,9 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 				...refreshed,
 				...(stale.issuer === undefined ? {} : { issuer: stale.issuer }),
 			});
-			await this.saveTokens(stamped, ctx);
+			// An invalidation that landed while the refresh was in flight wins: the caller gets the
+			// fresh set for this one request, but the store stays cleared.
+			if (this.#epoch === epoch) await this.saveTokens(stamped, ctx);
 			return stamped;
 		} catch (error) {
 			this.#refresh?.onError?.(error);
@@ -550,7 +577,26 @@ export class McpOAuthClientProvider implements OAuthClientProvider, McpCallbackS
 
 	async #rememberIssuer(issuer: string | undefined): Promise<void> {
 		if (issuer === undefined) return;
+		// Read the index before moving the pointer: the previous issuer must join the list.
+		const known = await this.#knownIssuers();
+		if (!known.includes(issuer)) {
+			await this.#store.set(this.#issuerIndexKey(), JSON.stringify([...known, issuer]));
+		}
 		await this.#store.set(this.#issuerPointerKey(), issuer);
+	}
+
+	/** Key of the list of every issuer this server's credentials were ever stored under. */
+	#issuerIndexKey(): string {
+		return `${this.#prefix()}${this.serverUrl}/issuers`;
+	}
+
+	async #knownIssuers(): Promise<string[]> {
+		const listed = await this.#readJson<unknown>(this.#issuerIndexKey());
+		const known = Array.isArray(listed)
+			? listed.filter((entry): entry is string => typeof entry === "string")
+			: [];
+		const last = await this.#lastIssuer();
+		return last !== undefined && !known.includes(last) ? [...known, last] : known;
 	}
 
 	async #lastIssuer(): Promise<string | undefined> {

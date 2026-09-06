@@ -144,9 +144,36 @@ export async function discoverSkills(reader: McpSkillReader): Promise<readonly M
 	return skillsFromResources(listed.resources);
 }
 
+const TRAVERSAL_SEGMENTS: ReadonlySet<string> = new Set([".", ".."]);
+
+/**
+ * Rejects `.` and `..` path segments, in their literal and percent-encoded spellings (`%2e%2e`,
+ * `.%2E`, `..%2f..`). A skill reference names a resource the server resolves against its own skill
+ * root, so a traversal segment is never legitimate — and the check must not depend on which form
+ * the caller happened to write.
+ */
+function assertNoTraversal(path: string, reference: string): void {
+	for (const segment of path.split("/")) {
+		let decoded = segment;
+		try {
+			decoded = decodeURIComponent(segment);
+		} catch {
+			// A malformed escape decodes to nothing; the literal check below still applies.
+		}
+		const parts = segment === decoded ? [segment] : [segment, ...decoded.split("/")];
+		if (parts.some((part) => TRAVERSAL_SEGMENTS.has(part))) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`'${reference}' is not a valid skill reference.`,
+			);
+		}
+	}
+}
+
 /**
  * Resolves a skill reference into a `SKILL.md` URI: a bare name (`git-workflow`), a nested path
  * (`acme/billing/refunds`), or a full `skill://` URI (a directory URI gets `/SKILL.md` appended).
+ * A reference whose path carries a `.` or `..` segment is rejected in either form.
  */
 export function resolveSkillUri(reference: string): string {
 	const trimmed = reference.trim();
@@ -155,16 +182,18 @@ export function resolveSkillUri(reference: string): string {
 	}
 	if (trimmed.startsWith("skill://")) {
 		const rest = trimmed.slice("skill://".length);
+		assertNoTraversal(rest, reference);
 		const lastSegment = rest.slice(rest.lastIndexOf("/") + 1);
 		if (lastSegment.includes(".")) return trimmed;
 		return trimmed.endsWith("/") ? `${trimmed}SKILL.md` : `${trimmed}/SKILL.md`;
 	}
 	const path = trimmed.replace(/^\/+/, "").replace(/\/+$/, "");
-	if (path.length === 0 || path.split("/").some((segment) => segment === "." || segment === "..")) {
+	if (path.length === 0) {
 		throw new KmcpError(
 			KMCP_ERROR_CODES.INVALID_DEFINITION,
 			`'${reference}' is not a valid skill reference.`,
 		);
 	}
+	assertNoTraversal(path, reference);
 	return `skill://${path}/SKILL.md`;
 }

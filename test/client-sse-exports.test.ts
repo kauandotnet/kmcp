@@ -31,7 +31,8 @@ test("sseConnection builds a legacy-only definition over the deprecated SSE tran
 	assert.equal(interactive.transportKind, "sse");
 	assert.deepEqual(interactive.clientOptions.versionNegotiation, { mode: "legacy" });
 	assert.equal(interactive.interactiveOAuth, true);
-	assert.equal(typeof interactive.clientOptions.cachePartition, "string");
+	// Nothing is derived from the credential; the SDK's per-client cache needs no partition.
+	assert.equal(interactive.clientOptions.cachePartition, undefined);
 	const transport = await interactive.openTransport();
 	assert.ok(transport instanceof SSEClientTransport);
 	await transport.close();

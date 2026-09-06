@@ -354,20 +354,26 @@ hanging), `terminateSession` (send the Streamable HTTP `DELETE` on disconnect; d
 extensions), and `configureClient` (a synchronous escape hatch over the freshly constructed official
 `Client` before `connect()`). `httpConnection` accepts a bearer string, an SDK `AuthProvider`, or
 any `OAuthClientProvider` (an interactive one arms the `authorizing` flow; client-credentials and
-enterprise providers advertise their capability extension automatically); `headers` may not carry
-`Authorization` next to `auth`; `middlewares` composes SDK fetch middlewares (`withLogging`,
-`createMiddleware`, …) around the transport; `resume` adopts a server-side session once — the SDK
-then runs no handshake, so the `McpResumedSession` record (`resumedSessionFrom(snapshot)` builds it
-from a connection snapshot; `undefined` when the server issued no session id) stands in for it,
-strict capability enforcement is off for that definition, the list verbs walk the pages themselves,
-and any later reconnect starts fresh; `reconnection` overrides `MCP_HTTP_RECONNECTION_DEFAULTS` (1 s
-→ 30 s, factor 2, 10 retries for the server-to-client stream); `cachePartition` defaults to a digest
-of the credential identity. `stdioConnection` (`kmcp/node`) adds `onStderrLine` to receive the
-child's stderr line by line. `sseConnection` reaches servers still on the deprecated HTTP+SSE
-transport (legacy era only; same `auth` and `headers` handling), for the migration period the SDK
-keeps that transport for. `kmcp/client` also re-exports the curated SDK client surface (`Client`,
-the transports, the OAuth providers and flow functions, the fetch middlewares, the error classes,
-`specTypeSchemas`) so application code imports one package.
+enterprise providers advertise their capability extension automatically); `headers` merge over
+`transportOptions.requestInit.headers`, and neither may carry `Authorization` next to `auth`
+(checked in every `HeadersInit` form); `middlewares` composes SDK fetch middlewares (`withLogging`,
+`createMiddleware`, …) around the transport, outermost first; `resume` adopts a server-side session
+once — the SDK then runs no handshake, so the `McpResumedSession` record
+(`resumedSessionFrom(snapshot)` builds it from a connection snapshot; `undefined` when the server
+issued no session id) stands in for it, strict capability enforcement is off for that generation,
+the list verbs walk the pages themselves, and any later reconnect starts fresh (the record is spent
+only by a connect that succeeds with it: a failed first attempt keeps it for the retry, and a 404
+burns it so the retry handshakes fresh; any transport that already carries a session id engages the
+same paths); `reconnection` overrides `MCP_HTTP_RECONNECTION_DEFAULTS` (1 s → 30 s, factor 2, 10
+retries for the server-to-client stream); `cachePartition` is never derived: it only matters for a
+`responseCacheStore` shared across principals, and credentials next to a shared store without an
+explicit partition are refused at definition time (`INVALID_DEFINITION`). `stdioConnection`
+(`kmcp/node`) adds `onStderrLine` to receive the child's stderr line by line. `sseConnection`
+reaches servers still on the deprecated HTTP+SSE transport (legacy era only; same `auth` and
+`headers` handling), for the migration period the SDK keeps that transport for. `kmcp/client` also
+re-exports the curated SDK client surface (`Client`, the transports, the OAuth providers and flow
+functions, the fetch middlewares, the error classes, `specTypeSchemas`) so application code imports
+one package.
 
 Manager verbs take the SDK request option types plus `meta` (`_meta` passthrough) and an optional
 generation/fingerprint `control`: `callTool` (with `contract` it refuses the call when the
@@ -378,18 +384,23 @@ advertised tool has drifted from an expected shape in a way that breaks it — s
 `checkToolContract` / `checkPromptContract`, `listTools`, `listResources`, `listResourceTemplates`,
 `listPrompts`, `listSkills` / `readSkill` (SEP-2640: the `skill://index.json` index, then a scan of
 the resource list), `ping` (`server/discover` on modern, `ping` on legacy), `discover` (a live
-`server/discover`, modern only), `setLogLevel`, `subscribeResource` / `unsubscribeResource` (legacy
-sends the RPC; 2026-07-28 has no `resources/subscribe`, so the subscription is expressed through the
-`subscriptions/listen` filter — updates surface as `resource.updated` events and subscriptions are
-generation-scoped, so re-subscribe after a reconnect), `notifyRootsChanged` (legacy-era only — the
-2026 wire removed roots), `connectAll`, `completeAuthorization`, and the task verbs below. The hub
+`server/discover`, modern only), `setLogLevel` (the snapshot records the level once the upstream
+accepted it), `subscribeResource` / `unsubscribeResource` (legacy sends the RPC; 2026-07-28 has no
+`resources/subscribe`, so the subscription is expressed through the `subscriptions/listen` filter —
+updates surface as `resource.updated` events, subscriptions are generation-scoped, so re-subscribe
+after a reconnect, and a subscribe that lands while the session is being replaced rejects with
+`CONNECTION_NOT_ONLINE` instead of pretending), `notifyRootsChanged` (legacy-era only — the 2026
+wire removed roots), `connectAll`, `completeAuthorization`, and the task verbs below. The hub
 mirrors `callToolParsed` and injects the resolved catalog `Tool` as `toolDefinition`. Snapshots
 carry `transportKind`, `sessionId`, `connectionMode` (`stateful` / `stateless`), `supportedVersions`
-(from `server/discover`), `lastSeenAt`, `keepalive`, `instructions`, `serverInfo`,
-`errorDetail { kind, code, httpStatus? }` (so a panel can tell "server is 2025-only" from "401" from
-"registration rejected" from `ECONNREFUSED` — a transport-level cause classifies as `network`
-wherever it sits in the cause chain), and `watch` (which list-changed sections are honored, why not,
-and how often the stream was re-opened).
+(from `server/discover`), `lastSeenAt`, `keepalive` (its failure counters survive into the `failed`
+phase so the verdict stays explainable; a deliberate disconnect or the next connect clears them),
+`instructions`, `serverInfo`, `errorDetail { kind, code, httpStatus? }` (so a panel can tell "server
+is 2025-only" from "401" from "registration rejected" from `ECONNREFUSED` — a transport-level cause
+classifies as `network` wherever it sits in the cause chain), and `watch` (which list-changed
+sections are honored, why not, and how often the stream was re-opened; a dropped stream reads as
+inactive until the retry re-opens it, and `maxRefreshesPerGeneration` counts only refreshes that
+committed a catalog).
 
 Two resilience behaviors run without configuration. A modern `subscriptions/listen` stream that
 drops unexpectedly (`closed` resolving `'remote'`) is re-opened with 1 s → 30 s backoff for as long
@@ -418,13 +429,15 @@ await manager.cancelTask("github", created.task.taskId);
 ```
 
 Task-augmented tool calls (SEP-1686) use the 2025-11-25 wire vocabulary through `Client.request()`
-with the SDK's own result validators: `callToolTask`, `waitForTask` (a `failed` or `cancelled` task
-rejects with `McpTaskFailedError`; `input_required` delegates to `tasks/result`), `callToolViaTask`,
-`getTask`, `getTaskResult`, `listTasks`, `cancelTask`, and `supportsToolTasks`. Revision 2026-07-28
-moved tasks to the `io.modelcontextprotocol/tasks` extension, which the SDK does not implement yet,
-so on a modern connection every task verb rejects with `TASKS_UNAVAILABLE` instead of returning a
-tool result where a task id was expected. `McpTaskClient` exposes the same verbs over a raw official
-`Client`.
+with the SDK's own result validators: `callToolTask` (`ttlMs`, and `pollIntervalMs` as the server
+hint), `waitForTask` (polls at the caller's `pollIntervalMs`, else the server's `pollInterval`
+re-read on every poll; a `signal` aborts the in-flight request, not only the sleep; a `failed` or
+`cancelled` task rejects with `McpTaskFailedError`; `input_required` delegates to `tasks/result`),
+`callToolViaTask`, `getTask`, `getTaskResult`, `listTasks`, `cancelTask`, and `supportsToolTasks`.
+Revision 2026-07-28 moved tasks to the `io.modelcontextprotocol/tasks` extension, which the SDK does
+not implement yet, so on a modern connection every task verb rejects with `TASKS_UNAVAILABLE`
+instead of returning a tool result where a task id was expected. `McpTaskClient` exposes the same
+verbs over a raw official `Client`.
 
 ### OAuth
 
@@ -463,23 +476,36 @@ try {
 `McpOAuthClientProvider` stores credentials per authorization-server issuer (SEP-2352) and per
 optional `profile` (several identities for one server share a store without sharing anything else),
 persists PKCE and discovery state, never overwrites a pre-registered client id, issues and verifies
-the OAuth `state` parameter the SDK leaves to hosts (`AUTH_STATE_MISMATCH`; the manager's
+the OAuth `state` parameter the SDK leaves to hosts (a callback without a pending state, or with a
+state already spent, is refused with `AUTH_STATE_MISMATCH`; `matchesIssuedState` lets a host that
+multiplexes one loopback listener route a callback without consuming it; the manager's
 `completeAuthorization` verifies it before the code is exchanged; the same verb also finishes a
 MID-SESSION round — a 403 scope step-up or a 401 the refresh could not fix surfaces from the
 operation as the SDK's `UnauthorizedError` after the provider was handed the new authorization URL,
 the manager announces `connection.authorization.required` without leaving the online phase, and
 completing it on the live transport stores the widened tokens for the next request), refreshes an
 access token before it expires through the SDK's `refreshAuthorization` (single-flight, 60 s buffer,
-off with `refresh: false`; a failed refresh falls back to the transport's 401 path), and reports
-what it holds through `status()` (issuer, client id, scope, expiry, save time, display-only
-identity). `InMemoryKeyValueStore`, `FileKeyValueStore` (`kmcp/node`, mode `0600`, atomic) and
-`KeyringKeyValueStore` (an OS keyring through a host-supplied `(service, account)` entry factory
-such as `@napi-rs/keyring`'s `Entry`; kmcp itself never loads a native module) are the bundled
-stores. `explainOAuthError` turns any error from the flow into a stable
-`{ kind, message, remediation? }` — registration refused or unsupported, client rejected, access
-denied, issuer mix-up (never echoing the attacker-controlled issuer), insufficient scope — and
-`describeError` carries the same classification into snapshots. `openBrowser` / `browserOpenCommand`
-(`kmcp/node`) open only `http(s)` URLs and never through a shell.
+off with `refresh: false`; a failed refresh falls back to the transport's 401 path; never during the
+SDK's own contextual reads, and a refresh that lands after `invalidateCredentials` is not
+re-stored), forgets tokens under every issuer it ever wrote on `invalidateCredentials("tokens")`,
+discards the PKCE verifier and state as soon as a round ends (`authorizeOAuth`, the manager's
+`completeAuthorization`, or `definition.finishAuthorizationRound()` for hosts that exchange the code
+themselves), and reports what it holds through `status()` (issuer, client id, scope, expiry, save
+time, display-only identity). `InMemoryKeyValueStore`, `FileKeyValueStore` (`kmcp/node`, mode
+`0600`, atomic) and `KeyringKeyValueStore` (an OS keyring through a host-supplied
+`(service, account)` entry factory such as `@napi-rs/keyring`'s `Entry`; kmcp itself never loads a
+native module) are the bundled stores. `explainOAuthError` turns any error from the flow into a
+stable `{ kind, message, remediation? }` — registration refused or unsupported, client rejected,
+access denied, issuer mix-up (never echoing the attacker-controlled issuer), insufficient scope —
+and `describeError` carries the same classification into snapshots (the authorization server's text
+is bounded and stripped of control characters before it reaches a log). `loopbackOAuthCallback`
+answers only top-level `GET` navigations whose `Host` is a loopback name (`127.0.0.1`, `localhost`,
+`[::1]`), keeps listening when an optional `accept(params)` predicate refuses a callback that is not
+ours, and with `hostname: "localhost"` also binds `::1` so a browser resolving to IPv6 lands on the
+same port. `openBrowser` / `browserOpenCommand` (`kmcp/node`) open only `http(s)` URLs and never
+through a shell. Every token endpoint the flows post to must be `https` or loopback (the SDK's
+`assertSecureTokenEndpoint`); `pinnedDiscoveryState(tokenEndpoint, issuer?)` keeps the caller's
+issuer and falls back to the endpoint's origin only when none is known.
 
 Machine-to-machine (`io.modelcontextprotocol/oauth-client-credentials`):
 
@@ -495,11 +521,12 @@ manager.register(httpConnection({ id: "m2m", url: "https://mcp.example.com/mcp",
 `StaticPrivateKeyJwtProvider`; `tokenEndpoint` pins the endpoint for servers without discoverable
 metadata. Enterprise-managed authorization (SEP-990,
 `io.modelcontextprotocol/enterprise-managed-authorization`) is `authorizeEnterpriseIdp` for the
-one-time OIDC sign-in at the IdP (PKCE S256, `state`, `nonce`) and `enterpriseManagedAuth` for the
-runtime `CrossAppAccessProvider`, which exchanges the ID token for an ID-JAG at the IdP and the
-ID-JAG for an access token at the MCP authorization server, renewing the ID token through the IdP
-refresh token (`reloadIdpTokens` / `onIdpTokensRefreshed` keep several processes in step).
-Connections that use either provider advertise the matching capability extension automatically.
+one-time OIDC sign-in at the IdP (PKCE S256, `state`, a `nonce` the ID token must echo, `https`
+authorization endpoints only) and `enterpriseManagedAuth` for the runtime `CrossAppAccessProvider`,
+which exchanges the ID token for an ID-JAG at the IdP and the ID-JAG for an access token at the MCP
+authorization server, renewing the ID token through the IdP refresh token (`reloadIdpTokens` /
+`onIdpTokensRefreshed` keep several processes in step). Connections that use either provider
+advertise the matching capability extension automatically.
 
 ## Hubs
 

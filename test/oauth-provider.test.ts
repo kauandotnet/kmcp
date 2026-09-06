@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { request as httpRequest } from "node:http";
 import test from "node:test";
 
 import type {
@@ -17,6 +18,25 @@ import {
 } from "../src/client/oauth.ts";
 import { KMCP_ERROR_CODES, KmcpError } from "../src/errors.ts";
 import { FileKeyValueStore, loopbackOAuthCallback } from "../src/node/oauth.ts";
+
+/** Loads a URL the way a browser navigation does (Node's fetch sends `Sec-Fetch-Mode: cors`). */
+function browse(url: URL): Promise<{ status: number; text: string }> {
+	return new Promise((resolve, reject) => {
+		const request = httpRequest(
+			url,
+			{ headers: { "sec-fetch-mode": "navigate", "sec-fetch-dest": "document" } },
+			(response) => {
+				const chunks: Buffer[] = [];
+				response.on("data", (chunk: Buffer) => chunks.push(chunk));
+				response.on("end", () =>
+					resolve({ status: response.statusCode ?? 0, text: Buffer.concat(chunks).toString() }),
+				);
+			},
+		);
+		request.on("error", reject);
+		request.end();
+	});
+}
 
 const SERVER_URL = "https://mcp.example.com/mcp";
 const REDIRECT_URL = "http://127.0.0.1:7777/callback";
@@ -403,14 +423,14 @@ test("loopbackOAuthCallback resolves with the full callback query", async () => 
 
 	const wrongPath = new URL(handle.redirectUrl.href);
 	wrongPath.pathname = "/favicon.ico";
-	assert.equal((await fetch(wrongPath)).status, 404);
+	assert.equal((await browse(wrongPath)).status, 404);
 
 	const callback = new URL(handle.redirectUrl.href);
 	callback.searchParams.set("code", "auth-code");
 	callback.searchParams.set("iss", FIRST.issuer);
-	const response = await fetch(callback);
+	const response = await browse(callback);
 	assert.equal(response.status, 200);
-	assert.match(await response.text(), /Authorization complete/);
+	assert.match(response.text, /Authorization complete/);
 
 	const params = await pending;
 	assert.equal(params.get("code"), "auth-code");
@@ -441,7 +461,7 @@ test("loopbackOAuthCallback rejects on an authorization error response", async (
 	const callback = new URL(handle.redirectUrl.href);
 	callback.searchParams.set("error", "access_denied");
 	callback.searchParams.set("error_description", "the user declined");
-	assert.equal((await fetch(callback)).status, 200);
+	assert.equal((await browse(callback)).status, 200);
 
 	await assert.rejects(
 		pending,
