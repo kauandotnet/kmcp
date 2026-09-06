@@ -563,6 +563,11 @@ forwarded.
   sockets: modern through the real `createMcpHandler` path, legacy over `InMemoryTransport`.
 - `pnpm run check` runs typecheck, both-era unit tests, build, a dist smoke test, `publint` and
   prettier. `pnpm run conformance:golden` runs the `server/discover` wire goldens.
+- `test/client-server-oauth-e2e.test.ts` runs kmcp's client against kmcp's own gated HTTP server
+  over real sockets on both eras, with a fake authorization server: discovery through the gate's
+  documents, dynamic registration, the connect-time authorization round, RFC 8707 `resource`
+  binding, and a per-request 403 that forces a mid-session scope step-up completed on the live
+  transport.
 - `pnpm run conformance:client` runs every CLIENT scenario of the official suite (26 in 0.1.16, the
   interactive OAuth ones included: kmcp never opens a browser, so
   `test/conformance/client-fixture.ts` completes the redirect leg itself by fetching the
