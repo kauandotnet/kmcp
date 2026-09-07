@@ -212,8 +212,10 @@ test("authorizeOAuth runs discovery, registration, the redirect leg and the exch
 	assert.equal(result.tokens?.access_token, "at-1");
 	assert.equal(server.registrations, 1);
 	assert.ok(
-		server.calls.every((call) => !call.url.includes("tools=")),
-		"the query string never reaches discovery",
+		server.calls.some(
+			(call) => call.url.includes("oauth-protected-resource") && call.url.includes("tools="),
+		),
+		"discovery sees the query exactly as the transport would send it",
 	);
 	const status = await provider.status();
 	assert.equal(status.hasTokens, true);
@@ -532,7 +534,10 @@ test("JWT helpers decode without verifying and reject malformed input", () => {
 	assert.equal(jwtExpiresAt(jwt), 123);
 	assert.equal(decodeJwtClaims("not-a-jwt"), undefined);
 	assert.equal(decodeJwtClaims("a.b.c"), undefined);
-	assert.equal(oauthServerUrl("https://mcp.example.com/mcp?x=1#y"), "https://mcp.example.com/mcp");
+	assert.equal(
+		oauthServerUrl("https://mcp.example.com/mcp?x=1#y"),
+		"https://mcp.example.com/mcp?x=1",
+	);
 });
 
 test("state verification fails closed: no pending state, a consumed state, and a non-consuming match", async () => {

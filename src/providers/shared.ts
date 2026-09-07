@@ -28,7 +28,7 @@ export function forwardedMeta(ctx: ServerContext): {
 	return { meta: { [CLIENT_CAPABILITIES_META_KEY]: capabilities } };
 }
 
-export const PROJECTED_NAME_REGEX = /^[A-Za-z0-9._-]{1,128}$/;
+export { EXPOSED_NAME_REGEX as PROJECTED_NAME_REGEX } from "../hub/hub.ts";
 
 export interface McpProjectionDrop {
 	readonly kind: "prompt" | "resource" | "resource-template" | "tool";
