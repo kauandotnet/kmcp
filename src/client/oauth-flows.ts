@@ -174,13 +174,16 @@ export async function assertCallbackSucceeded(
 }
 
 /**
- * The URL OAuth discovery runs against: the MCP endpoint without its query and fragment. A query
- * (a tool filter, say) is a connection-level concern; the SDK would otherwise copy it onto the
- * well-known discovery URLs.
+ * The URL OAuth discovery runs against: the MCP endpoint with only its fragment removed. The query
+ * stays because the transport hands its full URL to the SDK's `auth()`, which copies the query onto
+ * the well-known lookups and uses the full URL as the RFC 8707 `resource`; a pre-connection flow
+ * that stripped it would obtain tokens for a different resource than the connection asks for.
  */
 export function oauthServerUrl(serverUrl: string | URL): string {
 	const url = typeof serverUrl === "string" ? new URL(serverUrl) : new URL(serverUrl.href);
-	url.search = "";
+	// Keep the query: the SDK's transport hands its full URL to auth(), and discovery copies the
+	// query onto the well-known lookup, so a tenant-scoped endpoint must resolve the same metadata
+	// here as it does on the wire. Only the fragment never leaves the client.
 	url.hash = "";
 	return url.href;
 }
