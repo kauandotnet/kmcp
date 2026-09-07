@@ -11,7 +11,12 @@ import {
 } from "@modelcontextprotocol/client";
 
 import { KMCP_ERROR_CODES, KmcpError, errorCode } from "../errors.ts";
-import { assertNonEmpty, immutableClone, type MaybePromise } from "../internal/value.ts";
+import {
+	assertNonEmpty,
+	immutableClone,
+	stableFingerprint,
+	type MaybePromise,
+} from "../internal/value.ts";
 import type { McpCatalogSnapshot } from "../client/catalog.ts";
 import type {
 	McpCallToolOptions,
@@ -26,9 +31,32 @@ import type {
 } from "../client/manager.ts";
 import { McpConnectionManager } from "../client/manager.ts";
 
+/**
+ * An allow/deny list over a member's items, evaluated on the UPSTREAM identity (a tool or prompt
+ * name, a resource URI or URI template) BEFORE renaming and namespacing. A pattern is an exact
+ * identity or a prefix ending in a single trailing `*` (`git_*`). `deny` always wins over `allow`;
+ * when `allow` is present only matching items are exposed; an absent filter exposes everything.
+ */
+export interface McpHubMemberFilter {
+	readonly allow?: readonly string[];
+	readonly deny?: readonly string[];
+}
+
 export interface McpHubMember<ConnectionId extends string = string> {
 	readonly connectionId: ConnectionId;
 	readonly namespace: string;
+	/** Filters the member's tools by upstream tool name. */
+	readonly tools?: McpHubMemberFilter;
+	/** Filters the member's prompts by upstream prompt name. */
+	readonly prompts?: McpHubMemberFilter;
+	/** Filters the member's resources and resource templates by URI / URI template. */
+	readonly resources?: McpHubMemberFilter;
+	/**
+	 * Tools only: upstream tool name -> exposed name, applied after `tools` filtering and before
+	 * namespacing. Renamed tools keep their schemas and annotations; the upstream call still uses
+	 * the upstream name.
+	 */
+	readonly rename?: Readonly<Record<string, string>>;
 }
 
 export interface McpHubDefinitionOptions<HubId extends string, ConnectionId extends string> {
@@ -46,20 +74,27 @@ export class McpHubDefinition<
 	readonly label: string;
 	readonly members: readonly McpHubMember<ConnectionId>[];
 	readonly tags: Readonly<Record<string, string>>;
+	/**
+	 * A stable digest of everything that shapes the exposed surface: members, namespaces, filters
+	 * and renames. Two definitions with the same fingerprint project the same catalog from the same
+	 * upstream catalogs, so a consumer can treat `hub.updated` as a no-op when it does not change.
+	 */
+	readonly fingerprint: string;
 
 	constructor(options: McpHubDefinitionOptions<HubId, ConnectionId>) {
 		assertNonEmpty(options.id, "hub id");
 		this.id = options.id;
 		this.label = options.label ?? options.id;
 		assertNonEmpty(this.label, "hub label");
-		this.members = Object.freeze(
-			(options.members ?? []).map((member) => {
-				assertNamespace(member.namespace);
-				return Object.freeze({ ...member });
-			}),
-		);
+		this.members = Object.freeze((options.members ?? []).map((member) => normalizeMember(member)));
 		this.tags = Object.freeze({ ...options.tags });
 		assertUniqueMembers(this.members);
+		this.fingerprint = stableFingerprint({
+			id: this.id,
+			label: this.label,
+			tags: this.tags,
+			members: this.members,
+		});
 		Object.freeze(this);
 	}
 
@@ -84,6 +119,14 @@ export function defineHub<const HubId extends string, const ConnectionId extends
 export interface McpHubMemberSnapshot<ConnectionId extends string = string> {
 	readonly namespace: string;
 	readonly connection: McpConnectionSnapshot<ConnectionId>;
+	/**
+	 * The effective filters and renames, echoed from the definition so a UI can render which of the
+	 * member's items are disabled. Denied items are never listed in the hub catalog itself.
+	 */
+	readonly tools?: McpHubMemberFilter;
+	readonly prompts?: McpHubMemberFilter;
+	readonly resources?: McpHubMemberFilter;
+	readonly rename?: Readonly<Record<string, string>>;
 }
 
 export interface McpHubSnapshot<
@@ -93,6 +136,7 @@ export interface McpHubSnapshot<
 	readonly id: HubId;
 	readonly label: string;
 	readonly tags: Readonly<Record<string, string>>;
+	readonly fingerprint: string;
 	readonly members: readonly McpHubMemberSnapshot<ConnectionId>[];
 }
 
@@ -110,7 +154,10 @@ export interface McpHubToolRoute<ConnectionId extends string = string> {
 	readonly route: string;
 	readonly namespace: string;
 	readonly connectionId: ConnectionId;
+	/** The upstream tool name, which is what the member is actually called with. */
 	readonly sourceName: string;
+	/** The name exposed under the namespace: `rename[sourceName]` when renamed, else `sourceName`. */
+	readonly exposedName: string;
 	readonly generation: number;
 	readonly catalogFingerprint: string;
 	readonly tool: Tool;
@@ -160,6 +207,8 @@ export interface McpHubCatalogSnapshot<
 	ConnectionId extends string = string,
 > {
 	readonly hubId: HubId;
+	/** The definition fingerprint this catalog was projected with. */
+	readonly fingerprint: string;
 	readonly members: readonly McpHubCatalogMember<ConnectionId>[];
 	readonly tools: readonly McpHubToolRoute<ConnectionId>[];
 	readonly prompts: readonly McpHubPromptRoute<ConnectionId>[];
@@ -332,28 +381,34 @@ export class McpHubManager<
 	} {
 		const routeName = typeof route === "string" ? route : route.route;
 		const match = resolveRoute(this.#hub(id), routeName);
-		const identity = this.#catalogIdentity(match.connectionId, "tools");
-		const tool = findExactlyOne(
-			identity?.catalog.tools.items ?? [],
-			(candidate) => candidate.name === match.sourceName,
-		);
-		if (identity === undefined || tool === undefined) throw unknownRoute(routeName);
+		const identity = this.#catalogIdentity(match.member.connectionId, "tools");
+		// The exposed name is resolved against the same filtered, renamed, de-duplicated view the
+		// catalog projects, so a denied or shadowed tool is as unknown here as a missing one.
+		const exposed =
+			identity === undefined
+				? undefined
+				: findExactlyOne(
+						exposedTools(match.member, identity.catalog.tools.items),
+						(candidate) => candidate.exposedName === match.name,
+					);
+		if (identity === undefined || exposed === undefined) throw unknownRoute(routeName);
 		if (
 			typeof route !== "string" &&
-			(route.namespace !== match.namespace ||
-				route.connectionId !== match.connectionId ||
-				route.sourceName !== match.sourceName ||
+			(route.namespace !== match.member.namespace ||
+				route.connectionId !== match.member.connectionId ||
+				route.sourceName !== exposed.tool.name ||
+				route.exposedName !== exposed.exposedName ||
 				route.generation !== identity.catalog.generation ||
 				route.catalogFingerprint !== identity.catalog.fingerprint ||
-				route.tool.name !== tool.name)
+				route.tool.name !== exposed.tool.name)
 		) {
 			throw unknownRoute(routeName);
 		}
 		return {
-			connectionId: match.connectionId,
-			sourceName: match.sourceName,
+			connectionId: match.member.connectionId,
+			sourceName: exposed.tool.name,
 			control: identity.control,
-			tool,
+			tool: exposed.tool,
 		};
 	}
 
@@ -379,17 +434,19 @@ export class McpHubManager<
 		throwIfAborted(options?.signal);
 		const routeName = typeof route === "string" ? route : route.route;
 		const match = resolveRoute(this.#hub(id), routeName);
-		const identity = this.#catalogIdentity(match.connectionId, "prompts");
-		const prompt = findExactlyOne(
-			identity?.catalog.prompts.items ?? [],
-			(candidate) => candidate.name === match.sourceName,
-		);
+		const identity = this.#catalogIdentity(match.member.connectionId, "prompts");
+		const prompt = admits(match.member.prompts, match.name)
+			? findExactlyOne(
+					identity?.catalog.prompts.items ?? [],
+					(candidate) => candidate.name === match.name,
+				)
+			: undefined;
 		if (identity === undefined || prompt === undefined) throw unknownRoute(routeName);
 		if (
 			typeof route !== "string" &&
-			(route.namespace !== match.namespace ||
-				route.connectionId !== match.connectionId ||
-				route.sourceName !== match.sourceName ||
+			(route.namespace !== match.member.namespace ||
+				route.connectionId !== match.member.connectionId ||
+				route.sourceName !== match.name ||
 				route.generation !== identity.catalog.generation ||
 				route.catalogFingerprint !== identity.catalog.fingerprint ||
 				route.prompt.name !== prompt.name)
@@ -397,8 +454,8 @@ export class McpHubManager<
 			throw unknownRoute(routeName);
 		}
 		return this.#connections.getPrompt(
-			match.connectionId,
-			match.sourceName,
+			match.member.connectionId,
+			match.name,
 			arguments_,
 			options,
 			identity.control,
@@ -455,6 +512,9 @@ export class McpHubManager<
 		const member = definition.members.find((candidate) => candidate.namespace === namespace);
 		const routeName = `${namespace}:${uri}`;
 		if (member === undefined) throw unknownRoute(routeName);
+		// The filter is matched on the REQUESTED URI, so it covers template expansions too: a denied
+		// URI can never be reached through one of the member's templates.
+		if (!admits(member.resources, uri)) throw unknownRoute(routeName);
 		const identity = this.#catalogIdentity(member.connectionId, "resources");
 		if (identity === undefined) throw unknownRoute(routeName);
 		const resource = findExactlyOne(
@@ -467,7 +527,12 @@ export class McpHubManager<
 			if (
 				templates === undefined ||
 				templates.catalog !== identity.catalog ||
-				!matchesAnyTemplate(templates.catalog.resourceTemplates.items, uri)
+				!matchesAnyTemplate(
+					templates.catalog.resourceTemplates.items.filter((item) =>
+						admits(member.resources, item.uriTemplate),
+					),
+					uri,
+				)
 			) {
 				throw unknownRoute(routeName);
 			}
@@ -506,13 +571,21 @@ export class McpHubManager<
 		const routeName = typeof route === "string" ? route : route.route;
 		const target = resolveCompletionRoute(definition, routeName);
 		const identity = this.#catalogIdentity(
-			target.connectionId,
+			target.member.connectionId,
 			target.kind === "prompt" ? "prompts" : "resourceTemplates",
 		);
 		if (identity === undefined) throw unknownRoute(routeName);
 		if (
+			!admits(
+				target.kind === "prompt" ? target.member.prompts : target.member.resources,
+				target.source,
+			)
+		) {
+			throw unknownRoute(routeName);
+		}
+		if (
 			typeof route !== "string" &&
-			(route.connectionId !== target.connectionId ||
+			(route.connectionId !== target.member.connectionId ||
 				route.generation !== identity.catalog.generation ||
 				route.catalogFingerprint !== identity.catalog.fingerprint)
 		) {
@@ -534,7 +607,7 @@ export class McpHubManager<
 					: ({ type: "ref/resource", uri: target.source } as const);
 		if (ref === undefined) throw unknownRoute(routeName);
 		return this.#connections.complete(
-			target.connectionId,
+			target.member.connectionId,
 			{
 				ref,
 				argument: { name: argument.name, value: argument.value },
@@ -609,9 +682,11 @@ export class McpHubManager<
 		const resourceTemplates: McpHubResourceTemplateRoute<ConnectionId>[] = [];
 		for (const [index, member] of members.entries()) {
 			const connection = connections[index];
+			const filters = definition.members[index];
 			const catalog = member.catalog;
 			if (
 				connection === undefined ||
+				filters === undefined ||
 				catalog === undefined ||
 				catalog.generation !== connection.generation ||
 				!isRoutablePhase(connection.phase)
@@ -619,22 +694,24 @@ export class McpHubManager<
 				continue;
 			}
 			if (catalog.tools.status === "fresh" && catalog.tools.fingerprint !== undefined) {
-				for (const tool of uniquelyNamed(catalog.tools.items)) {
+				for (const exposed of exposedTools(filters, catalog.tools.items)) {
 					tools.push(
 						Object.freeze({
-							route: `${member.namespace}.${tool.name}`,
+							route: `${member.namespace}.${exposed.exposedName}`,
 							namespace: member.namespace,
 							connectionId: member.connectionId,
-							sourceName: tool.name,
+							sourceName: exposed.tool.name,
+							exposedName: exposed.exposedName,
 							generation: catalog.generation,
 							catalogFingerprint: catalog.fingerprint,
-							tool: immutableClone(tool),
+							tool: immutableClone(exposed.tool),
 						}),
 					);
 				}
 			}
 			if (catalog.prompts.status === "fresh" && catalog.prompts.fingerprint !== undefined) {
 				for (const prompt of uniquelyNamed(catalog.prompts.items)) {
+					if (!admits(filters.prompts, prompt.name)) continue;
 					prompts.push(
 						Object.freeze({
 							route: `${member.namespace}.${prompt.name}`,
@@ -650,6 +727,7 @@ export class McpHubManager<
 			}
 			if (catalog.resources.status === "fresh" && catalog.resources.fingerprint !== undefined) {
 				for (const resource of uniquelyIdentified(catalog.resources.items, (item) => item.uri)) {
+					if (!admits(filters.resources, resource.uri)) continue;
 					resources.push(
 						Object.freeze({
 							route: `${member.namespace}:${resource.uri}`,
@@ -672,6 +750,7 @@ export class McpHubManager<
 					catalog.resourceTemplates.items,
 					(item) => item.uriTemplate,
 				)) {
+					if (!admits(filters.resources, resourceTemplate.uriTemplate)) continue;
 					resourceTemplates.push(
 						Object.freeze({
 							route: `${member.namespace}:${resourceTemplate.uriTemplate}`,
@@ -689,6 +768,7 @@ export class McpHubManager<
 		}
 		return Object.freeze({
 			hubId: definition.id,
+			fingerprint: definition.fingerprint,
 			members: Object.freeze(members),
 			tools: Object.freeze(tools),
 			prompts: Object.freeze(prompts),
@@ -704,11 +784,16 @@ export class McpHubManager<
 			id: definition.id,
 			label: definition.label,
 			tags: definition.tags,
+			fingerprint: definition.fingerprint,
 			members: Object.freeze(
 				definition.members.map((member) =>
 					Object.freeze({
 						namespace: member.namespace,
 						connection: this.#connections.state(member.connectionId),
+						...(member.tools === undefined ? {} : { tools: member.tools }),
+						...(member.prompts === undefined ? {} : { prompts: member.prompts }),
+						...(member.resources === undefined ? {} : { resources: member.resources }),
+						...(member.rename === undefined ? {} : { rename: member.rename }),
 					}),
 				),
 			),
@@ -825,18 +910,14 @@ function resolveRoute<HubId extends string, ConnectionId extends string>(
 	hub: McpHubDefinition<HubId, ConnectionId>,
 	route: string,
 ): {
-	readonly namespace: string;
-	readonly connectionId: ConnectionId;
-	readonly sourceName: string;
+	readonly member: McpHubMember<ConnectionId>;
+	/** The name as EXPOSED under the namespace (renamed, for tools). */
+	readonly name: string;
 } {
 	for (const member of hub.members) {
 		const prefix = `${member.namespace}.`;
 		if (route.startsWith(prefix) && route.length > prefix.length) {
-			return Object.freeze({
-				namespace: member.namespace,
-				connectionId: member.connectionId,
-				sourceName: route.slice(prefix.length),
-			});
+			return Object.freeze({ member, name: route.slice(prefix.length) });
 		}
 	}
 	throw unknownRoute(route);
@@ -847,7 +928,7 @@ function resolveCompletionRoute<HubId extends string, ConnectionId extends strin
 	route: string,
 ): {
 	readonly kind: "prompt" | "resourceTemplate";
-	readonly connectionId: ConnectionId;
+	readonly member: McpHubMember<ConnectionId>;
 	readonly source: string;
 } {
 	for (const member of hub.members) {
@@ -856,19 +937,151 @@ function resolveCompletionRoute<HubId extends string, ConnectionId extends strin
 		if (route.startsWith(templatePrefix) && route.length > templatePrefix.length) {
 			return Object.freeze({
 				kind: "resourceTemplate",
-				connectionId: member.connectionId,
+				member,
 				source: route.slice(templatePrefix.length),
 			});
 		}
 		if (route.startsWith(promptPrefix) && route.length > promptPrefix.length) {
 			return Object.freeze({
 				kind: "prompt",
-				connectionId: member.connectionId,
+				member,
 				source: route.slice(promptPrefix.length),
 			});
 		}
 	}
 	throw unknownRoute(route);
+}
+
+interface McpHubExposedTool {
+	readonly tool: Tool;
+	readonly exposedName: string;
+}
+
+/**
+ * The member's tools as they are exposed: filtered on the upstream name, renamed, then narrowed to
+ * the names that identify exactly one tool (an ambiguous name is dropped, as duplicate upstream
+ * names already are).
+ */
+function exposedTools<ConnectionId extends string>(
+	member: McpHubMember<ConnectionId>,
+	items: readonly Tool[],
+): McpHubExposedTool[] {
+	const exposed: McpHubExposedTool[] = [];
+	for (const tool of uniquelyNamed(items)) {
+		if (!admits(member.tools, tool.name)) continue;
+		exposed.push(Object.freeze({ tool, exposedName: renamed(member.rename, tool.name) }));
+	}
+	return uniquelyIdentified(exposed, (entry) => entry.exposedName);
+}
+
+function renamed(rename: Readonly<Record<string, string>> | undefined, name: string): string {
+	if (rename === undefined || !Object.hasOwn(rename, name)) return name;
+	return rename[name] ?? name;
+}
+
+/** Whether a filter exposes an upstream identity. `deny` wins; an absent filter exposes everything. */
+function admits(filter: McpHubMemberFilter | undefined, value: string): boolean {
+	if (filter === undefined) return true;
+	if (filter.deny?.some((pattern) => matchesPattern(pattern, value)) === true) return false;
+	if (filter.allow === undefined) return true;
+	return filter.allow.some((pattern) => matchesPattern(pattern, value));
+}
+
+function matchesPattern(pattern: string, value: string): boolean {
+	if (pattern.endsWith("*")) return value.startsWith(pattern.slice(0, -1));
+	return value === pattern;
+}
+
+function normalizeMember<ConnectionId extends string>(
+	member: McpHubMember<ConnectionId>,
+): McpHubMember<ConnectionId> {
+	assertNamespace(member.namespace);
+	const label = `hub member '${member.namespace}'`;
+	const tools = normalizeFilter(member.tools, `${label} tools filter`);
+	const prompts = normalizeFilter(member.prompts, `${label} prompts filter`);
+	const resources = normalizeFilter(member.resources, `${label} resources filter`);
+	const rename = normalizeRename(member.rename, `${label} rename`);
+	return Object.freeze({
+		connectionId: member.connectionId,
+		namespace: member.namespace,
+		...(tools === undefined ? {} : { tools }),
+		...(prompts === undefined ? {} : { prompts }),
+		...(resources === undefined ? {} : { resources }),
+		...(rename === undefined ? {} : { rename }),
+	});
+}
+
+function normalizeFilter(
+	filter: McpHubMemberFilter | undefined,
+	label: string,
+): McpHubMemberFilter | undefined {
+	if (filter === undefined) return undefined;
+	// `allow: []` is a present allow list that exposes nothing, so it is never collapsed away.
+	const allow = normalizePatterns(filter.allow, `${label} allow`);
+	const deny = normalizePatterns(filter.deny, `${label} deny`);
+	if (allow === undefined && deny === undefined) return undefined;
+	return Object.freeze({
+		...(allow === undefined ? {} : { allow }),
+		...(deny === undefined ? {} : { deny }),
+	});
+}
+
+function normalizePatterns(
+	patterns: readonly string[] | undefined,
+	label: string,
+): readonly string[] | undefined {
+	if (patterns === undefined) return undefined;
+	return Object.freeze(
+		patterns.map((pattern) => {
+			if (typeof pattern !== "string" || pattern.trim().length === 0) {
+				throw new KmcpError(
+					KMCP_ERROR_CODES.INVALID_DEFINITION,
+					`${label} must not contain an empty pattern.`,
+				);
+			}
+			const star = pattern.indexOf("*");
+			if (star !== -1 && star !== pattern.length - 1) {
+				throw new KmcpError(
+					KMCP_ERROR_CODES.INVALID_DEFINITION,
+					`${label} pattern '${pattern}' may only use '*' as its last character.`,
+				);
+			}
+			return pattern;
+		}),
+	);
+}
+
+function normalizeRename(
+	rename: Readonly<Record<string, string>> | undefined,
+	label: string,
+): Readonly<Record<string, string>> | undefined {
+	if (rename === undefined) return undefined;
+	const entries = Object.entries(rename);
+	if (entries.length === 0) return undefined;
+	const targets = new Set<string>();
+	for (const [source, target] of entries) {
+		if (source.trim().length === 0) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`${label} must not rename an empty tool name.`,
+			);
+		}
+		if (typeof target !== "string" || target.trim().length === 0) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`${label} must not map '${source}' to an empty name.`,
+			);
+		}
+		if (targets.has(target)) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`${label} maps more than one tool to '${target}'.`,
+			);
+		}
+		targets.add(target);
+	}
+	// `fromEntries` keeps `__proto__` an own property; reads go through `Object.hasOwn`.
+	return Object.freeze(Object.fromEntries(entries));
 }
 
 function matchesAnyTemplate(templates: readonly ResourceTemplateType[], uri: string): boolean {

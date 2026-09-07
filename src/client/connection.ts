@@ -45,7 +45,7 @@ import {
 	isModernProtocolVersion,
 	resolveProtocolPin,
 } from "../internal/protocol.ts";
-import { assertNonEmpty, type MaybePromise } from "../internal/value.ts";
+import { assertNonEmpty, stableFingerprint, type MaybePromise } from "../internal/value.ts";
 import { KMCP_VERSION } from "../internal/version.ts";
 import type { McpCallbackStateVerifier } from "./oauth.ts";
 import {
@@ -290,6 +290,27 @@ export interface McpConnectionDefinitionOptions<Id extends string> {
 	 * `authorizing` phase instead of failing it. Never exposed on snapshots.
 	 */
 	readonly oauth?: OAuthClientProvider;
+	/**
+	 * The revision of this definition, as the caller counts revisions. `replace` and `reconcile`
+	 * compare definitions by {@link McpConnectionDefinition.fingerprint}, so a host that rebuilds
+	 * its definitions on every config read (a config loader passing a digest of the raw entry, a
+	 * UI re-rendering its server list) keeps live sessions instead of bouncing them.
+	 *
+	 * Absent, the definition derives one from its own non-secret shape — never from a credential,
+	 * so two definitions that differ ONLY in a token, a header value or an env value compare
+	 * equal. Where the credential is part of your revision, supply this instead.
+	 */
+	readonly fingerprint?: string;
+	/**
+	 * What `transport` opens, as a non-secret string, for the shape-derived `fingerprint`. The
+	 * built-in helpers (`httpConnection`, `sseConnection`, `inProcessConnection`) fill it in and do
+	 * not accept it; it is the seam a hand-written connection factory uses to make its definitions
+	 * comparable. Nothing secret belongs here: header NAMES not values, env KEYS not values.
+	 *
+	 * Absent (a bare `defineConnection` with its own transport factory), the definition falls back
+	 * to a per-instance value, so two distinct objects never compare equal by accident.
+	 */
+	readonly transportFingerprint?: string;
 }
 
 export class McpConnectionDefinition<const Id extends string = string> {
@@ -310,6 +331,7 @@ export class McpConnectionDefinition<const Id extends string = string> {
 	readonly terminateSession: boolean;
 	readonly resumed: McpResolvedResumedSession | undefined;
 	#resumePending: boolean;
+	readonly #fingerprint: string;
 	readonly #pinnedStrictCapabilities: boolean | undefined;
 	readonly #transportFactory: McpTransportFactory;
 	readonly #requestHandlers: McpClientRequestHandlers;
@@ -437,11 +459,34 @@ export class McpConnectionDefinition<const Id extends string = string> {
 		if (typeof options.transport !== "function") {
 			throw new TypeError("transport must be a factory function.");
 		}
+		this.#fingerprint = options.fingerprint ?? shapeFingerprint(this, options, extensions);
 		Object.freeze(this);
 	}
 
 	openTransport(): MaybePromise<Transport> {
 		return this.#transportFactory();
+	}
+
+	/**
+	 * The revision `replace` and `reconcile` compare definitions by: two definitions with the same
+	 * fingerprint describe the same connection, so an equivalent one is left completely untouched
+	 * (generation, session and all) instead of being torn down and rebuilt.
+	 *
+	 * It is the caller-supplied `fingerprint` when the definition carried one, else a digest of the
+	 * definition's own NON-SECRET shape — id, label, tags, client info, transport kind, pinned
+	 * revision, log level, request defaults, the refresh/reconnect/keepalive/timeout policies,
+	 * capability extensions, roots, which handlers are registered — plus whatever the connection
+	 * helper could say about its transport without leaking anything (`transportFingerprint`: a URL
+	 * and header NAMES, a command and env KEYS, an in-process era and server identity).
+	 *
+	 * Two consequences worth knowing. Credentials are deliberately absent: a definition whose only
+	 * change is a token, a header value or an env value compares EQUAL, so pass an explicit
+	 * `fingerprint` where the credential is part of the revision. And a definition whose transport
+	 * is an opaque factory (a bare `defineConnection`) has nothing comparable, so it falls back to
+	 * a per-instance value and never compares equal to another object.
+	 */
+	get fingerprint(): string {
+		return this.#fingerprint;
 	}
 
 	/**
@@ -682,6 +727,119 @@ export function normalizeRoots(roots: readonly string[] | readonly Root[]): Root
 	});
 }
 
+/**
+ * Definitions that could not describe their transport get one of these instead of a shape digest,
+ * so `sameDefinition` falls back to reference identity for them rather than declaring two opaque
+ * transport factories equivalent. A counter is enough: the value never leaves this process.
+ */
+let opaqueDefinitions = 0;
+
+/**
+ * The shape digest behind {@link McpConnectionDefinition.fingerprint}. Only fields that are
+ * non-secret AND stable across two builds of the same configuration take part: no credential, no
+ * header or env VALUE, no OAuth provider state (its presence, but never what it holds), and no
+ * live closure (a handler contributes its method name, never the function). Anything that cannot
+ * be described that way arrives pre-digested as `transportFingerprint`, or not at all — in which
+ * case the definition is unique to itself.
+ */
+function shapeFingerprint(
+	definition: McpConnectionDefinition<string>,
+	options: McpConnectionDefinitionOptions<string>,
+	extensions: McpCapabilityExtensions,
+): string {
+	try {
+		return stableFingerprint({
+			id: definition.id,
+			label: definition.label,
+			clientInfo: { ...definition.clientInfo },
+			tags: { ...definition.tags },
+			transportKind: definition.transportKind,
+			transport: options.transportFingerprint ?? null,
+			protocolVersion: definition.protocolVersion ?? null,
+			logLevel: definition.logLevel ?? null,
+			defaults: comparableDefaults(options.defaults),
+			autoRefreshCatalog: definition.autoRefreshCatalog ?? null,
+			reconnect: definition.reconnect ?? null,
+			keepalive: definition.keepalive ?? null,
+			disconnectTimeoutMs: definition.disconnectTimeoutMs ?? null,
+			terminateSession: definition.terminateSession,
+			tasks: options.tasks !== false,
+			extensions,
+			advertise: { ...options.advertise },
+			inputRequired: comparableInputRequired(options.inputRequired),
+			roots: comparableRoots(options.roots),
+			requestHandlers: Object.keys(options.requestHandlers ?? {}).sort(),
+			notificationHandlers: Object.keys(options.notificationHandlers ?? {}).sort(),
+			configureClient: options.configureClient !== undefined,
+			// Presence only. An OAuth provider holds tokens and PKCE state; none of it is comparable
+			// and none of it may be digested.
+			oauth: options.oauth !== undefined,
+			resumed: options.resumed !== undefined,
+			// The last component: without a description of the transport there is nothing to compare,
+			// so the definition is made unique to itself instead of accidentally equal to another.
+			opaque: options.transportFingerprint === undefined ? (opaqueDefinitions += 1) : null,
+		});
+	} catch {
+		// A hostile `extensions` payload (a cycle, an exotic getter) must not stop a definition from
+		// being constructed. An uncomparable definition is simply unique.
+		opaqueDefinitions += 1;
+		return `opaque:${opaqueDefinitions}`;
+	}
+}
+
+/** The request defaults minus `onprogress`, which is a closure: only whether one was supplied. */
+function comparableDefaults(defaults: McpRequestDefaults | undefined): Record<string, unknown> {
+	const { onprogress, ...rest } = defaults ?? {};
+	return { ...rest, onprogress: onprogress !== undefined };
+}
+
+/** `maxRounds` plus the names of the driver hooks; the hooks themselves are closures. */
+function comparableInputRequired(
+	inputRequired: (InputRequiredOptions & { readonly maxRounds: number }) | undefined,
+): Record<string, unknown> | null {
+	if (inputRequired === undefined) return null;
+	return { maxRounds: inputRequired.maxRounds, options: Object.keys(inputRequired).sort() };
+}
+
+/** Static roots normalize to their URIs; a callback can only contribute the fact that it exists. */
+function comparableRoots(roots: McpRootsSource | undefined): unknown {
+	if (roots === undefined) return null;
+	if (typeof roots === "function") return "dynamic";
+	return normalizeRoots(roots).map((root) => root.uri);
+}
+
+/** Lowercased header NAMES, sorted and de-duplicated. Values never take part in a fingerprint. */
+function headerNames(...inits: readonly (HeadersInit | undefined)[]): string[] {
+	const names = new Set<string>();
+	for (const init of inits) for (const [name] of headerEntries(init)) names.add(name);
+	return [...names].sort();
+}
+
+/** How a connection is authenticated, never with what: the shape, not the credential. */
+function authShape(auth: McpHttpAuth | undefined): string {
+	if (auth === undefined) return "none";
+	if (typeof auth === "string") return "bearer";
+	if (isOAuthClientProvider(auth)) return `oauth:${oauthGrantOf(auth) ?? "unknown"}`;
+	return "provider";
+}
+
+/**
+ * A stable id for one in-process server definition object. The definition is a bag of closures
+ * with nothing digestible in it, so identity is the only honest comparison: the same object is the
+ * same server, a rebuilt one is a different server.
+ */
+const inProcessServerIds = new WeakMap<McpInProcessServer, string>();
+let inProcessServers = 0;
+
+function inProcessServerId(server: McpInProcessServer): string {
+	const known = inProcessServerIds.get(server);
+	if (known !== undefined) return known;
+	inProcessServers += 1;
+	const id = `server:${inProcessServers}`;
+	inProcessServerIds.set(server, id);
+	return id;
+}
+
 export function defineConnection<const Id extends string>(
 	options: McpConnectionDefinitionOptions<Id>,
 ): McpConnectionDefinition<Id> {
@@ -712,7 +870,7 @@ export const MCP_HTTP_RECONNECTION_DEFAULTS: StreamableHTTPReconnectionOptions =
 
 export interface McpHttpConnectionOptions<Id extends string> extends Omit<
 	McpConnectionDefinitionOptions<Id>,
-	"transport" | "transportKind" | "oauth" | "resumed"
+	"transport" | "transportKind" | "transportFingerprint" | "oauth" | "resumed"
 > {
 	readonly url: string | URL;
 	readonly transportOptions?: StreamableHTTPClientTransportOptions;
@@ -823,6 +981,21 @@ export function httpConnection<const Id extends string>(
 		clientOptions,
 		extensions: { ...grantExtensions, ...definition.extensions },
 		transportKind: "streamable-http",
+		// Everything a Streamable HTTP connection can say about itself without saying a secret: the
+		// endpoint, which headers are set (never their values), how it authenticates (never with
+		// what), and the stream's reconnection policy.
+		transportFingerprint: stableFingerprint({
+			url: endpoint.href,
+			headers: headerNames(headers, transportOptions?.requestInit?.headers),
+			auth: authShape(auth),
+			authHeaders: authHeaders !== undefined,
+			middlewares: middlewares?.length ?? 0,
+			fetch: transportOptions?.fetch !== undefined,
+			reconnection: reconnectionOptions,
+			cachePartition: cachePartition ?? null,
+			responseCacheStore: responseCacheStore !== undefined,
+			defaultCacheTtlMs: defaultCacheTtlMs ?? null,
+		}),
 		...(resume === undefined ? {} : { resumed: resume }),
 		...(oauth === undefined ? {} : { oauth }),
 		transport: () => {
@@ -854,7 +1027,7 @@ export function httpConnection<const Id extends string>(
 
 export interface McpSseConnectionOptions<Id extends string> extends Omit<
 	McpConnectionDefinitionOptions<Id>,
-	"transport" | "transportKind" | "oauth" | "resumed" | "protocolVersion"
+	"transport" | "transportKind" | "transportFingerprint" | "oauth" | "resumed" | "protocolVersion"
 > {
 	/** The SSE endpoint (the `GET` that opens the event stream). */
 	readonly url: string | URL;
@@ -936,6 +1109,14 @@ export function sseConnection<const Id extends string>(
 		},
 		extensions: { ...grantExtensions, ...definition.extensions },
 		transportKind: "sse",
+		transportFingerprint: stableFingerprint({
+			url: endpoint.href,
+			headers: headerNames(headers, transportOptions?.requestInit?.headers),
+			auth: authShape(auth),
+			cachePartition: cachePartition ?? null,
+			responseCacheStore: responseCacheStore !== undefined,
+			defaultCacheTtlMs: defaultCacheTtlMs ?? null,
+		}),
 		...(oauth === undefined ? {} : { oauth }),
 		transport: () =>
 			new SSEClientTransport(endpoint, {
@@ -1054,7 +1235,7 @@ export interface McpInProcessServer {
 
 export interface McpInProcessConnectionOptions<Id extends string> extends Omit<
 	McpConnectionDefinitionOptions<Id>,
-	"transport" | "transportKind" | "oauth"
+	"transport" | "transportKind" | "transportFingerprint" | "oauth"
 > {
 	readonly definition: McpInProcessServer;
 	/** The protocol era the connection negotiates. Default: `"modern"`. */
@@ -1098,6 +1279,14 @@ export function inProcessConnection<const Id extends string>(
 		...rest,
 		clientOptions: { ...rest.clientOptions, versionNegotiation: negotiation },
 		transportKind: "in-process",
+		// The server definition is a bag of closures, so it contributes its identity and nothing
+		// else; `authInfo` carries a token, so only its presence takes part.
+		transportFingerprint: stableFingerprint({
+			era,
+			server: inProcessServerId(definition),
+			mcp: Object.keys(mcp ?? {}).sort(),
+			authInfo: authInfo !== undefined,
+		}),
 		transport:
 			era === "modern"
 				? () => openModernInProcessTransport(definition, mcp, authInfo)

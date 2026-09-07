@@ -29,6 +29,7 @@ import {
 } from "./client/connection.ts";
 import { type McpAuthGate, withMcpAuth } from "./auth/gate.ts";
 import { KMCP_ERROR_CODES, KmcpError } from "./errors.ts";
+import { stableFingerprint } from "./internal/value.ts";
 import {
 	type McpServerRuntime,
 	type McpServerSource,
@@ -67,6 +68,13 @@ export function stdioConnection<const Id extends string>(
 	return new McpConnectionDefinition({
 		...definition,
 		transportKind: "stdio",
+		// Shape only: the command line, the env NAMES and the cwd, never env values.
+		transportFingerprint: stableFingerprint({
+			command: stdio.command,
+			args: stdio.args ?? [],
+			env: Object.keys(stdio.env ?? {}).sort(),
+			cwd: stdio.cwd ?? null,
+		}),
 		transport: () => {
 			if (onStderrLine === undefined) return new StdioClientTransport(stdio);
 			const transport = new StdioClientTransport({ ...stdio, stderr: "pipe" });

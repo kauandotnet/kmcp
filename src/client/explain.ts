@@ -113,37 +113,45 @@ function classify(
 	}
 }
 
+/**
+ * A rejected credential is an `authorization` story on BOTH paths. `explainConnectionError` is
+ * called with a live error one moment and with the snapshot that recorded it the next, and a host
+ * branching on `kind` must not see the same failure land in two different families — so these two
+ * are answered from the code `describeError` records, before the live error is consulted at all.
+ */
+const UNAUTHORIZED: McpConnectionExplanation = Object.freeze({
+	kind: "authorization",
+	code: "unauthorized",
+	message: "The server requires authorization and the current credentials were not accepted.",
+	remediation: "Authorize this connection again to obtain fresh tokens.",
+});
+
+const INSUFFICIENT_SCOPE: McpConnectionExplanation = Object.freeze({
+	kind: "authorization",
+	code: "insufficient_scope",
+	message: "The server requires a scope the current token does not carry.",
+	remediation: "Authorize again requesting the scope the server asked for.",
+});
+
 function explainOAuth(detail: McpErrorDetail, error: unknown): McpConnectionExplanation {
-	if (error !== undefined) {
-		const oauth = explainOAuthError(error);
-		if (oauth.kind !== "unknown") {
-			return frozen({
-				kind: "oauth",
-				message: oauth.message,
-				...(oauth.remediation === undefined ? {} : { remediation: oauth.remediation }),
-				code: oauth.oauthCode ?? String(detail.code),
-				...(oauth.httpStatus === undefined ? {} : { httpStatus: oauth.httpStatus }),
-			});
-		}
+	const oauth = error === undefined ? undefined : explainOAuthError(error);
+	const live = oauth === undefined || oauth.kind === "unknown" ? undefined : oauth;
+	// Either witness — the recorded code, or the live classification — settles these two.
+	const code = String(detail.code);
+	if (code === "unauthorized" || live?.kind === "unauthorized") return UNAUTHORIZED;
+	if (code === "insufficient_scope" || live?.kind === "insufficient_scope") {
+		return INSUFFICIENT_SCOPE;
+	}
+	if (live !== undefined) {
+		return frozen({
+			kind: "oauth",
+			message: live.message,
+			...(live.remediation === undefined ? {} : { remediation: live.remediation }),
+			code: live.oauthCode ?? code,
+			...(live.httpStatus === undefined ? {} : { httpStatus: live.httpStatus }),
+		});
 	}
 	// The snapshot path has only the code `describeError` recorded; it still names the round.
-	const code = String(detail.code);
-	if (code === "unauthorized") {
-		return frozen({
-			kind: "authorization",
-			code,
-			message: "The server requires authorization and the current credentials were not accepted.",
-			remediation: "Authorize this connection again to obtain fresh tokens.",
-		});
-	}
-	if (code === "insufficient_scope") {
-		return frozen({
-			kind: "authorization",
-			code,
-			message: "The server requires a scope the current token does not carry.",
-			remediation: "Authorize again requesting the scope the server asked for.",
-		});
-	}
 	return frozen({
 		kind: "oauth",
 		code,

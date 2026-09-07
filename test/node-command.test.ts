@@ -138,6 +138,75 @@ test("resolveExecutable checks explicit paths and returns them as written", asyn
 	assert.equal(await resolveExecutable(join(directory, "nope"), bare), undefined);
 });
 
+test("resolveExecutable applies the executable test to an explicit path too", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "kmcp-bin-"));
+	const tool = join(directory, "kmcp-run");
+	await writeFile(tool, "#!/bin/sh\nexit 0\n");
+	await chmod(tool, 0o755);
+	const data = join(directory, "kmcp-data.bat");
+	await writeFile(data, "@echo off\n");
+	await chmod(data, 0o644);
+	const posix = { env: {}, platform: "linux" } as const;
+
+	assert.equal(await resolveExecutable(tool, posix), tool);
+	// A readable-but-not-executable file would fail to spawn just as one found along PATH would,
+	// so an explicit path is held to the same test rather than only being checked for existence.
+	if (NOT_ROOT) assert.equal(await resolveExecutable(data, posix), undefined);
+	// Windows has no execute bit: there any file that exists is a candidate.
+	assert.equal(await resolveExecutable(data, { env: {}, platform: "win32" }), data);
+});
+
+test("resolveExecutable prefers a PATHEXT match over an extensionless script on Windows", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "kmcp-bin-"));
+	// What an MSYS/Git-Bash install leaves behind: a shell script Windows will not execute, beside
+	// the `.cmd` shim Windows actually runs.
+	await writeFile(join(directory, "kmcp-npx"), "#!/bin/sh\nexit 0\n");
+	await writeFile(join(directory, "kmcp-npx.CMD"), "@echo off\n");
+	await writeFile(join(directory, "kmcp.tool"), "not a program\n");
+	const windows = { platform: "win32", env: { PATH: directory } } as const;
+
+	assert.equal(await resolveExecutable("kmcp-npx", windows), join(directory, "kmcp-npx.CMD"));
+	// A name that already carries a `.` may still match bare, which is what `which` does.
+	assert.equal(await resolveExecutable("kmcp-npx.CMD", windows), join(directory, "kmcp-npx.CMD"));
+	assert.equal(await resolveExecutable("kmcp.tool", windows), join(directory, "kmcp.tool"));
+});
+
+test("resolveExecutable unquotes Windows PATH entries and searches the cwd first", async () => {
+	// A space in the directory name is why a Windows PATH quotes an entry at all.
+	const directory = await mkdtemp(join(tmpdir(), "kmcp bin-"));
+	await writeFile(join(directory, "kmcp-tool.CMD"), "@echo off\n");
+	const local = await mkdtemp(join(tmpdir(), "kmcp-cwd-"));
+	await writeFile(join(local, "kmcp-tool.CMD"), "@echo off\n");
+	const bystander = await mkdtemp(join(tmpdir(), "kmcp-empty-"));
+
+	// One matching pair of surrounding quotes is list syntax, not part of the directory name.
+	assert.equal(
+		await resolveExecutable("kmcp-tool", {
+			platform: "win32",
+			env: { PATH: `"${directory}"` },
+			cwd: bystander,
+		}),
+		join(directory, "kmcp-tool.CMD"),
+	);
+	// Windows resolves a bare name against the working directory before PATH.
+	assert.equal(
+		await resolveExecutable("kmcp-tool", {
+			platform: "win32",
+			env: { PATH: directory },
+			cwd: local,
+		}),
+		join(local, "kmcp-tool.CMD"),
+	);
+	// POSIX never does: a file in the project directory is not an installed tool.
+	const script = join(local, "kmcp-tool");
+	await writeFile(script, "#!/bin/sh\nexit 0\n");
+	await chmod(script, 0o755);
+	assert.equal(
+		await resolveExecutable("kmcp-tool", { platform: "linux", env: { PATH: "" }, cwd: local }),
+		undefined,
+	);
+});
+
 test("resolveExecutable applies PATHEXT and case-insensitive env names on Windows", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "kmcp-bin-"));
 	await writeFile(join(directory, "kmcp-tool.CMD"), "@echo off\n");

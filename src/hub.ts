@@ -8,6 +8,7 @@ export type {
 	McpHubListener,
 	McpHubManagerSnapshot,
 	McpHubMember,
+	McpHubMemberFilter,
 	McpHubMemberSnapshot,
 	McpHubPromptRoute,
 	McpHubResourceRoute,

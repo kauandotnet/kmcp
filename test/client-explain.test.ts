@@ -7,6 +7,7 @@ import {
 	SdkError,
 	SdkErrorCode,
 	SdkHttpError,
+	SseError,
 	UnauthorizedError,
 } from "@modelcontextprotocol/client";
 
@@ -176,7 +177,8 @@ test("stdio failures separate a missing command from a process that exited", () 
 
 test("OAuth failures are delegated to explainOAuthError", () => {
 	const scope = explainConnectionError(new InsufficientScopeError({ requiredScope: "files:read" }));
-	assert.equal(scope.kind, "oauth");
+	// A rejected credential is an authorization story, not an "the OAuth machinery broke" one.
+	assert.equal(scope.kind, "authorization");
 	assert.match(scope.message, /scope/);
 	assert.match(scope.remediation ?? "", /Authorize again/);
 
@@ -197,7 +199,73 @@ test("OAuth failures are delegated to explainOAuthError", () => {
 			cause: new UnauthorizedError("needs auth"),
 		}),
 	);
-	assert.equal(wrapped.kind, "oauth");
+	assert.equal(wrapped.kind, "authorization");
+});
+
+test("a rejected credential explains the same live as it does from its snapshot", () => {
+	const cases: readonly [string, unknown][] = [
+		["unauthorized", new UnauthorizedError("needs auth")],
+		["insufficient_scope", new InsufficientScopeError({ requiredScope: "files:read" })],
+	];
+	for (const [code, error] of cases) {
+		const live = explainConnectionError(error);
+		// What the manager records on the snapshot, and what a host explains from it a screen later.
+		const recorded = explainConnectionError(snapshotWith({ errorDetail: describeError(error) }));
+		assert.deepEqual(recorded, live, code);
+		assert.equal(live.kind, "authorization", code);
+		assert.equal(live.code, code);
+		assert.ok(live.remediation, code);
+		// And a connect failure that merely carries it as a cause classifies identically.
+		const wrapped = explainConnectionError(
+			new KmcpError(KMCP_ERROR_CODES.CONNECTION_CONNECT_FAILED, "Failed to connect 'x'.", {
+				cause: error,
+			}),
+		);
+		assert.deepEqual(wrapped, live, code);
+	}
+});
+
+test("an SSE stream failure carries the HTTP status its numeric code holds", () => {
+	const forbidden = explainConnectionError(
+		new SseError(403, "forbidden", new Event("error") as ErrorEvent),
+	);
+	assert.equal(forbidden.kind, "authorization");
+	assert.equal(forbidden.httpStatus, 403);
+	assert.equal(forbidden.code, "403");
+
+	assert.deepEqual(describeError(new SseError(401, "nope", new Event("error") as ErrorEvent)), {
+		kind: "http",
+		code: "401",
+		httpStatus: 401,
+	});
+	// A stream that failed without a status has no HTTP story to tell.
+	assert.equal(
+		describeError(new SseError(undefined, "dropped", new Event("error") as ErrorEvent)).kind,
+		"sdk",
+	);
+});
+
+test("an AggregateError explains from its first member", () => {
+	// What connectAll and reconcile throw: the members carry the real reason.
+	const aggregate = new AggregateError(
+		[
+			new KmcpError(KMCP_ERROR_CODES.CONNECTION_CONNECT_FAILED, "Failed to connect 'a'.", {
+				cause: systemError("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:1"),
+			}),
+			new Error("a second one nobody asked about"),
+		],
+		"2 of 2 connections failed to connect.",
+	);
+	assert.deepEqual(describeError(aggregate), { kind: "network", code: "ECONNREFUSED" });
+	const explained = explainConnectionError(aggregate);
+	assert.equal(explained.kind, "network");
+	assert.equal(explained.code, "ECONNREFUSED");
+
+	// A `cause` still wins over the members, so nothing that classified before changes.
+	const caused = new AggregateError([new Error("member")], "both failed", {
+		cause: new KmcpError(KMCP_ERROR_CODES.CATALOG_STALE, "stale"),
+	});
+	assert.equal(explainConnectionError(caused).code, KMCP_ERROR_CODES.CATALOG_STALE);
 });
 
 test("an OAuth snapshot without the original error still names the round", () => {

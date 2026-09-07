@@ -123,10 +123,11 @@ const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
 /**
  * Resolves what a `command` field would actually run, WITHOUT spawning anything: a bare name is
  * looked up along `PATH` (each entry must hold a file that is executable by this process; on
- * Windows every `PATHEXT` suffix is tried), and a name that already carries a path separator is
- * checked against the filesystem and returned as written (only a `PATHEXT` suffix is ever
- * appended). Returns `undefined` when nothing matches — the answer to "will this stdio entry fail
- * with ENOENT?", which a host can ask before it connects, and never a reason to throw.
+ * Windows the working directory is searched first and every `PATHEXT` suffix is tried), and a name
+ * that already carries a path separator is checked against the filesystem and returned as written
+ * (only a `PATHEXT` suffix is ever appended). Returns `undefined` when nothing matches — the answer
+ * to "will this stdio entry fail with ENOENT?", which a host can ask before it connects, and never
+ * a reason to throw.
  */
 export async function resolveExecutable(
 	command: string,
@@ -141,12 +142,22 @@ export async function resolveExecutable(
 		for (const suffix of suffixes) {
 			const candidate = command + suffix;
 			const absolute = isAbsolute(candidate) ? candidate : resolve(cwd, candidate);
-			if (await isFile(absolute)) return candidate;
+			// The same test as the `PATH` branch: a readable-but-not-executable file at an explicit
+			// path would fail to spawn exactly as one found along `PATH` would.
+			if (await isExecutableFile(absolute, windows)) return candidate;
 		}
 		return undefined;
 	}
 	const search = lookupEnv(env, "PATH", windows) ?? "";
-	for (const entry of search.split(windows ? ";" : ":")) {
+	// Windows resolves a bare name against the working directory BEFORE `PATH` (which `cmd.exe` and
+	// `CreateProcess` both do, and `which` copies); POSIX shells never do, so there a project file
+	// can't shadow an installed tool.
+	const entries = windows ? [cwd, ...search.split(";")] : search.split(":");
+	for (const rawEntry of entries) {
+		// A Windows `PATH` may quote entries that hold spaces (`"C:\Program Files\bin";C:\bin`); the
+		// quotes are list syntax, not part of the directory name. `"` is a legal filename character
+		// on POSIX, so nothing is stripped there.
+		const entry = windows ? unquotePathEntry(rawEntry) : rawEntry;
 		// An empty `PATH` entry means the working directory to a shell; treat it as noise instead,
 		// so a stray `:` never makes a file in the project directory look like an installed tool.
 		if (entry.length === 0) continue;
@@ -159,7 +170,19 @@ export async function resolveExecutable(
 	return undefined;
 }
 
-/** `[""]` off Windows; on Windows the bare name first, then every `PATHEXT` suffix it lacks. */
+/** Removes one matching pair of surrounding double quotes from a `PATH` entry. */
+function unquotePathEntry(entry: string): string {
+	return entry.length >= 2 && entry.startsWith('"') && entry.endsWith('"')
+		? entry.slice(1, -1)
+		: entry;
+}
+
+/**
+ * `[""]` off Windows. On Windows every `PATHEXT` suffix the name lacks, preceded by the bare name
+ * ONLY when the name already carries a `.` — the rule `which` uses. Trying `""` unconditionally
+ * would let an extensionless MSYS/Git-Bash shell script named `npx` win over the `npx.cmd` that
+ * Windows would actually have executed.
+ */
 function executableSuffixes(
 	command: string,
 	env: Readonly<Record<string, string | undefined>>,
@@ -168,7 +191,7 @@ function executableSuffixes(
 	if (!windows) return [""];
 	const configured = lookupEnv(env, "PATHEXT", windows) ?? DEFAULT_PATHEXT;
 	const lower = command.toLowerCase();
-	const suffixes = [""];
+	const suffixes = command.includes(".") ? [""] : [];
 	for (const raw of configured.split(";")) {
 		const suffix = raw.trim();
 		if (suffix.length === 0) continue;

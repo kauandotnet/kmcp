@@ -175,9 +175,16 @@ cryptographic integrity proofs.
 ## Hub and gateway model
 
 A hub is a class containing a safe ID, labels, and unique connection/namespace members. Tool and
-prompt routes are reversible (`namespace.sourceName`), resource routes are `namespace:uri`, and
-every route dispatches through the managed generation and catalog fingerprint. Template-expanded
-reads are matched against the member's listed templates with the SDK `UriTemplate`.
+prompt routes are reversible (`namespace.exposedName`), resource routes are `namespace:uri`, and
+every route dispatches through the managed generation and catalog fingerprint. A member may carry
+allow/deny filters and a tool rename map; they are applied to the upstream item before namespacing,
+`McpHubToolRoute` keeps `sourceName` (upstream, used for dispatch) apart from `exposedName` (what
+the route and passthrough gateway names are built from), and a denied route is indistinguishable
+from a missing one. The definition's `fingerprint` covers members, filters and renames, is mirrored
+on the hub and catalog snapshots, and is folded into the gateway's topology key so a reshaped view
+with unchanged upstream generations still rebuilds the projection and pushes `list_changed`.
+Template-expanded reads are matched against the member's listed templates with the SDK
+`UriTemplate`.
 
 `kmcp/gateway` serves a hub as one downstream MCP server and satisfies the prerequisites a real
 gateway needs:

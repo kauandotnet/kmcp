@@ -36,6 +36,7 @@ import {
 	SdkError,
 	SdkHttpError,
 	type ServerCapabilities,
+	SseError,
 	type SubscriptionFilter,
 	type Tool,
 	type Transport,
@@ -263,6 +264,27 @@ export interface McpReconcileResult<Id extends string = string> {
 	readonly removed: readonly Id[];
 }
 
+/**
+ * What {@link McpConnectionManager.reconcile} throws when part of the set could not be applied: an
+ * `AggregateError` over the individual failures, carrying the diff that DID land. Every other step
+ * was still attempted, so the caller can act on `result` — `connectAll(result.added)` brings up the
+ * connections that were registered — and report the failures separately.
+ */
+export interface McpReconcileError<Id extends string = string> extends AggregateError {
+	readonly result: McpReconcileResult<Id>;
+}
+
+/** Options for {@link McpConnectionManager.replace}. */
+export interface McpReplaceOptions {
+	/**
+	 * Swap a connection parked in the `authorizing` phase, ABANDONING the OAuth round in flight:
+	 * the pending transport is released, the authorization code the user is about to bring back
+	 * becomes unusable, and the new definition starts its own round. Without it such a swap is
+	 * refused with `CONNECTION_AUTHORIZING`, the way a `quarantined` one is refused.
+	 */
+	readonly cancelAuthorization?: boolean;
+}
+
 /** Optional stale-work fences for an operation admitted to an already-online connection. */
 export interface McpConnectionOperationControl {
 	readonly expectedGeneration?: number;
@@ -460,11 +482,26 @@ interface ListenWatchState {
 /**
  * The dedupe/staleness window one connect attempt owns. `client.onerror` and `transport.onerror`
  * see the SAME error object for a transport-raised failure (the SDK chains a pre-set handler and
- * then calls its own), so the set collapses them to one report; comparing the scope by identity
- * also silences a transport that keeps talking after its generation was abandoned.
+ * then calls its own), so the set collapses them to one report; a window that is closed
+ * (`#dropErrorScope`) silences a transport that keeps talking after its generation was abandoned.
  */
-interface ErrorScope {
+interface ErrorScope<Id extends string> {
+	/** The connection this window speaks for; `#reportError` publishes under its id. */
+	readonly entry: ManagedConnection<Id>;
 	readonly seen: WeakSet<object>;
+	/** The handlers this window armed, so closing it can silence every one of them. */
+	readonly watches: ErrorWatch<Id>[];
+}
+
+/**
+ * One installed `onerror` wrapper. The wrapper itself is installed at most ONCE per target and
+ * lives as long as the target does: a long-lived transport handed back by a user's factory would
+ * otherwise collect a new wrapper on every connect attempt, growing the handler chain without
+ * bound. Re-arming for a new attempt only re-points `scope`; closing a window clears it, which is
+ * what makes an abandoned generation's transport go quiet.
+ */
+interface ErrorWatch<Id extends string> {
+	scope: ErrorScope<Id> | undefined;
 }
 
 interface ManagedConnection<Id extends string> {
@@ -488,7 +525,7 @@ interface ManagedConnection<Id extends string> {
 	removeTask?: Promise<void>;
 	/** Serializes `replace` on this id: a second swap queues behind the one in flight. */
 	swapTask?: Promise<McpConnectionSnapshot<Id>>;
-	errorScope?: ErrorScope;
+	errorScope?: ErrorScope<Id>;
 	diagnostics?: McpConnectionDiagnostic[];
 	quarantinedCleanup?: () => Promise<void>;
 	pendingAuthorization?: PendingAuthorization;
@@ -547,6 +584,11 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		((error: unknown, event: McpConnectionEvent<Id>) => MaybePromise<void>) | undefined;
 	readonly #onError: ((id: string, error: unknown) => MaybePromise<void>) | undefined;
 	readonly #diagnosticsKeep: number;
+	/**
+	 * The `onerror` wrapper installed on each transport or client, so a target that outlives one
+	 * connect attempt (a user's long-lived transport) is wrapped once and re-armed, never re-wrapped.
+	 */
+	readonly #errorWatches = new WeakMap<object, ErrorWatch<Id>>();
 	#revision = 0;
 	#generationSequence = 0;
 	#closed = false;
@@ -624,19 +666,27 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 
 	/**
 	 * Swaps the definition registered under `definition.id` — a host applying a config edit to one
-	 * server without losing its identity, its diagnostics or its place in the snapshot.
+	 * server without losing its identity or its place in the snapshot.
 	 *
 	 * - Registered as `offline` or `failed`: swapped in place, staying down (a recorded failure
 	 *   belonged to the OLD definition, so it is cleared).
-	 * - Live (`online`, `degraded`, `authorizing`, or a connect/disconnect still settling):
-	 *   disconnected first — draining in-flight work exactly as `disconnect` does — then swapped,
-	 *   then reconnected only if it was `online`, on a NEW generation talking to the new server.
+	 * - Live (`online`, `degraded`, or a connect/disconnect still settling): disconnected first —
+	 *   draining in-flight work exactly as `disconnect` does — then swapped, then reconnected only
+	 *   if it was usable (`online` or `degraded`), on a NEW generation talking to the new server.
+	 * - `authorizing`: refused with `CONNECTION_AUTHORIZING` unless `cancelAuthorization` says the
+	 *   round in flight may be abandoned.
 	 * - `quarantined`: refused; the failed cleanup has to be resolved (`disconnect`) first.
 	 *
-	 * A definition equivalent to the registered one (same `fingerprint` when the definition exposes
-	 * one, else the same object) is a no-op. Concurrent swaps on one id serialize.
+	 * The diagnostics ring is NOT carried over: it describes the previous server, so it is dropped
+	 * along with the cached era verdict and the recorded failure.
+	 *
+	 * A definition equivalent to the registered one (the same object, or the same
+	 * {@link McpConnectionDefinition.fingerprint}) is a no-op. Concurrent swaps on one id serialize.
 	 */
-	replace(definition: McpConnectionDefinition<Id>): Promise<McpConnectionSnapshot<Id>> {
+	replace(
+		definition: McpConnectionDefinition<Id>,
+		options: McpReplaceOptions = {},
+	): Promise<McpConnectionSnapshot<Id>> {
 		this.#assertOpen();
 		if (!(definition instanceof McpConnectionDefinition)) {
 			throw new TypeError("replace requires an McpConnectionDefinition.");
@@ -653,7 +703,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				);
 			}
 			if (sameDefinition(entry.definition, definition)) return this.#snapshotEntry(entry);
-			return this.#performReplace(entry, definition);
+			return this.#performReplace(entry, definition, options);
 		})();
 		entry.swapTask = task;
 		void task
@@ -674,8 +724,10 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	 * Reconnecting a replaced connection is best-effort: a server that is down afterwards is left in
 	 * the `failed` phase with its reason on the snapshot and still counted under `replaced`, exactly
 	 * as `connectAll` without `atomic` reports one bad member. Failures that leave the registry
-	 * inconsistent (a quarantined entry, a close that did not complete) are collected and thrown as
-	 * an `AggregateError` once every other step has been attempted.
+	 * inconsistent (a quarantined entry, a connection parked in `authorizing`, a close that did not
+	 * complete) are collected and thrown as an {@link McpReconcileError} once every other step has
+	 * been attempted — an `AggregateError` carrying the diff that DID land on `result`, so the
+	 * caller can still `connectAll(result.added)` and report the rest.
 	 */
 	async reconcile(
 		definitions: readonly McpConnectionDefinition<Id>[],
@@ -722,8 +774,12 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					unchanged.push(id);
 				} else {
 					await this.replace(definition).catch((error: unknown) => {
-						// The swap itself landed whenever the failure is only the reconnect's verdict.
+						// The swap itself landed only when the entry now holds the NEW definition and the
+						// failure is the reconnect's verdict. A refusal that never swapped — quarantined,
+						// or parked in `authorizing`, which reports the same code a post-swap OAuth park
+						// does — leaves the old definition in place and has to be reported.
 						if (!isReconnectVerdict(error)) throw error;
+						if (this.#entries.get(id)?.definition !== definition) throw error;
 					});
 					replaced.push(id);
 				}
@@ -731,15 +787,21 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				failures.push(error);
 			}
 		}
-		if (failures.length > 0) {
-			throw new AggregateError(failures, `${failures.length} connections failed to reconcile.`);
-		}
-		return Object.freeze({
+		const result: McpReconcileResult<Id> = Object.freeze({
 			added: Object.freeze(added),
 			replaced: Object.freeze(replaced),
 			unchanged: Object.freeze(unchanged),
 			removed: Object.freeze(removed),
 		});
+		if (failures.length > 0) {
+			// The applied diff travels WITH the failure: every other step was attempted, so throwing
+			// it away would leave the caller unable to bring up the connections that were registered.
+			throw Object.assign(
+				new AggregateError(failures, `${failures.length} connections failed to reconcile.`),
+				{ result },
+			) satisfies McpReconcileError<Id>;
+		}
+		return result;
 	}
 
 	remove(id: Id): Promise<void> {
@@ -2034,7 +2096,8 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		this.#transition(entry, "connecting");
 		// A fresh dedupe/staleness window per attempt: whatever the abandoned transport of the
 		// previous attempt still emits is no longer this connection's story.
-		const scope: ErrorScope = { seen: new WeakSet() };
+		this.#dropErrorScope(entry);
+		const scope: ErrorScope<Id> = { entry, seen: new WeakSet(), watches: [] };
 		entry.errorScope = scope;
 		let transport: Transport | undefined;
 		let session: McpClientSession<Id> | undefined;
@@ -2047,7 +2110,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			transport = await definition.openTransport();
 			// Armed BEFORE `client.connect`, which chains a pre-set `transport.onerror` ahead of its
 			// own: that covers the probe/handshake window too, where the client is not attached yet.
-			this.#watchErrors(entry, scope, transport);
+			this.#watchErrors(scope, transport);
 			let liveSession: McpClientSession<Id> | undefined;
 			const listChanged = this.#listChangedHandlers(entry, () => liveSession);
 			const client = this.#createClient(entry, resuming, {
@@ -2059,7 +2122,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 					});
 				},
 			});
-			this.#watchErrors(entry, scope, client);
+			this.#watchErrors(scope, client);
 			session = new McpClientSession(definition.id, client);
 			liveSession = session;
 			const closingSession = session;
@@ -2111,6 +2174,11 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			// A resume the server refused as gone (404 / expired session) must not be replayed: burn
 			// it here so the reconnect this failure schedules runs a fresh handshake.
 			if (resuming && isSessionExpiryVerdict(error)) definition.consumeResume();
+			// The attempt is over on every one of these paths, so its window closes with it: the
+			// transport that is about to be abandoned (or parked for `finishAuth`) must not go on
+			// publishing `connection.error` for a connection that is now failed, quarantined or
+			// waiting on a user. The next `connect()` opens a fresh window.
+			this.#dropErrorScope(entry);
 			if (
 				transport !== undefined &&
 				session !== undefined &&
@@ -2209,7 +2277,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		delete entry.transport;
 		delete entry.connectedAt;
 		// The generation is over: whatever the dead transport still emits is not this connection's.
-		delete entry.errorScope;
+		this.#dropErrorScope(entry);
 		// The stream belongs to the dead client; closing it would only talk to a closed transport.
 		// Dropping the handle keeps `#watchListen` free to arm for the next session.
 		delete entry.listen;
@@ -2679,17 +2747,50 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	 * chains the transport's own inside `Protocol.connect`). Reporting runs FIRST so a throwing
 	 * downstream handler cannot swallow the diagnostic, and behaves exactly as it did before
 	 * otherwise.
+	 *
+	 * A target is wrapped AT MOST ONCE, ever. A user's transport factory may hand back the same
+	 * long-lived transport on every connect, and a fresh wrapper per attempt would grow the handler
+	 * chain by one link each time (the SDK adds its own on top and never removes it, so nothing
+	 * downstream unwinds ours either). Re-arming an already-wrapped target just re-points it at the
+	 * new window; the wrapper reads the window at call time, so an abandoned generation's transport
+	 * reports nothing rather than reporting under the wrong generation.
 	 */
 	#watchErrors(
-		entry: ManagedConnection<Id>,
-		scope: ErrorScope,
+		scope: ErrorScope<Id>,
 		target: { onerror?: ((error: Error) => void) | undefined },
 	): void {
+		const known = this.#errorWatches.get(target);
+		if (known !== undefined) {
+			known.scope = scope;
+			scope.watches.push(known);
+			return;
+		}
+		const watch: ErrorWatch<Id> = { scope };
+		this.#errorWatches.set(target, watch);
+		scope.watches.push(watch);
 		const existing = target.onerror;
 		target.onerror = (error: Error) => {
-			this.#reportError(entry, scope, error);
+			const current = watch.scope;
+			if (current !== undefined) this.#reportError(current.entry, current, error);
 			existing?.(error);
 		};
+	}
+
+	/**
+	 * Closes a connection's error window: the generation is over, so whatever its transport still
+	 * emits is no longer this connection's story. Every failure path calls it — a failed connect, a
+	 * quarantine, a disconnect that could not close, a removal — because an abandoned transport that
+	 * keeps its window open goes on publishing `connection.error` for a connection that is `failed`,
+	 * `offline`, or gone from the registry entirely, and keeps the deleted entry reachable.
+	 */
+	#dropErrorScope(entry: ManagedConnection<Id>): void {
+		const scope = entry.errorScope;
+		delete entry.errorScope;
+		if (scope === undefined) return;
+		for (const watch of scope.watches) {
+			if (watch.scope === scope) watch.scope = undefined;
+		}
+		scope.watches.length = 0;
 	}
 
 	/**
@@ -2699,7 +2800,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	 * close still reaches `#handleUnexpectedClose` through its own `onclose`, which is what actually
 	 * fails the connection.
 	 */
-	#reportError(entry: ManagedConnection<Id>, scope: ErrorScope, error: unknown): void {
+	#reportError(entry: ManagedConnection<Id>, scope: ErrorScope<Id>, error: unknown): void {
 		// A generation whose window is closed no longer speaks for this connection.
 		if (entry.errorScope !== scope) return;
 		if (typeof error === "object" && error !== null) {
@@ -2712,7 +2813,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				at: isoTimestamp(this.#now),
 				kind: detail.kind,
 				code: String(detail.code).slice(0, 64),
-				message: diagnosticMessage(error),
+				message: diagnosticMessage(error, detail),
 				generation: entry.generation,
 			});
 			if (this.#diagnosticsKeep > 0) {
@@ -2736,12 +2837,21 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 	async #performReplace(
 		entry: ManagedConnection<Id>,
 		definition: McpConnectionDefinition<Id>,
+		options: McpReplaceOptions,
 	): Promise<McpConnectionSnapshot<Id>> {
 		const id = definition.id;
 		if (entry.phase === "quarantined") {
 			throw new KmcpError(
 				KMCP_ERROR_CODES.CONNECTION_QUARANTINED,
 				`Connection '${id}' is quarantined after a cleanup failure; disconnect it before replacing it.`,
+			);
+		}
+		// A swap here would silently cancel the round the user is in the middle of: the pending
+		// transport is closed, and the authorization code they bring back has nowhere to land.
+		if (entry.phase === "authorizing" && options.cancelAuthorization !== true) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.CONNECTION_AUTHORIZING,
+				`Connection '${id}' is waiting for OAuth authorization; complete it, or pass { cancelAuthorization: true } to abandon the round.`,
 			);
 		}
 		if (entry.removeTask !== undefined) {
@@ -2752,7 +2862,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		}
 		// Let a connect already in flight settle: the state this swap preserves must be the real one.
 		if (entry.connectTask !== undefined) await entry.connectTask.catch(() => undefined);
-		const wasOnline = entry.phase === "online";
+		// `degraded` is a LIVE phase (`isUsable`), so a degraded connection is brought back up after
+		// the swap exactly as an online one is; only a connection that was genuinely down stays down.
+		const wasLive = isUsable(entry);
 		if (entry.phase !== "offline" && entry.phase !== "failed") await this.disconnect(id);
 		if (this.#entries.get(id) !== entry) {
 			throw new KmcpError(KMCP_ERROR_CODES.CONNECTION_UNKNOWN, `Unknown connection '${id}'.`);
@@ -2765,14 +2877,14 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		delete entry.errorCode;
 		delete entry.errorDetail;
 		delete entry.diagnostics;
-		delete entry.errorScope;
+		this.#dropErrorScope(entry);
 		if (definition.logLevel === undefined) delete entry.logLevel;
 		else entry.logLevel = definition.logLevel;
 		this.#cancelReconnectTimer(entry);
 		delete entry.reconnect;
 		if (entry.phase === "failed") this.#transition(entry, "offline");
 		this.#publish("connection.registered", entry);
-		if (!wasOnline) return this.#snapshotEntry(entry);
+		if (!wasLive) return this.#snapshotEntry(entry);
 		return this.connect(id);
 	}
 
@@ -2780,6 +2892,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		await this.disconnect(entry.definition.id);
 		if (this.#entries.get(entry.definition.id) !== entry) return;
 		this.#entries.delete(entry.definition.id);
+		// Nothing may keep the removed entry alive or keep publishing under its id: a transport that
+		// outlives the registry entry still holds a handler pointing at it.
+		this.#dropErrorScope(entry);
 		this.#publish("connection.removed", entry);
 	}
 
@@ -2796,6 +2911,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 		if (entry.pendingAuthorization !== undefined) {
 			this.#transition(entry, "draining");
 			await this.#releasePendingAuthorization(entry);
+			this.#dropErrorScope(entry);
 			delete entry.errorCode;
 			delete entry.errorDetail;
 			this.#transition(entry, "offline");
@@ -2808,11 +2924,13 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				// Same bound as the connect path: a hung close must not hang disconnect() or close().
 				await this.#bounded(quarantinedCleanup(), entry.definition.disconnectTimeoutMs, "close");
 				delete entry.quarantinedCleanup;
+				this.#dropErrorScope(entry);
 				delete entry.errorCode;
 				delete entry.errorDetail;
 				this.#transition(entry, "offline");
 				return this.#snapshotEntry(entry);
 			} catch (error) {
+				this.#dropErrorScope(entry);
 				entry.errorCode = KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED;
 				entry.errorDetail = describeError(error);
 				this.#transition(entry, "quarantined");
@@ -2829,6 +2947,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 				this.#transition(entry, "draining");
 				await this.#waitUntilDrained(entry);
 			}
+			this.#dropErrorScope(entry);
 			delete entry.errorCode;
 			delete entry.errorDetail;
 			this.#transition(entry, "offline");
@@ -2848,7 +2967,7 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			await this.#bounded(session.close(), entry.definition.disconnectTimeoutMs, "close");
 			delete entry.session;
 			delete entry.transport;
-			delete entry.errorScope;
+			this.#dropErrorScope(entry);
 			entry.resumed = false;
 			delete entry.connectedAt;
 			delete entry.errorCode;
@@ -2856,6 +2975,9 @@ export class McpConnectionManager<Id extends string = string> implements AsyncDi
 			this.#transition(entry, "offline");
 			return this.#snapshotEntry(entry);
 		} catch (error) {
+			// The close failed, so the transport is abandoned rather than cleanly shut: it must not
+			// keep reporting under a quarantined connection either.
+			this.#dropErrorScope(entry);
 			entry.errorCode = KMCP_ERROR_CODES.CONNECTION_CLOSE_FAILED;
 			entry.errorDetail = describeError(error);
 			this.#transition(entry, "quarantined");
@@ -3238,34 +3360,94 @@ export function describeError(error: unknown): McpErrorDetail {
 			return network === undefined
 				? { kind: "sdk", code: current.code }
 				: { kind: "network", code: network };
+		} else if (current instanceof SseError) {
+			// The legacy SSE transport reports the HTTP status of the stream that failed as a
+			// NUMERIC `code`, so 401/403 on that wire classifies exactly as it does on Streamable
+			// HTTP instead of falling through to `unknown`.
+			const status = current.code;
+			if (typeof status === "number") {
+				return { kind: "http", code: String(status), httpStatus: status };
+			}
+			return network === undefined
+				? { kind: "sdk", code: "SSE_ERROR" }
+				: { kind: "network", code: network };
 		} else if (current instanceof ProtocolError) {
 			return { kind: "protocol", code: current.code };
 		} else if (network !== undefined) {
 			return { kind: "network", code: network };
 		}
-		current = current instanceof Error ? current.cause : undefined;
+		current = nextInErrorChain(current);
 	}
 	if (network !== undefined) return { kind: "network", code: network };
 	if (error instanceof KmcpError) return { kind: "kmcp", code: error.code };
 	return { kind: "unknown", code: error instanceof Error ? error.name : typeof error };
 }
 
+/**
+ * The next link when classifying a failure: its `cause`, else the FIRST member of an
+ * `AggregateError`. `connectAll`, `reconcile` and the manager's own connect-and-cleanup failure
+ * all report several failures at once, and a caller asking why one of them is down wants the
+ * reason the first member gives rather than the word "AggregateError".
+ */
+function nextInErrorChain(error: unknown): unknown {
+	if (!(error instanceof Error)) return undefined;
+	if (error.cause !== undefined && error.cause !== null) return error.cause;
+	const members = (error as { readonly errors?: unknown }).errors;
+	return Array.isArray(members) ? (members[0] as unknown) : undefined;
+}
+
 const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F-\u009F]+/g;
 
 /**
- * The bounded, non-secret summary a diagnostic carries. Upstream text reaches this unfiltered, so
- * control characters are collapsed (no terminal escapes in a host's log) and the result is capped.
+ * The bounded, NON-SECRET summary a diagnostic carries — a value the manager publishes on every
+ * `connection.error`, keeps in the snapshot's ring and hands to a host's logs.
+ *
+ * An error's own `message` is echoed only where kmcp knows who wrote it: kmcp's own `KmcpError`s
+ * and plain Node system errors (a `code` plus a syscall summary such as
+ * `connect ECONNREFUSED 127.0.0.1:1`). Everything else is SYNTHESIZED from the classification,
+ * because the SDK interpolates raw server responses into its messages — `SdkHttpError` carries
+ * `Error POSTing to endpoint: <body>`, and the legacy SSE transport does the same with a plain
+ * `Error` — and a response body can hold the very token the connection authenticates with. The
+ * host still receives the original error, untouched, through `onError`.
+ *
+ * Whatever survives is stripped of control characters (no terminal escapes in a log) and capped.
  */
-function diagnosticMessage(error: unknown): string {
-	let raw: string;
-	try {
-		raw =
-			error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
-	} catch {
-		raw = "";
+function diagnosticMessage(error: unknown, detail: McpErrorDetail): string {
+	return bounded(echoableMessage(error) ?? synthesizedMessage(error, detail));
+}
+
+/** The message of an error whose text kmcp itself (or Node) wrote, and is therefore safe to echo. */
+function echoableMessage(error: unknown): string | undefined {
+	if (error instanceof KmcpError) return error.message;
+	// A Node system error: a plain `Error` carrying a string `code`, never an SDK or protocol class.
+	if (!(error instanceof Error) || error instanceof SdkError || error instanceof SseError) {
+		return undefined;
 	}
-	const cleaned = raw.replace(CONTROL_CHARACTERS, " ").trim();
-	if (cleaned.length === 0) return error instanceof Error ? error.name : "Unknown error.";
+	if (error instanceof ProtocolError || error instanceof OAuthError) return undefined;
+	const code = (error as { readonly code?: unknown }).code;
+	return typeof code === "string" && code.length > 0 ? error.message : undefined;
+}
+
+/** What is left when the text cannot be trusted: the classification, in words. */
+function synthesizedMessage(error: unknown, detail: McpErrorDetail): string {
+	if (error instanceof SdkHttpError) {
+		const status = `HTTP ${error.status}${error.statusText === undefined ? "" : ` ${error.statusText}`}`;
+		return `The server answered ${status}; the response body is not echoed (${error.code}).`;
+	}
+	if (error instanceof SseError) {
+		const status = typeof error.code === "number" ? ` with HTTP ${error.code}` : "";
+		return `The SSE stream failed${status}; the server's text is not echoed.`;
+	}
+	if (error instanceof SdkError) return `The MCP SDK reported ${error.code}.`;
+	if (error instanceof OAuthError) return `The OAuth round failed (${error.code}).`;
+	if (error instanceof ProtocolError) return `The peer returned a JSON-RPC error (${error.code}).`;
+	const name = error instanceof Error ? error.name : typeof error;
+	return `${name}: the reported text is not echoed (${detail.kind}/${detail.code}).`;
+}
+
+function bounded(message: string): string {
+	const cleaned = message.replace(CONTROL_CHARACTERS, " ").trim();
+	if (cleaned.length === 0) return "Unknown error.";
 	return cleaned.length > MAX_DIAGNOSTIC_MESSAGE_LENGTH
 		? `${cleaned.slice(0, MAX_DIAGNOSTIC_MESSAGE_LENGTH - 1)}…`
 		: cleaned;
@@ -3273,8 +3455,10 @@ function diagnosticMessage(error: unknown): string {
 
 /**
  * Whether two definitions describe the same connection for `replace`/`reconcile`: the same object,
- * or the same `fingerprint` when a definition exposes one. Definitions carry live closures
- * (transport factories, request handlers), so there is no structural comparison to fall back on.
+ * or the same {@link McpConnectionDefinition.fingerprint}. A definition rebuilt from a byte-identical
+ * configuration fingerprints identically, so a host that re-reads its config keeps its live
+ * sessions; one whose transport is an opaque factory fingerprints uniquely and is only ever equal
+ * to itself, because there is nothing about it that can honestly be compared.
  */
 function sameDefinition(
 	left: McpConnectionDefinition<string>,
@@ -3285,6 +3469,7 @@ function sameDefinition(
 	return leftPrint !== undefined && leftPrint === definitionFingerprint(right);
 }
 
+/** Tolerant of a subclass that overrides `fingerprint` with something that is not a usable string. */
 function definitionFingerprint(definition: McpConnectionDefinition<string>): string | undefined {
 	const value = (definition as { readonly fingerprint?: unknown }).fingerprint;
 	return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -3312,7 +3497,7 @@ function deepNetworkErrorCode(error: unknown): string | undefined {
 		const data = current instanceof SdkError ? current.data : undefined;
 		const dataCause =
 			typeof data === "object" && data !== null ? (data as { cause?: unknown }).cause : undefined;
-		current = current instanceof Error && current.cause !== undefined ? current.cause : dataCause;
+		current = nextInErrorChain(current) ?? dataCause;
 	}
 	return undefined;
 }
