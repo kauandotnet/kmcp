@@ -546,12 +546,20 @@ export class McpGatewayDefinition<
 
 		const nameMode = this.#policy.names;
 		const toolNameCollisions =
-			nameMode === "passthrough" ? nameCollisions(catalog.tools) : new Set<string>();
+			nameMode === "passthrough"
+				? // A renamed tool collides under its EXPOSED name, which is what passthrough projects.
+					nameCollisions(
+						catalog.tools.map((route) => ({
+							sourceName: route.exposedName,
+							connectionId: route.connectionId,
+						})),
+					)
+				: new Set<string>();
 		const promptNameCollisions =
 			nameMode === "passthrough" ? nameCollisions(catalog.prompts) : new Set<string>();
 		let toolCount = 0;
 		for (const route of catalog.tools) {
-			const name = nameMode === "passthrough" ? route.sourceName : route.route;
+			const name = nameMode === "passthrough" ? route.exposedName : route.route;
 			if (!NAME_REGEX.test(name)) {
 				dropped.push(
 					drop("tool", route.connectionId, route.namespace, route.sourceName, "invalid-name"),
@@ -971,7 +979,9 @@ function topologyKey<HubId extends string, ConnectionId extends string>(
 				`${member.connectionId}=${member.catalog?.generation ?? "-"}:${member.catalog?.fingerprint ?? "-"}:${completions.get(member.connectionId) === true ? "c" : "-"}`,
 		)
 		.join("|");
-	return `${policy.names}/${policy.resources}/${policy.completions ? "c" : "-"}/${members}/${catalog.tools.length}/${catalog.prompts.length}/${catalog.resources.length}/${catalog.resourceTemplates.length}`;
+	// The hub fingerprint covers namespaces, member filters and renames, so a `hub.updated` that only
+	// changes the exposed view (same upstream catalogs, same counts) still rebuilds the projection.
+	return `${policy.names}/${policy.resources}/${policy.completions ? "c" : "-"}/${catalog.fingerprint}/${members}/${catalog.tools.length}/${catalog.prompts.length}/${catalog.resources.length}/${catalog.resourceTemplates.length}`;
 }
 
 /** The current MRTR round to relay: the downstream client's embedded responses and echoed state. */

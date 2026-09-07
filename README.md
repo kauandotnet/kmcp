@@ -289,25 +289,34 @@ lives in the kernel — compose those in your framework over `createNodeMcpHandl
 and resource-updated signals on both eras. `connectionsFromMcpConfig(config, { env })` turns an
 `mcpServers` config (or the VS Code `servers` shape) into keyed connection definitions with hub-safe
 namespace suggestions in `tags["kmcp.namespace"]`, honoring `timeout` (seconds), `protocolVersion`,
-`${VAR}` substitution when an `env` map is supplied, and `type` / `transport` routing (`stdio`,
-`http` / `streamable-http`, `sse` for the deprecated HTTP+SSE transport — `transportKind: "sse"`,
-legacy era only, so `protocolVersion` is refused there; case-insensitive; an unknown value or one
-the entry contradicts, such as `type: "stdio"` with only a `url`, throws `INVALID_DEFINITION`
-instead of guessing; entries without a `type` keep inferring from `url` / `command`). A `command`
-that contains whitespace and no `args` is split POSIX-style (`parseCommandLine`: quotes and
-backslash escapes, no expansion; any `args`, even `[]`, keeps the command verbatim, which is how a
-program path with spaces is written); `resolveExecutable` answers whether a command would be found
-on `PATH` (`PATHEXT` on Windows) without spawning. `standardMcpConfigPaths` / `discoverMcpConfigs` /
+`${VAR}` / `${env:VAR}` substitution on every value-bearing field when an `env` map is supplied (VS
+Code's `${input:…}`, `${workspaceFolder}` and other host variables pass through unchanged), and
+`type` / `transport` routing (`stdio`, `http` / `streamable-http`, `sse` for the deprecated HTTP+SSE
+transport — `transportKind: "sse"`, legacy era only, so `protocolVersion` is refused there;
+case-insensitive; an unknown value or one the entry contradicts, such as `type: "stdio"` with only a
+`url`, throws `INVALID_DEFINITION` instead of guessing; entries without a `type` keep inferring from
+`url` / `command`; a malformed field raises `INVALID_DEFINITION` naming the entry and the field). A
+`command` that reads as a command line and has no `args` is split POSIX-style before substitution
+(`parseCommandLine`: quotes and backslash escapes, no expansion; a path that exists as written, a
+`C:\…` drive path or a `\`-separated path is passed through whole, an expanded `${VAR}` with spaces
+is never re-split, and any `args`, even `[]`, keeps the command verbatim); `resolveExecutable`
+answers whether a command would be found on `PATH` without spawning (on Windows: working directory
+first, quoted entries unquoted, `PATHEXT`, and the bare name only when it carries a `.`). Every
+definition the loader builds carries a `fingerprint` (SHA-256 over the loaded entry and the loader
+options, secrets included on purpose so a rotated token counts as a change) for `reconcile` to tell
+an unchanged entry from an edited one. `standardMcpConfigPaths` / `discoverMcpConfigs` /
 `readMcpConfigFile` find and read the Claude Code, Claude Desktop, Cursor, VS Code, Windsurf and
 Kiro config locations (a file where a directory was expected, or the reverse, counts as absent), and
 `watchMcpConfigs({ paths?, onChange, onError? })` watches them — `fs.watch` on the parent directory,
 debounced (`debounceMs`, 250 ms), polling fallback where `fs.watch` fails or with `poll: true`,
-`onChange({ path, configs })` with freshly parsed content (empty when the file was deleted or holds
-no servers), parse errors to `onError` without stopping, idempotent `close()`.
-`decodeResourceContent` (`kmcp/client`) and `writeResourceToFile` (`kmcp/node`, atomic) materialize
-a `resources/read` result; `syncResourceToFile(manager, id, uri, path)` keeps a file in step with a
-resource — one write up front, a coalesced rewrite on every `resource.updated`, and a re-subscribe
-after a reconnect.
+`onChange({ path, configs })` only when the file's bytes actually change (identical rewrites and
+macOS event replays are dropped; `initial: true` delivers the current content once at start),
+content empty when the file was deleted or holds no servers, parse errors to `onError` without
+stopping, a deleted or replaced watched directory re-watched or polled instead of going dead, and an
+idempotent `close()`. `decodeResourceContent` (`kmcp/client`) and `writeResourceToFile`
+(`kmcp/node`, atomic) materialize a `resources/read` result;
+`syncResourceToFile(manager, id, uri, path)` keeps a file in step with a resource — one write up
+front, a coalesced rewrite on every `resource.updated`, and a re-subscribe after a reconnect.
 
 HTTP proxies: Node's `fetch` ignores `HTTP_PROXY` / `HTTPS_PROXY` unless the process runs with
 `NODE_USE_ENV_PROXY=1` (Node 24 and later); otherwise pass a proxy-aware `fetch` through
@@ -422,22 +431,38 @@ no longer vanish: every generation wires `client.onerror` and `transport.onerror
 unexpected-close path), keeps the last few as `snapshot.diagnostics`
 (`{ at, kind, code, message, generation }`, default 20,
 `new McpConnectionManager({ diagnostics: { keep: 50 } })` or `false`; bounded, control-character
-stripped, never carrying headers, tokens or bodies), and hands the original error to the manager's
-`onError(id, error)` hook. `explainConnectionError(errorOrSnapshot)` turns any failure into the same
-stable `{ kind, message, remediation?, code?, httpStatus? }` shape `explainOAuthError` produces
-(network and TLS codes, HTTP statuses with session and transport awareness — a 404 on a stateful
-connection is an expired session, a 405 suggests the other HTTP transport —, era and version
-mismatches, stdio spawn failures, and the kmcp codes), so a panel renders one shape for every reason
-a connection is down.
+stripped, never carrying headers, tokens or bodies: only a `KmcpError` or a Node system error speaks
+in its own words, every SDK, SSE, protocol or OAuth error gets a sentence synthesized from its
+classification because SDK transports interpolate raw response bodies into their messages), and
+hands the original error to the manager's `onError(id, error)` hook.
+`explainConnectionError(errorOrSnapshot)` turns any failure into the same stable
+`{ kind, message, remediation?, code?, httpStatus? }` shape `explainOAuthError` produces (network
+and TLS codes, HTTP statuses with session and transport awareness — a 404 on a stateful connection
+is an expired session, a 405 suggests the other HTTP transport —, the SDK's `SseError` by its HTTP
+status, an `AggregateError` from `connectAll` or `reconcile` by its first member, era and version
+mismatches, stdio spawn failures, and the kmcp codes; a rejected credential is `authorization`
+whether it arrives live or from a snapshot), so a panel renders one shape for every reason a
+connection is down.
 
-Runtime config edits go through `replace(definition)` (swap under an id: offline or failed in place,
-clearing the old failure and diagnostics; online, degraded or authorizing disconnect, swap and
-reconnect only if it was online, on a new generation; an equivalent definition — same `fingerprint`,
-else the same object — is a no-op; concurrent swaps on one id serialize) and
+Runtime config edits go through `replace(definition, { cancelAuthorization? })` (swap under an id:
+offline or failed in place, clearing the old failure and diagnostics; a usable connection — online
+or degraded — drains, swaps and reconnects on a new generation; one parked in `authorizing` is
+refused with `CONNECTION_AUTHORIZING` unless the caller opts to cancel the round; an equivalent
+definition is a no-op; concurrent swaps on one id serialize) and
 `reconcile(definitions, { remove? })`, which applies a whole desired set and returns
 `{ added, replaced, unchanged, removed }`: removals drain first, additions are registered but not
-connected, unchanged entries keep their generation and session, and a replaced connection whose new
-server is down still counts as replaced with its reason on the snapshot. Pair it with
+connected, unchanged entries keep their generation and session, a replaced connection whose new
+server is down still counts as replaced with its reason on the snapshot, and a partial failure
+throws `McpReconcileError` (an `AggregateError` whose `result` is the diff that did land, so
+`connectAll(error.result.added)` is the recovery). Equivalence is
+`McpConnectionDefinition.fingerprint`: by default a digest of the definition's non-secret shape
+(`httpConnection` / `sseConnection` add the URL, header names and the auth shape; `stdioConnection`
+the command line, env names and cwd; `inProcessConnection` the era and server identity), so two
+definitions rebuilt from the same config are `unchanged` and live sessions survive a config re-read,
+while a definition whose only change is a token, header value or env value compares equal — pass
+`fingerprint` (a digest of the raw entry, as `connectionsFromMcpConfig` does) when credentials are
+part of your revision, and `transportFingerprint` from a custom factory that wants shape comparison;
+a bare `defineConnection` with an opaque transport is unique to itself. Pair it with
 `watchMcpConfigs` (`kmcp/node`) to follow config files as the user edits them.
 
 Two resilience behaviors run without configuration. A modern `subscriptions/listen` stream that
@@ -572,20 +597,31 @@ Before any connection exists, `probeServerAuth` tells a host what a pasted URL n
 import { probeServerAuth, suggestAuth } from "kmcp/client";
 
 const probe = await probeServerAuth("https://mcp.example.com/mcp", { timeoutMs: 5000 });
-// probe.kind: "open" | "oauth" | "bearer" | "not-mcp" | "unreachable" | "redirect" | "error"
+// probe.kind: "open" | "oauth" | "bearer" | "unauthorized" | "not-mcp" | "unreachable" | "redirect" | "error"
 const { grant, interactive } = suggestAuth(probe); // "authorization_code" | "client_credentials" | "none"
 ```
 
 One `POST` with an `initialize`-shaped body (a `GET` only when that is inconclusive), status and
-headers only, same-origin redirects followed and cross-origin ones reported as `redirect`. An
-`oauth` outcome runs the SDK's own discovery, so it carries what a real connection would find:
-protected-resource metadata, the authorization servers, their metadata, `scopes`, `grants`,
-`registration` (`dynamic` / `cimd` / `preregistered-only` / `unknown`) and extension hints. A
-`not-mcp` outcome (404/405/406 or an HTML page) may carry `suggestedTransport` when the evidence
-points at the deprecated HTTP+SSE transport. Every outcome carries `serverUrl`, `httpStatus`, the
+headers only (bodies are cancelled, never buffered), same-origin `http(s)` redirects followed and
+everything else reported as `redirect` with a `reason` (`cross-origin`, `too-many-redirects`,
+`opaque`) and, when known, a `location`. A `401` or `403` with a `Bearer` challenge anywhere in
+`WWW-Authenticate` is `oauth` (a `403` being a scope step-up); a challenge-less `401`/`403` runs the
+SDK's well-known discovery and is `oauth` if that finds an authorization server, otherwise
+`unauthorized`. An `oauth` outcome runs the SDK's own discovery — keeping the endpoint's query,
+never following a redirect, refusing a `resource_metadata` URL that is plaintext off-loopback or
+aimed at a private or link-local address the server does not live on — so it carries what a real
+connection would find: protected-resource metadata, the authorization servers and their metadata,
+`scopes` (what a connection would request: the challenge's scope, else `scopes_supported`) next to
+`scopesSupported` (everything advertised), `grants`, `registration` (`cimd` whenever the server
+advertises it, since that is the branch `auth()` takes; `dynamicRegistration` says whether
+registering is also available; else `dynamic` / `preregistered-only` / `unknown`), extension hints,
+and `issues` listing the checks `auth()` would fail (a `resource` that does not cover the probed
+URL, a non-TLS token endpoint), in which case `suggestAuth` answers `none`. A `not-mcp` outcome
+(404/405/406 or an HTML page) may carry `suggestedTransport` when the evidence points at the
+deprecated HTTP+SSE transport. Every outcome carries `serverUrl`, `httpStatus`, the
 `mcp-protocol-version` header and whether a session id was seen; nothing the server did makes the
-probe throw (only a non-`http(s)` URL does), and server text is bounded and control-character
-stripped.
+probe throw (only a non-`http(s)` URL does), caller `headers` merge case-insensitively, and every
+surfaced string is bounded and control-character stripped.
 
 ## Hubs
 
@@ -607,6 +643,38 @@ await hubs.complete("workspace", "gh.review", { name: "language", value: "ty" })
 Routes are reversible (`namespace.name`, `namespace:uri`) and fenced on the member's exact catalog
 generation and fingerprint. Template-expanded reads resolve against the member's listed templates
 with the SDK `UriTemplate`.
+
+A member can narrow and rename what it contributes:
+
+```ts
+new McpHubDefinition({
+	id: "workspace",
+	members: [
+		{
+			connectionId: "github",
+			namespace: "gh",
+			tools: { allow: ["git_*", "search_repositories"], deny: ["git_push"] },
+			prompts: { deny: ["*"] },
+			resources: { allow: ["repo://*"] },
+			rename: { git_status: "status" }, // exposed as `gh.status`; `gh.git_status` is gone
+		},
+	],
+});
+```
+
+Filters (`{ allow?, deny? }`) match the upstream tool or prompt name, or the resource URI (and a
+template's URI template), as exact strings or a prefix with one trailing `*`; `deny` beats `allow`,
+no filter exposes everything, `allow: []` exposes nothing. Filtering runs on the upstream item, then
+`rename` (tools only) maps the upstream name to the exposed one, then the namespace prefix is
+applied. Renamed tools keep their schema, annotations and description and are still called upstream
+by their upstream name; a denied or renamed-away route fails with `HUB_ROUTE_UNKNOWN` exactly like a
+missing one and is not found downstream through the gateway. Two exposed names that collide drop
+both, as duplicate upstream names already do. The definition refuses an empty pattern, a `*`
+anywhere but last, an empty rename source or target, and two renames onto one target
+(`INVALID_DEFINITION`). The hub snapshot echoes each member's `tools` / `prompts` / `resources` /
+`rename` so a panel can render disabled items; denied items never appear in a catalog. Hub
+definitions carry a `fingerprint` over members, filters and renames, so `hubs.update` with a
+reshaped view rebuilds the gateway projection and pushes `list_changed`.
 
 ## Gateway
 

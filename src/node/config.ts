@@ -1,4 +1,14 @@
-import { type FSWatcher, type Stats, unwatchFile, watch, watchFile } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	type FSWatcher,
+	type Stats,
+	existsSync,
+	readFileSync,
+	statSync,
+	unwatchFile,
+	watch,
+	watchFile,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, platform as osPlatform } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -13,7 +23,7 @@ import {
 } from "../client/connection.ts";
 import { KMCP_ERROR_CODES, KmcpError } from "../errors.ts";
 import { stdioConnection } from "../node.ts";
-import { parseCommandLine } from "./command.ts";
+import { type McpParsedCommandLine, parseCommandLine } from "./command.ts";
 
 /**
  * The transport an entry may name in `type` (Cursor, VS Code and Claude Desktop) or in
@@ -33,6 +43,11 @@ export interface McpStdioServerConfig {
 	 * whole command line (see `parseCommandLine`) — the single-input-field shape hosts store —
 	 * so `"npx -y pkg"` becomes `npx` plus `["-y", "pkg"]`. An entry that has `args` (even `[]`)
 	 * is never re-split, which is also how a program whose path contains spaces is expressed.
+	 *
+	 * The split is decided on the string AS WRITTEN, before `${…}` substitution, and a value that
+	 * reads as a path is left whole: one that exists on disk (`/Applications/My App/bin/srv`), one
+	 * rooted at a drive letter (`C:\Program Files\MyServer\server.exe`), or one using `\`
+	 * separators without quotes. An expanded `${VAR}` is therefore never re-split.
 	 */
 	readonly command: string;
 	readonly args?: readonly string[];
@@ -80,12 +95,20 @@ export interface McpConfigLoaderOptions {
 	/** Extra tags stamped on every definition (merged under the loader's own `kmcp.*` tags). */
 	readonly tags?: Readonly<Record<string, string>>;
 	/**
-	 * Substitute `${NAME}` references in `url`, `command`, `args`, `env`, and `headers` from this
-	 * map (pass `process.env` to use the process environment). Off when absent: config values are
-	 * taken literally.
+	 * Substitute `${NAME}` and VS Code's `${env:NAME}` references in every string field of an entry
+	 * (`url`, `command`, `args`, `env`, `headers`, `cwd`) from this map (pass `process.env` to use
+	 * the process environment). Off when absent: config values are taken literally.
+	 *
+	 * Only those two spellings are the loader's to expand. A reference the HOST owns —
+	 * `${input:api-key}`, `${command:…}`, `${config:…}`, `${workspaceFolder}` and the rest of VS
+	 * Code's predefined variables — is left exactly as written rather than collapsing to an empty
+	 * string, and never reaches `onMissingEnv`.
 	 */
 	readonly env?: Readonly<Record<string, string | undefined>>;
-	/** Observes a `${NAME}` whose variable is absent; the reference becomes an empty string. */
+	/**
+	 * Observes a `${NAME}` (or `${env:NAME}`, reported as the bare `NAME`) whose variable is absent;
+	 * the reference becomes an empty string.
+	 */
 	readonly onMissingEnv?: (name: string, entryId: string) => void;
 }
 
@@ -113,6 +136,10 @@ export const MCP_CONFIG_TAGS = Object.freeze({
  * that contradicts the entry's own fields, is refused instead of being guessed at. Entries
  * without either field keep the old inference: a `url` means Streamable HTTP, a `command` means
  * stdio.
+ *
+ * Every definition carries a `fingerprint`: a SHA-256 over the entry as loaded plus the loader
+ * options that shape it, so a host that re-reads a config file can tell an untouched entry from an
+ * edited one (a rotated token included) without comparing definitions field by field.
  */
 export function connectionsFromMcpConfig<const Config extends McpServersConfig>(
 	config: Config,
@@ -127,7 +154,11 @@ export function connectionsFromMcpConfig<const Config extends McpServersConfig>(
 		if (id.length === 0) {
 			throw new KmcpError(KMCP_ERROR_CODES.INVALID_DEFINITION, "Config keys must be non-empty.");
 		}
-		const entry = options.env === undefined ? rawEntry : substituteEntry(rawEntry, id, options);
+		assertEntryShape(rawEntry, id);
+		// Routing is decided on the RAW entry: which fields are present never depends on what
+		// `${…}` expands to, and the command split below has to see the pre-substitution string.
+		const transportType = entryTransportType(rawEntry, id);
+		const entry = substituteEntry(rawEntry, id, transportType, options);
 		const namespace = entry.namespace ?? mcpConfigNamespace(id);
 		const clash = namespaces.get(namespace);
 		if (clash !== undefined) {
@@ -146,6 +177,7 @@ export function connectionsFromMcpConfig<const Config extends McpServersConfig>(
 			...(timeoutMs === undefined ? {} : { defaults: { ...shared.defaults, timeoutMs } }),
 			id,
 			label: id,
+			fingerprint: entryFingerprint(entry, options),
 		};
 		// `sseConnection` takes no `protocolVersion` (that wire is legacy-era only), so the pin is
 		// applied per transport rather than in `base`.
@@ -157,7 +189,6 @@ export function connectionsFromMcpConfig<const Config extends McpServersConfig>(
 			[MCP_CONFIG_TAGS.transport]: transport,
 			[MCP_CONFIG_TAGS.namespace]: namespace,
 		});
-		const transportType = entryTransportType(entry, id);
 		if (transportType === "stdio") {
 			const stdio = entry as McpStdioServerConfig;
 			result[id] = stdioConnection({
@@ -165,7 +196,9 @@ export function connectionsFromMcpConfig<const Config extends McpServersConfig>(
 				...pin,
 				tags: tagsFor("stdio"),
 				stdio: {
-					...entryCommand(stdio, id),
+					// `substituteEntry` already split and expanded the command line, so this is a
+					// pass-through; the identity substitute keeps the split rule in one place.
+					...entryCommand(stdio, id, identity),
 					env: { ...getDefaultEnvironment(), ...stdio.env },
 					...(stdio.cwd === undefined ? {} : { cwd: stdio.cwd }),
 				},
@@ -204,14 +237,68 @@ export function connectionsFromMcpConfig<const Config extends McpServersConfig>(
 /** The transports a config entry can resolve to, after aliases are folded together. */
 type McpConfigTransport = "http" | "sse" | "stdio";
 
-const TRANSPORT_ALIASES: Readonly<Record<string, McpConfigTransport>> = Object.freeze({
-	stdio: "stdio",
-	http: "http",
-	"streamable-http": "http",
-	streamablehttp: "http",
-	streamable_http: "http",
-	sse: "sse",
-});
+// A Map, not an object: a plain record resolves `type: "constructor"` and `type: "__proto__"`
+// through `Object.prototype` and would route a config entry to a transport nobody named.
+const TRANSPORT_ALIASES: ReadonlyMap<string, McpConfigTransport> = new Map<
+	string,
+	McpConfigTransport
+>([
+	["stdio", "stdio"],
+	["http", "http"],
+	["streamable-http", "http"],
+	["streamablehttp", "http"],
+	["streamable_http", "http"],
+	["sse", "sse"],
+]);
+
+/** Entry fields that must be a plain string when present. */
+const ENTRY_STRING_FIELDS = ["command", "url", "cwd", "namespace", "protocolVersion"] as const;
+/** Entry fields that must be an object whose every value is a string when present. */
+const ENTRY_RECORD_FIELDS = ["env", "headers"] as const;
+
+function invalidEntryField(id: string, field: string, expected: string): KmcpError {
+	return new KmcpError(
+		KMCP_ERROR_CODES.INVALID_DEFINITION,
+		`Config entry '${id}' has an invalid '${field}': expected ${expected}.`,
+	);
+}
+
+/**
+ * Checks one entry's field shapes up front, naming the entry and the field. Config files are
+ * hand-written JSON, so the wrong type is ordinary; without this a number `command` escapes as a
+ * raw `TypeError` from `String.prototype.replace` and a string `args` is spread into one argument
+ * per CHARACTER. `type`/`transport` are validated where they are resolved, `timeout` where it is
+ * converted.
+ */
+function assertEntryShape(entry: unknown, id: string): void {
+	if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			`Config entry '${id}' must be an object.`,
+		);
+	}
+	const record = entry as Record<string, unknown>;
+	for (const field of ENTRY_STRING_FIELDS) {
+		const value = record[field];
+		if (value !== undefined && typeof value !== "string") {
+			throw invalidEntryField(id, field, "a string");
+		}
+	}
+	const args = record.args;
+	if (args !== undefined && (!Array.isArray(args) || args.some((v) => typeof v !== "string"))) {
+		throw invalidEntryField(id, "args", "an array of strings");
+	}
+	for (const field of ENTRY_RECORD_FIELDS) {
+		const value = record[field];
+		if (value === undefined) continue;
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			throw invalidEntryField(id, field, "an object of strings");
+		}
+		for (const [key, item] of Object.entries(value)) {
+			if (typeof item !== "string") throw invalidEntryField(id, `${field}.${key}`, "a string");
+		}
+	}
+}
 
 /**
  * Reads the entry's declared transport (`type`, or the `transport` spelling), falling back to the
@@ -236,7 +323,7 @@ function entryTransportType(entry: McpServerConfig, id: string): McpConfigTransp
 				`Config entry '${id}' has a non-string '${field}'.`,
 			);
 		}
-		const kind = TRANSPORT_ALIASES[value.trim().toLowerCase()];
+		const kind = TRANSPORT_ALIASES.get(value.trim().toLowerCase());
 		if (kind === undefined) {
 			throw new KmcpError(
 				KMCP_ERROR_CODES.INVALID_DEFINITION,
@@ -266,27 +353,55 @@ function entryTransportType(entry: McpServerConfig, id: string): McpConfigTransp
 	return resolved;
 }
 
+/** `C:\srv\server.exe`, `D:/srv/server.exe` — a drive-letter root. */
+const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
+
 /**
- * The `command`/`args` pair to spawn. A `command` that holds whitespace and comes WITHOUT `args`
- * is one command line and is split (hosts with a single input field store it that way); note that
- * `${VAR}` substitution happens first, so an expanded value with spaces splits too. Any `args`
- * field — including `[]` — means the command is a program name and is passed through verbatim.
+ * Whether a `command` that carries whitespace is ONE command line to split, or one program whose
+ * path merely holds spaces. Decided on the RAW, pre-substitution string, so a `${VAR}` that expands
+ * to `/Applications/My App/bin/srv` is never re-split by the expansion.
+ *
+ * Three shapes are read as a path and left whole: one that exists on disk exactly as written, one
+ * rooted at a drive letter, and one that uses `\` separators without any quote to disambiguate
+ * them from the POSIX escapes `parseCommandLine` would see (which also keeps a trailing `C:\srv\`
+ * from failing the whole config).
+ */
+function looksLikeCommandLine(raw: string): boolean {
+	if (!/\s/.test(raw)) return false;
+	if (existsSync(raw)) return false;
+	if (WINDOWS_DRIVE_PATH.test(raw)) return false;
+	if (raw.includes("\\") && !raw.includes('"') && !raw.includes("'")) return false;
+	return true;
+}
+
+const identity = (value: string): string => value;
+
+/**
+ * The `command`/`args` pair to spawn, with `substitute` applied to each token AFTER the split so an
+ * expanded value is never re-split. A `command` that holds whitespace and comes WITHOUT `args` is
+ * one command line (hosts with a single input field store it that way) unless it reads as a path
+ * (see {@link looksLikeCommandLine}). Any `args` field — including `[]` — means the command is a
+ * program name and is passed through verbatim.
  */
 function entryCommand(
 	entry: McpStdioServerConfig,
 	id: string,
+	substitute: (value: string) => string,
 ): { command: string; args: string[] } {
-	if (typeof entry.command !== "string" || entry.command.length === 0) {
+	const raw = entry.command;
+	if (typeof raw !== "string" || raw.length === 0) {
 		throw new KmcpError(
 			KMCP_ERROR_CODES.INVALID_DEFINITION,
 			`Config entry '${id}' must have a 'command' or a 'url'.`,
 		);
 	}
-	if (entry.args !== undefined) return { command: entry.command, args: [...entry.args] };
-	if (!/\s/.test(entry.command)) return { command: entry.command, args: [] };
+	if (entry.args !== undefined) {
+		return { command: substitute(raw), args: entry.args.map(substitute) };
+	}
+	if (!looksLikeCommandLine(raw)) return { command: substitute(raw), args: [] };
+	let parsed: McpParsedCommandLine;
 	try {
-		const parsed = parseCommandLine(entry.command);
-		return { command: parsed.command, args: [...parsed.args] };
+		parsed = parseCommandLine(raw);
 	} catch (error) {
 		throw new KmcpError(
 			KMCP_ERROR_CODES.INVALID_DEFINITION,
@@ -296,6 +411,7 @@ function entryCommand(
 			{ cause: error },
 		);
 	}
+	return { command: substitute(parsed.command), args: parsed.args.map(substitute) };
 }
 
 function entryTimeoutMs(entry: McpServerConfig, id: string): number | undefined {
@@ -309,44 +425,146 @@ function entryTimeoutMs(entry: McpServerConfig, id: string): number | undefined 
 	return Math.round(entry.timeout * 1000);
 }
 
-const ENV_REFERENCE = /\$\{([^}]+)\}/g;
+const ENV_REFERENCE = /\$\{([^{}]*)\}/g;
+/** VS Code spells an environment lookup `${env:NAME}`; the prefix is not part of the name. */
+const ENV_REFERENCE_PREFIX = "env:";
+const ENV_REFERENCE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/**
+ * VS Code's predefined `${…}` variables. They belong to the HOST that owns the workspace, so the
+ * loader leaves them exactly as written instead of resolving them to an empty string.
+ */
+const HOST_VARIABLES: ReadonlySet<string> = new Set([
+	"cwd",
+	"defaultBuildTask",
+	"execPath",
+	"file",
+	"fileBasename",
+	"fileBasenameNoExtension",
+	"fileDirname",
+	"fileExtname",
+	"fileWorkspaceFolder",
+	"lineNumber",
+	"pathSeparator",
+	"relativeFile",
+	"relativeFileDirname",
+	"selectedText",
+	"userHome",
+	"workspaceFolder",
+	"workspaceFolderBasename",
+]);
+
+/**
+ * The environment variable a `${…}` body names, or `undefined` when the reference is not the
+ * loader's to expand: a `name:`-prefixed reference some host resolves (`${input:api-key}`,
+ * `${command:pickPort}`), one of {@link HOST_VARIABLES}, or a body that is not a variable name at
+ * all. Those are returned untouched rather than emptied, and never reported as missing.
+ */
+function envReferenceName(body: string): string | undefined {
+	if (body.startsWith(ENV_REFERENCE_PREFIX)) {
+		const name = body.slice(ENV_REFERENCE_PREFIX.length);
+		return name.length === 0 ? undefined : name;
+	}
+	if (!ENV_REFERENCE_NAME.test(body) || HOST_VARIABLES.has(body)) return undefined;
+	return body;
+}
+
+/**
+ * Expands `${NAME}`/`${env:NAME}` in every VALUE-bearing field of an entry — `url`, `cwd`,
+ * `headers`, `env`, `command` and `args`. Routing never decides which fields are substituted, so a
+ * `type: "stdio"` entry that still carries a stale `url` gets its `command`, `args` and `env`
+ * expanded all the same instead of handing the child a literal `${TOKEN}`. (`namespace`, `type` and
+ * `transport` are identifiers the loader reads, not values, and are taken as written.) The stdio
+ * command line is split before its tokens are substituted; see {@link entryCommand}.
+ */
 function substituteEntry(
 	entry: McpServerConfig,
 	id: string,
+	transportType: McpConfigTransport,
 	options: McpConfigLoaderOptions,
 ): McpServerConfig {
-	const env = options.env ?? {};
-	const substitute = (value: string): string =>
-		value.replace(ENV_REFERENCE, (_match, name: string) => {
-			const replacement = env[name];
-			if (replacement === undefined) {
-				options.onMissingEnv?.(name, id);
-				return "";
-			}
-			return replacement;
-		});
+	const env = options.env;
+	const substitute =
+		env === undefined
+			? identity
+			: (value: string): string =>
+					value.replace(ENV_REFERENCE, (match: string, body: string) => {
+						const name = envReferenceName(body);
+						if (name === undefined) return match;
+						const replacement = env[name];
+						if (replacement === undefined) {
+							options.onMissingEnv?.(name, id);
+							return "";
+						}
+						return replacement;
+					});
 	const substituteRecord = (
 		record: Readonly<Record<string, string>> | undefined,
 	): Readonly<Record<string, string>> | undefined =>
 		record === undefined
 			? undefined
 			: Object.fromEntries(Object.entries(record).map(([key, value]) => [key, substitute(value)]));
-	if ("url" in entry) {
-		const headers = substituteRecord(entry.headers);
-		return {
-			...entry,
-			url: substitute(entry.url),
-			...(headers === undefined ? {} : { headers }),
-		};
+	const next = { ...entry } as Record<string, unknown>;
+	for (const field of ["url", "cwd"] as const) {
+		const value = next[field];
+		if (typeof value === "string") next[field] = substitute(value);
 	}
-	const env2 = substituteRecord(entry.env);
-	return {
-		...entry,
-		command: substitute(entry.command),
-		...(entry.args === undefined ? {} : { args: entry.args.map(substitute) }),
-		...(env2 === undefined ? {} : { env: env2 }),
-	};
+	for (const field of ENTRY_RECORD_FIELDS) {
+		const record = substituteRecord(next[field] as Readonly<Record<string, string>> | undefined);
+		if (record !== undefined) next[field] = record;
+	}
+	if (typeof next.command === "string") {
+		if (transportType === "stdio") {
+			const command = entryCommand(entry as McpStdioServerConfig, id, substitute);
+			next.command = command.command;
+			next.args = command.args;
+		} else {
+			// A leftover `command` on a remote entry is not what gets spawned, so it is expanded but
+			// never split: splitting could only fail on a value nothing will run.
+			next.command = substitute(next.command);
+			if (Array.isArray(next.args)) next.args = (next.args as readonly string[]).map(substitute);
+		}
+	}
+	return next as unknown as McpServerConfig;
+}
+
+/**
+ * A SHA-256 over the canonical JSON of one loaded entry — every field, keys sorted, values as they
+ * stand AFTER substitution — together with the loader options that shape the definition
+ * (`defaults`, `tags`). Reloading the same config produces the same digest, so a manager's
+ * `reconcile` can tell an untouched entry from an edited one without diffing live closures.
+ *
+ * The digest deliberately covers SECRET values (`env`, `headers`, a token inside a `url`): a
+ * rotated credential MUST count as a change. SHA-256 is one-way and never reversible, so the digest
+ * reveals nothing about what went into it and is safe to expose, log and compare. Values JSON
+ * cannot carry (the callbacks a `defaults` may hold) contribute nothing.
+ */
+function entryFingerprint(entry: McpServerConfig, options: McpConfigLoaderOptions): string {
+	const shape = canonicalJson({ entry, defaults: options.defaults, tags: options.tags });
+	return createHash("sha256").update(shape).digest("hex");
+}
+
+/** JSON with object keys sorted, so the key order a config file happens to use never matters. */
+function canonicalJson(value: unknown, seen: Set<object> = new Set()): string {
+	if (typeof value === "bigint") return JSON.stringify(value.toString());
+	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+	if (seen.has(value)) return '"[circular]"';
+	seen.add(value);
+	try {
+		if (Array.isArray(value)) {
+			return `[${value.map((item) => canonicalJson(item, seen)).join(",")}]`;
+		}
+		const record = value as Record<string, unknown>;
+		const fields: string[] = [];
+		for (const key of Object.keys(record).sort()) {
+			const item = record[key];
+			if (item === undefined || typeof item === "function" || typeof item === "symbol") continue;
+			fields.push(`${JSON.stringify(key)}:${canonicalJson(item, seen)}`);
+		}
+		return `{${fields.join(",")}}`;
+	} finally {
+		seen.delete(value);
+	}
 }
 
 /**
@@ -580,10 +798,24 @@ export interface McpConfigWatchOptions {
 	 * yet are watched too: their creation is a change.
 	 */
 	readonly paths?: readonly (string | McpConfigCandidate)[];
-	/** Passed to {@link standardMcpConfigPaths} when `paths` is omitted; `cwd` also scopes strings. */
+	/**
+	 * Passed to {@link standardMcpConfigPaths} when `paths` is omitted; `cwd` also resolves the
+	 * relative paths (and relative candidates) given in `paths`.
+	 */
 	readonly pathOptions?: McpConfigPathOptions;
-	/** Called once per settled change, per path. Exceptions are routed to `onError`. */
+	/**
+	 * Called once per settled change, per path, and only when the file's BYTES actually differ from
+	 * what was last delivered (see {@link McpConfigWatchOptions.initial}). Exceptions are routed to
+	 * `onError`.
+	 */
 	readonly onChange: (change: McpConfigChange) => void;
+	/**
+	 * Deliver each watched path's CURRENT content once at start, before any change. Default:
+	 * `false` — the watcher records what each file holds at start and stays silent until the
+	 * content differs from that, so a host that has already loaded its configs is not handed them
+	 * again.
+	 */
+	readonly initial?: boolean;
 	/**
 	 * Receives read failures, unparseable JSON, and watch failures (a `KmcpError` for the first
 	 * two). The watch continues: one broken editor config never stops the others.
@@ -609,14 +841,51 @@ export interface McpConfigWatcher {
 const DEFAULT_WATCH_DEBOUNCE_MS = 250;
 const DEFAULT_WATCH_POLL_MS = 1000;
 
+/** Stands in for "there is no file at this path"; no hex digest can collide with it. */
+const ABSENT_DIGEST = "absent";
+
+function digestOf(raw: string): string {
+	return createHash("sha256").update(raw).digest("hex");
+}
+
+/** The digest of a file's current content, or `undefined` when it cannot be read at all. */
+function digestOfFileSync(path: string): string | undefined {
+	try {
+		return digestOf(readFileSync(path, "utf8"));
+	} catch (error) {
+		return isAbsentConfig(error) ? ABSENT_DIGEST : undefined;
+	}
+}
+
+/**
+ * `dev:ino` for a directory — its identity on disk, which survives a rename but not a delete and
+ * recreate. `undefined` when the path is gone or is no longer a directory.
+ */
+function directoryIdentity(path: string): string | undefined {
+	try {
+		const stats = statSync(path, { bigint: true });
+		return stats.isDirectory() ? `${stats.dev}:${stats.ino}` : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Watches MCP config files and reports each settled change with the freshly parsed content, so a
  * long-lived host can pick up a server the user just added in another app without a restart.
  *
  * Watching happens on each file's PARENT directory (`fs.watch`), which is what makes creation,
  * deletion and the write-to-temp-then-rename editors do observable; a platform where that throws
- * (or fails later) falls back to `fs.watchFile` polling for the affected files. Only `node:fs` is
- * used — no watcher dependency, no recursive watching, and no directory is walked.
+ * (or fails later, or has its directory deleted out from under it) falls back to `fs.watchFile`
+ * polling for the affected files. Only `node:fs` is used — no watcher dependency, no recursive
+ * watching, and no directory is walked.
+ *
+ * Changes are content-addressed: each path's raw bytes are hashed (SHA-256) and a rewrite that
+ * produces identical content is NOT reported. Hosts rewrite these files constantly (Claude Code
+ * rewrites `~/.claude.json` on almost every interaction) and macOS replays pre-watch events, so
+ * without that a host would rebuild its connections over and over for nothing. The hashes are
+ * primed at start, so nothing is delivered until the content actually changes; pass
+ * `initial: true` to receive each file's current content once up front.
  */
 export function watchMcpConfigs(options: McpConfigWatchOptions): McpConfigWatcher {
 	if (typeof options?.onChange !== "function") {
@@ -640,14 +909,27 @@ export function watchMcpConfigs(options: McpConfigWatchOptions): McpConfigWatche
 		const candidate =
 			typeof source === "string"
 				? watchCandidate(source, pathOptions)
-				: { ...source, path: resolve(source.path) };
+				: // A candidate's own path is resolved against the SAME base as a bare string's, so
+					// `pathOptions.cwd` scopes both (a test cwd must not fall through to the process's).
+					{ ...source, path: resolve(pathOptions.cwd ?? process.cwd(), source.path) };
 		if (candidate.path.length === 0) continue;
 		candidates.set(candidate.path, Object.freeze(candidate));
 	}
 
 	const timers = new Map<string, NodeJS.Timeout>();
-	const watchers: FSWatcher[] = [];
+	const watchers = new Set<FSWatcher>();
 	const polling = new Map<string, () => void>();
+	// The SHA-256 of the raw text last DELIVERED for each path (or `ABSENT_DIGEST` for "no file
+	// here"), so byte-identical rewrites and replayed events are dropped instead of republished.
+	const digests = new Map<string, string>();
+	if (options.initial !== true) {
+		// Primed BEFORE any watcher is armed (and synchronously, so no edit can slip into the gap):
+		// the watch starts from what the files hold now and stays quiet until that changes.
+		for (const path of candidates.keys()) {
+			const digest = digestOfFileSync(path);
+			if (digest !== undefined) digests.set(path, digest);
+		}
+	}
 	let closed = false;
 	// Reads are chained so two quick edits can never deliver out of order, and so `close()` has
 	// something to await before it promises that no further callback will run.
@@ -678,9 +960,12 @@ export function watchMcpConfigs(options: McpConfigWatchOptions): McpConfigWatche
 			raw = await readFile(candidate.path, "utf8");
 		} catch (error) {
 			if (isAbsentConfig(error)) {
+				if (digests.get(candidate.path) === ABSENT_DIGEST) return;
+				digests.set(candidate.path, ABSENT_DIGEST);
 				deliver({ path: candidate.path, configs: Object.freeze([]) });
 				return;
 			}
+			// A real access failure leaves the recorded digest alone, so a retry still reports.
 			report(
 				new KmcpError(
 					KMCP_ERROR_CODES.OPERATION_FAILED,
@@ -691,6 +976,12 @@ export function watchMcpConfigs(options: McpConfigWatchOptions): McpConfigWatche
 			);
 			return;
 		}
+		const digest = digestOf(raw);
+		// Identical bytes are the same config: hosts rewrite these files constantly, and macOS
+		// replays events that predate the watch. The digest is recorded even for content that turns
+		// out to be broken, so one bad file is reported once rather than on every rewrite of it.
+		if (digests.get(candidate.path) === digest) return;
+		digests.set(candidate.path, digest);
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(raw);
@@ -753,37 +1044,100 @@ export function watchMcpConfigs(options: McpConfigWatchOptions): McpConfigWatche
 		}
 		for (const [directory, group] of byDirectory) {
 			const byName = new Map(group.map((candidate) => [basename(candidate.path), candidate]));
+			// The name the directory itself is reported under when it is the thing that changed.
+			const selfName = basename(directory);
+			// The `dev:ino` the live handle was opened on, so a directory that was replaced (deleted
+			// and recreated) is recognized as a different one rather than trusted.
+			let identity: string | undefined;
+			let live: FSWatcher | undefined;
+
+			const drop = (watcher: FSWatcher): void => {
+				watchers.delete(watcher);
+				try {
+					watcher.close();
+				} catch {
+					// Already closed.
+				}
+				if (live === watcher) live = undefined;
+			};
 			const fallback = (error: unknown): void => {
 				// A directory that simply does not exist is the normal case for a standard location
 				// nobody has used yet, not a failure worth reporting; polling still sees it appear.
 				if (!isAbsentConfig(error)) report(error, directory);
 				for (const candidate of group) startPolling(candidate);
 			};
-			let watcher: FSWatcher;
-			try {
-				// The directory itself may not exist yet (`~/.cursor` before Cursor ran once).
-				watcher = watch(directory, { persistent });
-			} catch (error) {
-				fallback(error);
-				continue;
-			}
-			watcher.on("change", (_event, filename) => {
-				if (filename === null || filename === undefined) {
-					// Some platforms omit the name; re-check every file this directory holds.
-					for (const candidate of group) trigger(candidate.path);
+			/**
+			 * `fs.watch` keeps reporting on the directory it opened, so a deleted or replaced
+			 * directory leaves a handle that is alive but watches nothing. Linux announces that as an
+			 * ordinary `'change'` naming the directory itself (never as an `'error'`), so every such
+			 * event re-stats the path: same inode, nothing to do; gone, poll (which also sees it come
+			 * back); replaced, re-watch the directory that is there now.
+			 */
+			const recheck = (watcher: FSWatcher): void => {
+				if (closed || live !== watcher) return;
+				const current = directoryIdentity(directory);
+				if (current !== undefined && current === identity) return;
+				drop(watcher);
+				for (const candidate of group) trigger(candidate.path);
+				if (current === undefined) {
+					for (const candidate of group) startPolling(candidate);
 					return;
 				}
-				const name = typeof filename === "string" ? filename : filename.toString("utf8");
-				const candidate = byName.get(name);
-				if (candidate !== undefined) trigger(candidate.path);
-			});
-			watcher.on("error", (error) => {
-				// The directory was removed, or the platform dropped the handle: keep going by polling.
-				watcher.close();
-				fallback(error);
-			});
-			watchers.push(watcher);
+				open();
+			};
+			function open(): void {
+				if (closed) return;
+				let watcher: FSWatcher;
+				try {
+					// The directory itself may not exist yet (`~/.cursor` before Cursor ran once).
+					watcher = watch(directory, { persistent });
+				} catch (error) {
+					fallback(error);
+					return;
+				}
+				live = watcher;
+				identity = directoryIdentity(directory);
+				watcher.on("change", (_event, filename) => {
+					if (live !== watcher) return;
+					const name =
+						filename === null || filename === undefined
+							? undefined
+							: typeof filename === "string"
+								? filename
+								: filename.toString("utf8");
+					if (name === undefined || name === selfName) recheck(watcher);
+					if (name === undefined) {
+						// Some platforms omit the name; re-check every file this directory holds.
+						for (const candidate of group) trigger(candidate.path);
+						return;
+					}
+					const candidate = byName.get(name);
+					if (candidate !== undefined) trigger(candidate.path);
+				});
+				watcher.on("error", (error) => {
+					// The directory was removed, or the platform dropped the handle: keep going by
+					// polling.
+					drop(watcher);
+					fallback(error);
+				});
+				watchers.add(watcher);
+			}
+			open();
 		}
+	}
+
+	if (options.initial === true) {
+		// The host asked for the current content: deliver it once, which records the digests too, so
+		// the rewrites that follow are compared against what was actually handed over.
+		queue = queue.then(async () => {
+			for (const candidate of candidates.values()) {
+				try {
+					await emit(candidate);
+				} catch (error) {
+					report(error, candidate.path);
+				}
+			}
+		});
 	}
 
 	let closing: Promise<void> | undefined;
@@ -801,7 +1155,7 @@ export function watchMcpConfigs(options: McpConfigWatchOptions): McpConfigWatche
 						// Already closed by an error handler.
 					}
 				}
-				watchers.length = 0;
+				watchers.clear();
 				for (const stop of polling.values()) stop();
 				polling.clear();
 				await queue;

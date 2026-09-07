@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -216,6 +216,101 @@ test("watchMcpConfigs watches the standard locations by default", async (t) => {
 	assert.equal(change.path, join(cwd, ".mcp.json"));
 	assert.equal(change.configs[0]!.scope, "project");
 	assert.equal(change.configs[0]!.client, "claude-code");
+});
+
+test("watchMcpConfigs resolves a relative candidate against pathOptions.cwd", async (t) => {
+	const cwd = await mkdtemp(join(tmpdir(), "kmcp-watch-cwd-"));
+	const recorder = new Recorder();
+	const watcher = start(t, {
+		// A candidate, not a bare string: its own `path` is scoped by `cwd` the same way.
+		paths: [{ path: ".mcp.json", scope: "project", client: "cursor" }],
+		pathOptions: { cwd },
+		onChange: recorder.onChange,
+		onError: recorder.onError,
+	});
+	assert.deepEqual(watcher.paths, [join(cwd, ".mcp.json")]);
+
+	await writeFile(join(cwd, ".mcp.json"), CONFIG("https://scoped.example.com/mcp"));
+	const change = await recorder.next("the scoped config", (c) => c.configs.length === 1);
+	assert.equal(change.path, join(cwd, ".mcp.json"));
+	assert.equal(change.configs[0]!.client, "cursor");
+});
+
+test("watchMcpConfigs reports a rewrite only when the content actually changed", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "kmcp-watch-"));
+	const path = join(directory, "mcp.json");
+	// The file already exists when the watch starts, as a host's own config does.
+	await writeFile(path, CONFIG("https://one.example.com/mcp"));
+	const recorder = new Recorder();
+	start(t, { paths: [path], onChange: recorder.onChange, onError: recorder.onError });
+
+	// Hosts rewrite these files constantly (Claude Code rewrites `~/.claude.json` on almost every
+	// interaction): identical bytes are not a change, and neither is the content already on disk.
+	for (let index = 0; index < 3; index += 1) {
+		await writeFile(path, CONFIG("https://one.example.com/mcp"));
+	}
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	assert.deepEqual(recorder.changes, []);
+	assert.deepEqual(recorder.errors, []);
+
+	await writeFile(path, CONFIG("https://two.example.com/mcp"));
+	const change = await recorder.next("the real edit");
+	assert.equal(alphaUrl(change), "https://two.example.com/mcp");
+	// Rewriting the NEW content is not a change either.
+	await writeFile(path, CONFIG("https://two.example.com/mcp"));
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	assert.equal(recorder.changes.length, 1);
+});
+
+test("watchMcpConfigs can deliver the current content once at start", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "kmcp-watch-"));
+	const path = join(directory, "mcp.json");
+	const absent = join(directory, "other.json");
+	await writeFile(path, CONFIG("https://one.example.com/mcp"));
+	const recorder = new Recorder();
+	start(t, {
+		paths: [path, absent],
+		initial: true,
+		onChange: recorder.onChange,
+		onError: recorder.onError,
+	});
+
+	const first = await recorder.next("the initial content", (c) => c.path === path);
+	assert.equal(alphaUrl(first), "https://one.example.com/mcp");
+	// A path with no file is "no config here", delivered once as well.
+	const empty = await recorder.next("the initial absence", (c) => c.path === absent);
+	assert.deepEqual(empty.configs, []);
+
+	// The digests are recorded by that delivery, so an identical rewrite is still silent.
+	await writeFile(path, CONFIG("https://one.example.com/mcp"));
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	assert.equal(recorder.changes.length, 2);
+});
+
+test("watchMcpConfigs survives the watched directory being deleted and recreated", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "kmcp-watch-"));
+	const directory = join(root, "nested");
+	await mkdir(directory);
+	const path = join(directory, "mcp.json");
+	await writeFile(path, CONFIG("https://one.example.com/mcp"));
+	const recorder = new Recorder();
+	start(t, { paths: [path], onChange: recorder.onChange, onError: recorder.onError });
+
+	// Deleting the DIRECTORY leaves `fs.watch` holding a handle on an inode nothing writes to
+	// again; on Linux it arrives as an ordinary 'change' naming the directory, never as an 'error'.
+	await rm(directory, { recursive: true });
+	const gone = await recorder.next("the deletion", (change) => change.configs.length === 0);
+	assert.deepEqual(gone.configs, []);
+
+	// A fresh directory at the same path is a different inode, so the watch has to be re-armed.
+	await mkdir(directory);
+	await writeFile(path, CONFIG("https://back.example.com/mcp"));
+	const back = await recorder.next(
+		"the recreated config",
+		(change) => alphaUrl(change) === "https://back.example.com/mcp",
+	);
+	assert.equal(back.configs.length, 1);
+	assert.deepEqual(recorder.errors, []);
 });
 
 test("watchMcpConfigs validates its options", () => {

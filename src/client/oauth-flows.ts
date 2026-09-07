@@ -20,11 +20,11 @@ import {
 	UnauthorizedError,
 	assertSecureTokenEndpoint,
 	auth,
+	checkResourceAllowed,
 	discoverAndRequestJwtAuthGrant,
 	discoverAuthorizationServerMetadata,
 	discoverOAuthProtectedResourceMetadata,
 	discoverOAuthServerInfo,
-	extractWWWAuthenticateParams,
 	requestJwtAuthorizationGrant,
 } from "@modelcontextprotocol/client";
 
@@ -961,11 +961,17 @@ export type McpOAuthGrantType =
 	| "urn:ietf:params:oauth:grant-type:token-exchange"
 	| (string & {});
 
-/** How a client gets a `client_id` from the authorization server the probe found. */
+/** How {@link auth} would obtain a `client_id` from the authorization server the probe found. */
 export type McpOAuthRegistrationSupport =
 	/** RFC 7591 Dynamic Client Registration: the server advertises a `registration_endpoint`. */
 	| "dynamic"
-	/** SEP-991 Client ID Metadata Documents: pass `clientMetadataUrl` instead of registering. */
+	/**
+	 * SEP-991 Client ID Metadata Documents: pass `clientMetadataUrl` instead of registering. The
+	 * SDK's `auth()` takes this branch whenever the server advertises
+	 * `client_id_metadata_document_supported`, so the probe reports it even when a
+	 * `registration_endpoint` is advertised too — {@link McpServerAuthProbeOAuth.dynamicRegistration}
+	 * then says that registering is still available to a host with no client metadata URL.
+	 */
 	| "cimd"
 	/** Neither: only clients the authorization server already knows are accepted. */
 	| "preregistered-only"
@@ -989,10 +995,19 @@ export interface McpServerAuthProbeOpen extends McpServerAuthProbeCommon {
 	readonly kind: "open";
 }
 
-/** The server answered `401` with a `Bearer` challenge: an OAuth 2.1 flow is required. */
+/**
+ * The server asked for OAuth: a `401` with a `Bearer` challenge, a `403` with one (a scope
+ * step-up), or a challenge-less refusal whose well-known discovery still turned up an
+ * authorization server.
+ */
 export interface McpServerAuthProbeOAuth extends McpServerAuthProbeCommon {
 	readonly kind: "oauth";
-	/** The `resource_metadata` URL the challenge pointed at, when it carried one (RFC 9728 §5.1). */
+	/**
+	 * The `resource_metadata` URL the challenge pointed at (RFC 9728 §5.1), when it carried one the
+	 * probe was willing to follow. A `http:` non-loopback URL, or one aimed at a private or
+	 * link-local IP literal the probed server does not itself live on, is dropped and discovery
+	 * falls back to the well-known path instead of trusting an attacker-chosen host.
+	 */
 	readonly resourceMetadataUrl?: string;
 	/** RFC 9728 protected-resource metadata, when the resource server publishes it. */
 	readonly resourceMetadata?: OAuthProtectedResourceMetadata;
@@ -1003,16 +1018,37 @@ export interface McpServerAuthProbeOAuth extends McpServerAuthProbeCommon {
 	readonly authorizationServers: readonly string[];
 	/** RFC 8414 / OIDC Discovery metadata of `authorizationServers[0]`, when it could be read. */
 	readonly authorizationServerMetadata?: AuthorizationServerMetadata;
-	/** The challenge's `scope` unioned with the advertised `scopes_supported`. */
+	/**
+	 * The scopes a real connection would ask for, mirroring the SDK's `determineScope`: the
+	 * challenge's own `scope` when it carried one, and only otherwise the protected-resource
+	 * metadata's `scopes_supported`. Absent when neither was given — the client's own
+	 * `clientMetadata.scope` decides then.
+	 */
 	readonly scopes?: readonly string[];
+	/** Every scope either metadata document advertises, whether or not it would be requested. */
+	readonly scopesSupported?: readonly string[];
 	/**
 	 * `grant_types_supported`, or RFC 8414 §2's default of `authorization_code` + `implicit` when
 	 * the metadata was read but omitted the field. Empty when no metadata could be read.
 	 */
 	readonly grants: readonly McpOAuthGrantType[];
 	readonly registration: McpOAuthRegistrationSupport;
+	/**
+	 * Whether the authorization server advertises an RFC 7591 `registration_endpoint`, whatever
+	 * `registration` says. `registration: "cimd"` with this set means a host holding no client
+	 * metadata URL can still register dynamically.
+	 */
+	readonly dynamicRegistration: boolean;
 	/** MCP extension / grant-profile identifiers advertised by either metadata document. */
 	readonly extensions?: readonly string[];
+	/**
+	 * Checks the SDK's `auth()` runs that this server would fail — an RFC 9728 `resource` that does
+	 * not cover the probed URL (`selectResourceURL` / `checkResourceAllowed`), or a token endpoint
+	 * that is neither `https:` nor loopback (`assertSecureTokenEndpoint`). Bounded, non-secret
+	 * sentences; absent when both checks passed. {@link suggestAuth} refuses to suggest a grant
+	 * while any is present.
+	 */
+	readonly issues?: readonly string[];
 }
 
 /** The server answered `401` with a challenge kmcp cannot drive (`Basic`, or a custom scheme). */
@@ -1021,6 +1057,16 @@ export interface McpServerAuthProbeBearer extends McpServerAuthProbeCommon {
 	/** The challenge's auth-scheme token, bounded (`Basic`, `Negotiate`, ...). */
 	readonly scheme: string;
 	readonly realm?: string;
+}
+
+/**
+ * The endpoint refused the request and said nothing about how to authenticate: a `401` or `403`
+ * carrying no `WWW-Authenticate` challenge, whose well-known discovery turned up no
+ * authorization-server metadata either. Credentials are required; which ones is not knowable here.
+ */
+export interface McpServerAuthProbeUnauthorized extends McpServerAuthProbeCommon {
+	readonly kind: "unauthorized";
+	readonly httpStatus: number;
 }
 
 /** The endpoint answered, but not like an MCP Streamable HTTP endpoint. */
@@ -1040,10 +1086,17 @@ export interface McpServerAuthProbeUnreachable extends McpServerAuthProbeCommon 
 	readonly code: string;
 }
 
-/** The endpoint redirected to another origin; the probe refuses to follow it. */
+/** The endpoint redirected somewhere the probe will not follow. */
 export interface McpServerAuthProbeRedirect extends McpServerAuthProbeCommon {
 	readonly kind: "redirect";
-	readonly location: string;
+	/**
+	 * `cross-origin` — the hop left the probed origin, or left `http(s)` altogether;
+	 * `too-many-redirects` — same-origin hops ran past the probe's cap without settling;
+	 * `opaque` — the runtime answered with an opaque redirect and never revealed the target.
+	 */
+	readonly reason: "cross-origin" | "too-many-redirects" | "opaque";
+	/** Where the refused hop pointed, bounded. Absent when no target was ever revealed. */
+	readonly location?: string;
 }
 
 /** Any other status: the endpoint is reachable but said nothing a host can act on. */
@@ -1056,6 +1109,7 @@ export type McpServerAuthProbe =
 	| McpServerAuthProbeOpen
 	| McpServerAuthProbeOAuth
 	| McpServerAuthProbeBearer
+	| McpServerAuthProbeUnauthorized
 	| McpServerAuthProbeNotMcp
 	| McpServerAuthProbeUnreachable
 	| McpServerAuthProbeRedirect
@@ -1067,7 +1121,10 @@ export interface McpProbeServerAuthOptions {
 	readonly timeoutMs?: number;
 	/** The `protocolVersion` the probe's `initialize` body claims. Defaults to kmcp's modern pin. */
 	readonly protocolVersion?: string;
-	/** Extra request headers (a tenant hint, a proxy token) merged over the probe's own. */
+	/**
+	 * Extra request headers (a tenant hint, a proxy token) merged over the probe's own, matched
+	 * case-insensitively: a caller's `Accept` replaces the probe's default rather than joining it.
+	 */
 	readonly headers?: Readonly<Record<string, string>>;
 	/** Follow an inconclusive `POST` with a `GET` to spot the deprecated SSE transport. Default `true`. */
 	readonly probeGet?: boolean;
@@ -1079,10 +1136,12 @@ const PROBE_DEFAULT_TIMEOUT_MS = 10_000;
 /** Same-origin hops the probe will follow before giving up and reporting the redirect. */
 const PROBE_MAX_REDIRECTS = 3;
 const PROBE_REDIRECT_STATUSES = Object.freeze(new Set([301, 302, 303, 307, 308]));
+const PROBE_ACCEPT = "application/json, text/event-stream";
 const PROBE_HTML = /^\s*text\/html\b/i;
 const PROBE_EVENT_STREAM = /^\s*text\/event-stream\b/i;
 const PROBE_SSE_PATH = /\/sse\/?$/;
-const PROBE_REALM = /realm\s*=\s*(?:"([^"]*)"|([^\s,]+))/i;
+/** Every URL the probe surfaces is server-controlled: bound it before a host ever renders it. */
+const PROBE_URL_MAX = 400;
 /** RFC 8414 §2: `grant_types_supported` defaults to these when the metadata omits it. */
 const PROBE_DEFAULT_GRANTS: readonly McpOAuthGrantType[] = Object.freeze([
 	"authorization_code",
@@ -1102,8 +1161,10 @@ const PROBE_EXTENSION_FIELDS: readonly string[] = Object.freeze([
  * One `POST` carrying an `initialize`-shaped body settles it in the common case (the answer's
  * *body* is never inspected — only its status and headers); a `GET` follows only when the `POST`
  * was inconclusive, to tell the deprecated HTTP+SSE transport from a wrong URL. Redirects are not
- * followed across origins. Discovery for the OAuth verdict runs the SDK's own RFC 9728 / RFC 8414
- * helpers, so what the probe reports is exactly what a real connection would find.
+ * followed across origins, and never during discovery. Discovery for the OAuth verdict runs the
+ * SDK's own RFC 9728 / RFC 8414 helpers and repeats the two checks `auth()` makes before it sends
+ * anything (`checkResourceAllowed`, `assertSecureTokenEndpoint`), so what the probe reports is what
+ * a real connection would find.
  *
  * Never throws for anything the server did — every server-side condition is one of the
  * {@link McpServerAuthProbe} outcomes. Only invalid input throws.
@@ -1129,6 +1190,7 @@ export async function probeServerAuth(
 	// A mock or a non-conforming `fetch` may ignore `signal`, so the deadline is also raced here.
 	const send: FetchLike = (url, init) => withDeadline(raw(url, { ...init, signal }), signal);
 	const seen: ProbeSignals = { protocolVersionHeader: undefined, sessionful: false };
+	const headers = probeHeaders(options, { "content-type": "application/json" });
 
 	let current = target;
 	let response: Response;
@@ -1136,7 +1198,7 @@ export async function probeServerAuth(
 		try {
 			response = await send(current, {
 				method: "POST",
-				headers: { "content-type": "application/json", ...probeHeaders(options) },
+				headers,
 				body: probeBody(options),
 				redirect: "manual",
 			});
@@ -1148,12 +1210,12 @@ export async function probeServerAuth(
 			});
 		}
 		recordProbeSignals(seen, response);
-		// A browser hides a manual redirect behind an opaque response: report it, do not follow.
+		// A browser hides a manual redirect behind an opaque response: there is no target to report.
 		if (response.type === "opaqueredirect") {
 			await drainResponse(response);
 			return Object.freeze({
 				kind: "redirect",
-				location: current.href,
+				reason: "opaque" as const,
 				...probeBase(target, seen, true),
 			});
 		}
@@ -1165,10 +1227,23 @@ export async function probeServerAuth(
 		if (next === undefined) {
 			return Object.freeze({ kind: "error", ...probeBase(target, seen, true), httpStatus: status });
 		}
-		if (next.origin !== current.origin || hop + 1 >= PROBE_MAX_REDIRECTS) {
+		// `blob:https://host/x` reports the same origin as `https://host`, so the scheme is
+		// re-asserted here exactly as `probeTarget` asserts it for the caller's own URL.
+		const followable = next.protocol === "http:" || next.protocol === "https:";
+		if (!followable || next.origin !== current.origin) {
 			return Object.freeze({
 				kind: "redirect",
-				location: next.href,
+				reason: "cross-origin" as const,
+				location: boundedUrl(next),
+				...probeBase(target, seen, true),
+				httpStatus: status,
+			});
+		}
+		if (hop + 1 >= PROBE_MAX_REDIRECTS) {
+			return Object.freeze({
+				kind: "redirect",
+				reason: "too-many-redirects" as const,
+				location: boundedUrl(next),
 				...probeBase(target, seen, true),
 				httpStatus: status,
 			});
@@ -1178,29 +1253,46 @@ export async function probeServerAuth(
 
 	const status = response.status;
 	const contentType = response.headers.get("content-type") ?? "";
-	if (status === 401) {
-		const challenge = response.headers.get("www-authenticate");
-		const scheme = challengeScheme(challenge);
-		if (scheme !== undefined && scheme.toLowerCase() !== "bearer") {
-			const realm = PROBE_REALM.exec(challenge ?? "");
+	const html = PROBE_HTML.test(contentType);
+	// A 403 carrying a Bearer challenge is a scope step-up, not a dead end, so both statuses that
+	// mean "not with these credentials" are read the same way.
+	if (status === 401 || status === 403) {
+		const challenges = parseChallenges(response.headers.get("www-authenticate"));
+		// RFC 7235 §4.1 allows several challenges in one header: a `Bearer` anywhere means OAuth.
+		const bearer = challenges.find((challenge) => challenge.scheme.toLowerCase() === "bearer");
+		if (bearer !== undefined) {
 			await drainResponse(response);
-			const value = realm?.[1] ?? realm?.[2];
+			return await probeOAuth(target, seen, status, challengeParams(bearer), send, options);
+		}
+		const other = challenges[0];
+		if (other !== undefined) {
+			await drainResponse(response);
+			const realm = other.params.get("realm");
 			return Object.freeze({
 				kind: "bearer",
-				scheme: bounded(scheme, 64),
-				...(value === undefined ? {} : { realm: bounded(value, 200) }),
+				scheme: bounded(other.scheme, 64),
+				...(realm === undefined ? {} : { realm: bounded(realm, 200) }),
 				...probeBase(target, seen, true),
 				httpStatus: status,
 			});
 		}
-		if (scheme !== undefined) {
-			const params = extractWWWAuthenticateParams(response);
+		if (!html) {
 			await drainResponse(response);
-			return await probeOAuth(target, seen, status, params, send, options);
+			// No challenge at all. `auth()` would still run well-known discovery, so the probe does:
+			// an authorization server found there means OAuth; nothing found means nobody said what
+			// this endpoint wants.
+			const oauth = await probeOAuth(target, seen, status, {}, send, options);
+			return oauth.authorizationServerMetadata === undefined
+				? Object.freeze({
+						kind: "unauthorized",
+						...probeBase(target, seen, true),
+						httpStatus: status,
+					})
+				: oauth;
 		}
 	}
 	await drainResponse(response);
-	if (PROBE_HTML.test(contentType)) {
+	if (html) {
 		return await probeNotMcp(
 			target,
 			seen,
@@ -1211,7 +1303,8 @@ export async function probeServerAuth(
 		);
 	}
 	if (status === 404 || status === 405 || status === 406) {
-		return await probeNotMcp(target, seen, status, notMcpReason(status), send, options);
+		const reason = notMcpReason(status, headers.get("accept") ?? PROBE_ACCEPT);
+		return await probeNotMcp(target, seen, status, reason, send, options);
 	}
 	if (status >= 200 && status < 300) {
 		return Object.freeze({
@@ -1247,24 +1340,37 @@ export function suggestAuth(probe: McpServerAuthProbe): McpAuthSuggestion {
 				note: "The server answered without an authorization challenge; connect with no auth provider.",
 			});
 		case "oauth": {
-			const interactiveOffered =
-				probe.grants.length === 0 || probe.grants.includes("authorization_code");
-			const machineOnly = !interactiveOffered && probe.grants.includes("client_credentials");
-			if (machineOnly) {
+			// A check `auth()` would fail settles it before any grant is worth naming.
+			const issue = probe.issues?.[0];
+			if (issue !== undefined) {
+				return Object.freeze({
+					grant: "none" as const,
+					interactive: false,
+					note: `The server requires OAuth, but a real connection would refuse this one: ${issue}`,
+				});
+			}
+			if (probe.grants.length === 0 || probe.grants.includes("authorization_code")) {
+				return Object.freeze({
+					grant: "authorization_code" as const,
+					interactive: true,
+					note: `${
+						probe.grants.length === 0
+							? "The server requires OAuth but its metadata could not be read; assume the interactive authorization_code grant"
+							: "The authorization server offers the authorization_code grant"
+					}; use McpOAuthClientProvider and send the user through a browser. ${registrationNote(probe)}`,
+				});
+			}
+			if (probe.grants.includes("client_credentials")) {
 				return Object.freeze({
 					grant: "client_credentials" as const,
 					interactive: false,
-					note: `The authorization server offers no authorization_code grant, only client_credentials; use clientCredentialsAuth(). ${registrationNote(probe.registration)}`,
+					note: `The authorization server offers no authorization_code grant, only client_credentials; use clientCredentialsAuth(). ${registrationNote(probe)}`,
 				});
 			}
 			return Object.freeze({
-				grant: "authorization_code" as const,
-				interactive: true,
-				note: `${
-					probe.grants.length === 0
-						? "The server requires OAuth but its metadata could not be read; assume the interactive authorization_code grant"
-						: "The authorization server offers the authorization_code grant"
-				}; use McpOAuthClientProvider and send the user through a browser. ${registrationNote(probe.registration)}`,
+				grant: "none" as const,
+				interactive: false,
+				note: `The authorization server advertises neither authorization_code nor client_credentials, only ${bounded(probe.grants.join(", "), 200)}; kmcp cannot drive that. ${registrationNote(probe)}`,
 			});
 		}
 		case "bearer":
@@ -1272,6 +1378,12 @@ export function suggestAuth(probe: McpServerAuthProbe): McpAuthSuggestion {
 				grant: "none" as const,
 				interactive: false,
 				note: `The server asked for a '${probe.scheme}' credential, which is not OAuth; supply the Authorization header yourself via the connection's headers.`,
+			});
+		case "unauthorized":
+			return Object.freeze({
+				grant: "none" as const,
+				interactive: false,
+				note: `The endpoint answered HTTP ${probe.httpStatus}: credentials are required, but the server sent no WWW-Authenticate challenge and publishes no authorization-server metadata, so it never said which. Ask the operator rather than starting an OAuth flow.`,
 			});
 		case "not-mcp":
 			return Object.freeze({
@@ -1295,7 +1407,7 @@ export function suggestAuth(probe: McpServerAuthProbe): McpAuthSuggestion {
 			return Object.freeze({
 				grant: "none" as const,
 				interactive: false,
-				note: `The endpoint redirects to another origin (${probe.location}); probe that URL instead of authorizing against this one.`,
+				note: redirectNote(probe),
 			});
 		case "error":
 			return Object.freeze({
@@ -1315,6 +1427,12 @@ interface ProbeBase {
 	readonly serverUrl: string;
 	readonly protocolVersionHeader?: string;
 	readonly sessionful?: boolean;
+}
+
+/** The `WWW-Authenticate` fields the probe reads, in the shape the SDK's own extractor returns. */
+interface ProbeChallengeParams {
+	readonly resourceMetadataUrl?: URL;
+	readonly scope?: string;
 }
 
 /** Accepts only an absolute `http:`/`https:` URL — every other scheme is a caller mistake. */
@@ -1337,6 +1455,18 @@ function probeTarget(serverUrl: string | URL): URL {
 	return url;
 }
 
+/**
+ * The probed endpoint as the SDK sees it: the RFC 8707 §2 resource identifier
+ * (`resourceUrlFromServerUrl` — only the fragment removed), which is also the `issuer` whose
+ * `search` `discoverMetadataWithFallback` copies onto the well-known URL. A query is part of what a
+ * real connection discovers against, so the probe keeps it.
+ */
+function probeResourceUrl(target: URL): URL {
+	const url = new URL(target.href);
+	url.hash = "";
+	return url;
+}
+
 function probeBase(target: URL, seen: ProbeSignals, responded: boolean): ProbeBase {
 	return {
 		serverUrl: target.href,
@@ -1347,8 +1477,18 @@ function probeBase(target: URL, seen: ProbeSignals, responded: boolean): ProbeBa
 	};
 }
 
-function probeHeaders(options: McpProbeServerAuthOptions): Record<string, string> {
-	return { accept: "application/json, text/event-stream", ...options.headers };
+/**
+ * The probe's own headers with the caller's merged over them. `Headers` matches names
+ * case-insensitively, so a caller's `Accept` *replaces* the probe's default instead of appending a
+ * second value to it — and the header actually sent is what the 406 verdict quotes.
+ */
+function probeHeaders(
+	options: McpProbeServerAuthOptions,
+	extra?: Readonly<Record<string, string>>,
+): Headers {
+	const headers = new Headers({ accept: PROBE_ACCEPT, ...extra });
+	for (const [name, value] of Object.entries(options.headers ?? {})) headers.set(name, value);
+	return headers;
 }
 
 function probeBody(options: McpProbeServerAuthOptions): string {
@@ -1382,17 +1522,188 @@ function resolveLocation(location: string | null, from: URL): URL | undefined {
 	}
 }
 
-/** The auth-scheme token of a `WWW-Authenticate` header, or `undefined` when there is no challenge. */
-function challengeScheme(header: string | null): string | undefined {
-	if (header === null) return undefined;
-	const token = header.trim().split(/[\s,]+/, 1)[0];
-	return token === undefined || token.length === 0 ? undefined : token;
+function boundedUrl(url: string | URL): string {
+	return bounded(String(url), PROBE_URL_MAX);
 }
 
-function notMcpReason(status: number): string {
+/** RFC 7230 `token`: the characters an auth-scheme and an auth-param name are drawn from. */
+const PROBE_TOKEN = "[!#$%&'*+.^_\x60|~0-9A-Za-z-]+";
+/** `name=value` (quoted or bare): an auth-param, which belongs to the challenge before it. */
+const PROBE_CHALLENGE_PARAM = new RegExp(
+	`^(${PROBE_TOKEN})\\s*=\\s*(?:"((?:[^"\\\\]|\\\\.)*)"|(.*))$`,
+);
+/** A bare token, or a token followed by whitespace: the start of a new challenge. */
+const PROBE_CHALLENGE_START = new RegExp(`^(${PROBE_TOKEN})(?:\\s+([\\s\\S]*))?$`);
+
+interface ProbeChallenge {
+	readonly scheme: string;
+	readonly params: Map<string, string>;
+}
+
+/**
+ * Splits a `WWW-Authenticate` header into its challenges (RFC 7235 §4.1 `1#challenge`). Commas
+ * separate challenges *and* auth-params, so the boundary is read from the shape of each segment: a
+ * bare token, or a token followed by whitespace, starts a challenge; a token followed by `=` is a
+ * param of the challenge before it. Quoted values may contain commas, so the split honours quoting.
+ *
+ * Reading only the first challenge would call `Basic realm="x", Bearer` a non-OAuth server.
+ */
+function parseChallenges(header: string | null): ProbeChallenge[] {
+	if (header === null || header.trim().length === 0) return [];
+	const challenges: ProbeChallenge[] = [];
+	for (const segment of splitOutsideQuotes(header)) {
+		const text = segment.trim();
+		if (text.length === 0) continue;
+		const previous = challenges[challenges.length - 1];
+		const param = PROBE_CHALLENGE_PARAM.exec(text);
+		if (param !== null && previous !== undefined) {
+			addChallengeParam(previous, param);
+			continue;
+		}
+		const start = PROBE_CHALLENGE_START.exec(text);
+		if (start === null) continue;
+		const challenge: ProbeChallenge = { scheme: start[1] ?? "", params: new Map() };
+		challenges.push(challenge);
+		const rest = start[2]?.trim() ?? "";
+		// Anything after the scheme that is not `name=value` is an RFC 7235 `token68` credential.
+		const first = rest.length === 0 ? null : PROBE_CHALLENGE_PARAM.exec(rest);
+		if (first !== null) addChallengeParam(challenge, first);
+	}
+	return challenges;
+}
+
+function addChallengeParam(challenge: ProbeChallenge, match: RegExpExecArray): void {
+	const name = (match[1] ?? "").toLowerCase();
+	const quoted = match[2];
+	const value = quoted === undefined ? (match[3] ?? "").trim() : quoted.replace(/\\(.)/g, "$1");
+	// RFC 7235: a repeated auth-param is invalid; the first wins rather than the last.
+	if (name.length > 0 && !challenge.params.has(name)) challenge.params.set(name, value);
+}
+
+function splitOutsideQuotes(header: string): string[] {
+	const segments: string[] = [];
+	let start = 0;
+	let quoted = false;
+	for (let index = 0; index < header.length; index += 1) {
+		const character = header[index];
+		if (quoted) {
+			if (character === "\\") index += 1;
+			else if (character === '"') quoted = false;
+			continue;
+		}
+		if (character === '"') quoted = true;
+		else if (character === ",") {
+			segments.push(header.slice(start, index));
+			start = index + 1;
+		}
+	}
+	segments.push(header.slice(start));
+	return segments;
+}
+
+/** The RFC 9728 §5.1 fields of a `Bearer` challenge, parsed from that challenge alone. */
+function challengeParams(challenge: ProbeChallenge): ProbeChallengeParams {
+	const metadata = challenge.params.get("resource_metadata");
+	let resourceMetadataUrl: URL | undefined;
+	if (metadata !== undefined && metadata.length > 0) {
+		try {
+			resourceMetadataUrl = new URL(metadata);
+		} catch {
+			resourceMetadataUrl = undefined;
+		}
+	}
+	const scope = challenge.params.get("scope");
+	return {
+		...(resourceMetadataUrl === undefined ? {} : { resourceMetadataUrl }),
+		...(scope === undefined || scope.length === 0 ? {} : { scope }),
+	};
+}
+
+/** The hosts RFC 8252 §7.3 — and the SDK's own token-endpoint check — exempt from `https:`. */
+function probeLoopbackHost(hostname: string): boolean {
+	return (
+		hostname === "localhost" ||
+		hostname === "127.0.0.1" ||
+		hostname === "[::1]" ||
+		hostname === "::1"
+	);
+}
+
+const PROBE_IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+/**
+ * Whether a hostname is an IP literal in a range that only ever names the probing machine's own
+ * network: loopback, RFC 1918 private, RFC 6598 CGNAT, link-local (169.254/16 — the cloud instance
+ * metadata service), IPv6 unique-local and link-local, and the IPv4-mapped forms of all of those.
+ */
+function privateIpLiteral(hostname: string): boolean {
+	const host =
+		hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+	const ipv4 = PROBE_IPV4.exec(host);
+	if (ipv4 !== null) return privateIpv4(ipv4);
+	if (!host.includes(":")) return false;
+	const lower = host.toLowerCase();
+	if (lower === "::1" || lower === "::") return true;
+	// `::ffff:169.254.169.254` reaches exactly what the bare IPv4 literal reaches.
+	const mapped = PROBE_IPV4.exec(lower.slice(lower.lastIndexOf(":") + 1));
+	if (mapped !== null) return privateIpv4(mapped);
+	const leading = Number.parseInt(lower.split(":")[0] ?? "", 16);
+	if (Number.isNaN(leading)) return false;
+	return (leading >= 0xfc00 && leading <= 0xfdff) || (leading >= 0xfe80 && leading <= 0xfeff);
+}
+
+function privateIpv4(match: RegExpExecArray): boolean {
+	const first = Number(match[1]);
+	const second = Number(match[2]);
+	const third = Number(match[3]);
+	const fourth = Number(match[4]);
+	if (first > 255 || second > 255 || third > 255 || fourth > 255) return false;
+	if (first === 0 || first === 10 || first === 127) return true;
+	if (first === 169 && second === 254) return true;
+	if (first === 172 && second >= 16 && second <= 31) return true;
+	if (first === 192 && second === 168) return true;
+	return first === 100 && second >= 64 && second <= 127;
+}
+
+/**
+ * Whether the `resource_metadata` URL a `401` handed over may be fetched. The header is
+ * attacker-controlled, and RFC 9728 discovery is the one place a challenge can aim the client at a
+ * host of its choosing: a hostile server could point it at `http://169.254.169.254/…` and have the
+ * probe surface whatever "authorization server" answers there. `https:` is required, `http:` only
+ * between loopback hosts, and a private, loopback or link-local IP literal is refused unless the
+ * probed server itself lives on it.
+ */
+function metadataUrlAllowed(candidate: URL, target: URL): boolean {
+	const loopbackTarget = probeLoopbackHost(target.hostname);
+	const loopbackCandidate = probeLoopbackHost(candidate.hostname);
+	if (candidate.protocol === "http:") {
+		if (!loopbackTarget || !loopbackCandidate) return false;
+	} else if (candidate.protocol !== "https:") return false;
+	if (!privateIpLiteral(candidate.hostname)) return true;
+	return candidate.hostname === target.hostname || (loopbackTarget && loopbackCandidate);
+}
+
+/**
+ * The `fetch` the SDK's discovery helpers run on: the probe's deadline, plus `redirect: "manual"`
+ * with a redirect answered as "nothing published here". Following a redirect is the other way a
+ * hostile `401` could move discovery onto a host of its choosing, and neither RFC 9728 nor RFC 8414
+ * discovery needs one — both already fall back on their own when a well-known path 404s.
+ */
+function discoveryFetch(send: FetchLike): FetchLike {
+	return async (url, init) => {
+		const response = await send(url, { ...init, redirect: "manual" });
+		if (response.type !== "opaqueredirect" && !PROBE_REDIRECT_STATUSES.has(response.status)) {
+			return response;
+		}
+		await drainResponse(response);
+		return new Response(null, { status: 404, statusText: "Not Found" });
+	};
+}
+
+function notMcpReason(status: number, accept: string): string {
 	if (status === 404) return "The endpoint answered HTTP 404: nothing is served at this path.";
 	if (status === 405) return "The endpoint answered HTTP 405: it does not accept POST.";
-	return "The endpoint answered HTTP 406: it rejected 'application/json, text/event-stream'.";
+	return `The endpoint answered HTTP 406: it rejected '${bounded(accept, 120)}'.`;
 }
 
 /**
@@ -1455,30 +1766,35 @@ async function probeOAuth(
 	target: URL,
 	seen: ProbeSignals,
 	status: number,
-	params: ReturnType<typeof extractWWWAuthenticateParams>,
+	params: ProbeChallengeParams,
 	send: FetchLike,
 	options: McpProbeServerAuthOptions,
 ): Promise<McpServerAuthProbeOAuth> {
-	const identity = oauthServerUrl(target);
+	const identity = probeResourceUrl(target);
+	const discover = discoveryFetch(send);
+	const metadataUrl =
+		params.resourceMetadataUrl !== undefined &&
+		metadataUrlAllowed(params.resourceMetadataUrl, target)
+			? params.resourceMetadataUrl
+			: undefined;
 	let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
 	try {
 		resourceMetadata = await discoverOAuthProtectedResourceMetadata(
 			identity,
-			params.resourceMetadataUrl === undefined
-				? {}
-				: { resourceMetadataUrl: params.resourceMetadataUrl },
-			send,
+			metadataUrl === undefined ? {} : { resourceMetadataUrl: metadataUrl },
+			discover,
 		);
 	} catch {
 		// RFC 9728 metadata is optional; discovery falls back to the server's own origin below.
 	}
 	const declared = arrayOfStrings(resourceMetadata?.authorization_servers);
-	const authorizationServers = declared.length > 0 ? declared : [String(new URL("/", identity))];
-	const primary = authorizationServers[0] ?? identity;
+	const fallback = String(new URL("/", identity));
+	const primary = declared[0] ?? fallback;
+	const authorizationServers = (declared.length > 0 ? declared : [fallback]).map(boundedUrl);
 	let authorizationServerMetadata: AuthorizationServerMetadata | undefined;
 	try {
 		authorizationServerMetadata = await discoverAuthorizationServerMetadata(primary, {
-			fetchFn: send,
+			fetchFn: discover,
 			...(options.skipIssuerMetadataValidation === undefined
 				? {}
 				: { skipIssuerValidation: options.skipIssuerMetadataValidation }),
@@ -1493,41 +1809,92 @@ async function probeOAuth(
 			: advertised.length > 0
 				? Object.freeze(advertised)
 				: PROBE_DEFAULT_GRANTS;
-	const scopes = uniqueStrings([
-		...(normalizeScope(params.scope)?.split(/\s+/) ?? []),
-		...arrayOfStrings(
-			resourceMetadata?.scopes_supported ?? authorizationServerMetadata?.scopes_supported,
-		),
-	]);
+	// `determineScope`: the challenge's own scope wins outright; the resource metadata is the only
+	// fallback the SDK consults. The authorization server's list is advertisement, never a request.
+	const requested = boundedScopes(normalizeScope(params.scope)?.split(/\s+/) ?? []);
+	const resourceScopes = boundedScopes(arrayOfStrings(resourceMetadata?.scopes_supported));
+	const serverScopes = boundedScopes(arrayOfStrings(authorizationServerMetadata?.scopes_supported));
+	const scopes = requested.length > 0 ? requested : resourceScopes;
+	const scopesSupported = uniqueStrings([...resourceScopes, ...serverScopes]);
 	const extensions = uniqueStrings([
 		...extensionHints(resourceMetadata),
 		...extensionHints(authorizationServerMetadata),
 	]);
+	const issues = probeIssues(identity, resourceMetadata, authorizationServerMetadata);
 	return Object.freeze({
 		kind: "oauth",
-		...(params.resourceMetadataUrl === undefined
-			? {}
-			: { resourceMetadataUrl: params.resourceMetadataUrl.href }),
+		...(metadataUrl === undefined ? {} : { resourceMetadataUrl: boundedUrl(metadataUrl) }),
 		...(resourceMetadata === undefined ? {} : { resourceMetadata }),
 		authorizationServers: Object.freeze(authorizationServers),
 		...(authorizationServerMetadata === undefined ? {} : { authorizationServerMetadata }),
 		...(scopes.length === 0 ? {} : { scopes: Object.freeze(scopes) }),
+		...(scopesSupported.length === 0 ? {} : { scopesSupported: Object.freeze(scopesSupported) }),
 		grants,
 		registration: registrationSupport(authorizationServerMetadata),
+		dynamicRegistration: hasRegistrationEndpoint(authorizationServerMetadata),
 		...(extensions.length === 0 ? {} : { extensions: Object.freeze(extensions) }),
+		...(issues.length === 0 ? {} : { issues: Object.freeze(issues) }),
 		...probeBase(target, seen, true),
 		httpStatus: status,
 	});
+}
+
+/**
+ * The two checks `auth()` makes on discovered metadata before it sends anything: RFC 8707 resource
+ * matching (`selectResourceURL` → `checkResourceAllowed`) and the SEP-2207 token-endpoint TLS rule
+ * (`assertSecureTokenEndpoint`). Failing either means a real connection throws where the probe
+ * would otherwise have reported a healthy `oauth`.
+ */
+function probeIssues(
+	identity: URL,
+	resourceMetadata: OAuthProtectedResourceMetadata | undefined,
+	authorizationServerMetadata: AuthorizationServerMetadata | undefined,
+): string[] {
+	const issues: string[] = [];
+	const resource = resourceMetadata?.resource;
+	if (typeof resource === "string" && resource.length > 0) {
+		let allowed = false;
+		try {
+			allowed = checkResourceAllowed({
+				requestedResource: identity,
+				configuredResource: resource,
+			});
+		} catch {
+			// An unparseable `resource` cannot cover anything: the SDK's own URL parse would throw.
+			allowed = false;
+		}
+		if (!allowed) {
+			issues.push(
+				`The protected-resource metadata declares resource '${boundedUrl(resource)}', which does not cover '${boundedUrl(identity)}'; selectResourceURL() would refuse this connection.`,
+			);
+		}
+	}
+	const tokenEndpoint = authorizationServerMetadata?.token_endpoint;
+	if (typeof tokenEndpoint === "string" && tokenEndpoint.length > 0) {
+		try {
+			assertSecureTokenEndpoint(tokenEndpoint);
+		} catch {
+			issues.push(
+				`The authorization server's token endpoint '${boundedUrl(tokenEndpoint)}' is neither https: nor loopback; the SDK refuses to send credentials to it.`,
+			);
+		}
+	}
+	return issues;
+}
+
+function hasRegistrationEndpoint(metadata: AuthorizationServerMetadata | undefined): boolean {
+	const endpoint = metadata?.registration_endpoint;
+	return typeof endpoint === "string" && endpoint.length > 0;
 }
 
 function registrationSupport(
 	metadata: AuthorizationServerMetadata | undefined,
 ): McpOAuthRegistrationSupport {
 	if (metadata === undefined) return "unknown";
-	// Dynamic registration first: it is what `McpOAuthClientProvider` drives with no configuration.
-	const endpoint = metadata.registration_endpoint;
-	if (typeof endpoint === "string" && endpoint.length > 0) return "dynamic";
+	// CIMD first: `auth()` takes that branch whenever the server advertises it, registering only
+	// when the provider carries no `clientMetadataUrl`.
 	if (metadata.client_id_metadata_document_supported === true) return "cimd";
+	if (hasRegistrationEndpoint(metadata)) return "dynamic";
 	return "preregistered-only";
 }
 
@@ -1551,12 +1918,19 @@ function uniqueStrings(values: readonly string[]): string[] {
 	return [...new Set(values.filter((value) => value.length > 0))];
 }
 
-function registrationNote(registration: McpOAuthRegistrationSupport): string {
-	switch (registration) {
+/** Scopes come off the wire and end up in host UI and in notes: bound each one. */
+function boundedScopes(values: readonly string[]): string[] {
+	return uniqueStrings(values.map((value) => bounded(value, 200)));
+}
+
+function registrationNote(probe: McpServerAuthProbeOAuth): string {
+	switch (probe.registration) {
 		case "dynamic":
 			return "It accepts Dynamic Client Registration, so no clientId is needed.";
 		case "cimd":
-			return "It accepts a Client ID Metadata Document, so pass clientMetadataUrl instead of registering.";
+			return probe.dynamicRegistration
+				? "It prefers a Client ID Metadata Document, so pass clientMetadataUrl; without one it also accepts Dynamic Client Registration."
+				: "It accepts a Client ID Metadata Document, so pass clientMetadataUrl instead of registering.";
 		case "preregistered-only":
 			return "It registers no clients dynamically, so a pre-registered clientId is required.";
 		case "unknown":
@@ -1564,14 +1938,32 @@ function registrationNote(registration: McpOAuthRegistrationSupport): string {
 	}
 }
 
+function redirectNote(probe: McpServerAuthProbeRedirect): string {
+	const where = probe.location === undefined ? "" : ` (${probe.location})`;
+	switch (probe.reason) {
+		case "cross-origin":
+			return `The endpoint redirects to another origin${where}; probe that URL instead of authorizing against this one.`;
+		case "too-many-redirects":
+			return `The endpoint kept redirecting within its own origin without settling${where}; check the URL before offering a sign-in.`;
+		case "opaque":
+			return "The endpoint redirected and the runtime hid the target behind an opaque response; probe the URL it redirects to, from somewhere redirects are visible.";
+	}
+}
+
 /**
  * Races a request against the probe's deadline. `fetch` honours `signal` on its own, but a caller
  * -supplied `fetch` (a mock, a proxy wrapper) may not, and an unbounded probe would hang a host.
+ * Whichever side loses the race is still observed: a request that rejects after the deadline has
+ * already been reported would otherwise surface as an unhandled rejection and take the process down.
  */
 function withDeadline<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-	if (signal.aborted) return Promise.reject(signal.reason);
+	if (signal.aborted) {
+		void promise.catch(() => undefined);
+		return Promise.reject(signal.reason);
+	}
 	return new Promise<T>((resolve, reject) => {
 		const onAbort = () => {
+			void promise.catch(() => undefined);
 			reject(signal.reason);
 		};
 		signal.addEventListener("abort", onAbort, { once: true });
@@ -1581,12 +1973,17 @@ function withDeadline<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 	});
 }
 
-/** Releases a response body the probe never reads, so the socket is not held open. */
+/**
+ * Releases a response body the probe never reads, so the socket is not held open. The body is
+ * cancelled, never buffered: an endpoint that answers with an open `text/event-stream` would
+ * otherwise hold the probe for its whole deadline — or forever, behind a `fetch` that ignores the
+ * signal — reading bytes the verdict never looks at.
+ */
 async function drainResponse(response: Response): Promise<void> {
 	try {
-		await response.arrayBuffer();
+		await response.body?.cancel();
 	} catch {
-		// Already consumed, or the body errored: nothing left to release either way.
+		// Already consumed, locked, or errored: nothing left to release either way.
 	}
 }
 
