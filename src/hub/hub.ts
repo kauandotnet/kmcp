@@ -17,7 +17,7 @@ import {
 	stableFingerprint,
 	type MaybePromise,
 } from "../internal/value.ts";
-import type { McpCatalogSnapshot } from "../client/catalog.ts";
+import type { McpCatalogSection, McpCatalogSnapshot } from "../client/catalog.ts";
 import type {
 	McpCallToolOptions,
 	McpCallToolParsedOptions,
@@ -30,6 +30,13 @@ import type {
 	McpRequestOptionsWithMeta,
 } from "../client/manager.ts";
 import { McpConnectionManager } from "../client/manager.ts";
+
+/**
+ * The character/length rule a projected tool or prompt name must satisfy downstream: the SDK
+ * name grammar the gateway and the capability providers enforce. Rename sources and targets are
+ * validated against it at definition time, so a hub never routes a name a projection would drop.
+ */
+export const EXPOSED_NAME_REGEX = /^[A-Za-z0-9._-]{1,128}$/;
 
 /**
  * An allow/deny list over a member's items, evaluated on the UPSTREAM identity (a tool or prompt
@@ -198,6 +205,11 @@ export interface McpHubResourceTemplateRoute<ConnectionId extends string = strin
 export interface McpHubCatalogMember<ConnectionId extends string = string> {
 	readonly connectionId: ConnectionId;
 	readonly namespace: string;
+	/**
+	 * The member's catalog AS EXPOSED: items its filters deny are removed and tools carry their
+	 * exposed (renamed) name, so walking it never re-exposes what a filter hides. Its identity
+	 * (`generation`, `fingerprint`) and its capture metrics still describe the upstream snapshot.
+	 */
 	readonly catalog?: McpCatalogSnapshot;
 	readonly refreshErrorCode?: string;
 }
@@ -512,9 +524,9 @@ export class McpHubManager<
 		const member = definition.members.find((candidate) => candidate.namespace === namespace);
 		const routeName = `${namespace}:${uri}`;
 		if (member === undefined) throw unknownRoute(routeName);
-		// The filter is matched on the REQUESTED URI, so it covers template expansions too: a denied
-		// URI can never be reached through one of the member's templates.
-		if (!admits(member.resources, uri)) throw unknownRoute(routeName);
+		// `deny` is matched on the REQUESTED URI, so a denied expansion can never be reached through
+		// one of the member's templates however permissive the template's own pattern is.
+		if (denies(member.resources, uri)) throw unknownRoute(routeName);
 		const identity = this.#catalogIdentity(member.connectionId, "resources");
 		if (identity === undefined) throw unknownRoute(routeName);
 		const resource = findExactlyOne(
@@ -524,6 +536,8 @@ export class McpHubManager<
 		if (resource === undefined) {
 			if (route !== undefined) throw unknownRoute(routeName);
 			const templates = this.#catalogIdentity(member.connectionId, "resourceTemplates");
+			// An admitted template stands for the whole set it expands, so allow-listing a member's
+			// exact `uriTemplate` exposes its expansions; the template's literal head bounds them.
 			if (
 				templates === undefined ||
 				templates.catalog !== identity.catalog ||
@@ -538,6 +552,8 @@ export class McpHubManager<
 			}
 			return this.#connections.readResource(member.connectionId, uri, options, identity.control);
 		}
+		// A LISTED static resource is reachable only when the filter admits its own URI.
+		if (!admits(member.resources, uri)) throw unknownRoute(routeName);
 		if (
 			route !== undefined &&
 			(route.route !== routeName ||
@@ -672,7 +688,9 @@ export class McpHubManager<
 			return Object.freeze({
 				connectionId: member.connectionId,
 				namespace: member.namespace,
-				...(connection.catalog === undefined ? {} : { catalog: connection.catalog }),
+				...(connection.catalog === undefined
+					? {}
+					: { catalog: exposedCatalog(member, connection.catalog) }),
 				...(refresh?.status === "rejected" ? { refreshErrorCode: errorCode(refresh.reason) } : {}),
 			});
 		});
@@ -683,7 +701,9 @@ export class McpHubManager<
 		for (const [index, member] of members.entries()) {
 			const connection = connections[index];
 			const filters = definition.members[index];
-			const catalog = member.catalog;
+			// Routes are projected from the UPSTREAM catalog: `member.catalog` already carries the
+			// exposed view, and filtering or renaming it a second time would resolve the wrong items.
+			const catalog = connection?.catalog;
 			if (
 				connection === undefined ||
 				filters === undefined ||
@@ -974,6 +994,55 @@ function exposedTools<ConnectionId extends string>(
 	return uniquelyIdentified(exposed, (entry) => entry.exposedName);
 }
 
+/**
+ * A member's catalog as the hub EXPOSES it: denied items removed, tools carrying their exposed name
+ * and narrowed to the ones `exposedTools` routes. `generation`, `fingerprint` and the capture
+ * metrics are left as captured: they identify and size the UPSTREAM snapshot, not this view.
+ */
+function exposedCatalog<ConnectionId extends string>(
+	member: McpHubMember<ConnectionId>,
+	catalog: McpCatalogSnapshot,
+): McpCatalogSnapshot {
+	if (
+		member.tools === undefined &&
+		member.prompts === undefined &&
+		member.resources === undefined &&
+		member.rename === undefined
+	) {
+		return catalog;
+	}
+	return Object.freeze({
+		...catalog,
+		tools: exposedSection(
+			catalog.tools,
+			exposedTools(member, catalog.tools.items).map((entry) =>
+				entry.exposedName === entry.tool.name
+					? entry.tool
+					: Object.freeze({ ...entry.tool, name: entry.exposedName }),
+			),
+		),
+		prompts: exposedSection(
+			catalog.prompts,
+			catalog.prompts.items.filter((item) => admits(member.prompts, item.name)),
+		),
+		resources: exposedSection(
+			catalog.resources,
+			catalog.resources.items.filter((item) => admits(member.resources, item.uri)),
+		),
+		resourceTemplates: exposedSection(
+			catalog.resourceTemplates,
+			catalog.resourceTemplates.items.filter((item) => admits(member.resources, item.uriTemplate)),
+		),
+	});
+}
+
+function exposedSection<Item>(
+	section: McpCatalogSection<Item>,
+	items: readonly Item[],
+): McpCatalogSection<Item> {
+	return Object.freeze({ ...section, items: Object.freeze(items) });
+}
+
 function renamed(rename: Readonly<Record<string, string>> | undefined, name: string): string {
 	if (rename === undefined || !Object.hasOwn(rename, name)) return name;
 	return rename[name] ?? name;
@@ -982,9 +1051,14 @@ function renamed(rename: Readonly<Record<string, string>> | undefined, name: str
 /** Whether a filter exposes an upstream identity. `deny` wins; an absent filter exposes everything. */
 function admits(filter: McpHubMemberFilter | undefined, value: string): boolean {
 	if (filter === undefined) return true;
-	if (filter.deny?.some((pattern) => matchesPattern(pattern, value)) === true) return false;
+	if (denies(filter, value)) return false;
 	if (filter.allow === undefined) return true;
 	return filter.allow.some((pattern) => matchesPattern(pattern, value));
+}
+
+/** Whether a filter refuses an identity outright, whatever its `allow` list says. */
+function denies(filter: McpHubMemberFilter | undefined, value: string): boolean {
+	return filter?.deny?.some((pattern) => matchesPattern(pattern, value)) === true;
 }
 
 function matchesPattern(pattern: string, value: string): boolean {
@@ -1016,9 +1090,11 @@ function normalizeFilter(
 	label: string,
 ): McpHubMemberFilter | undefined {
 	if (filter === undefined) return undefined;
-	// `allow: []` is a present allow list that exposes nothing, so it is never collapsed away.
+	// `allow: []` is a present allow list that exposes nothing, so it is never collapsed away; an
+	// empty `deny` denies nothing, so it collapses exactly like an absent one.
 	const allow = normalizePatterns(filter.allow, `${label} allow`);
-	const deny = normalizePatterns(filter.deny, `${label} deny`);
+	const denied = normalizePatterns(filter.deny, `${label} deny`);
+	const deny = denied === undefined || denied.length === 0 ? undefined : denied;
 	if (allow === undefined && deny === undefined) return undefined;
 	return Object.freeze({
 		...(allow === undefined ? {} : { allow }),
@@ -1031,24 +1107,25 @@ function normalizePatterns(
 	label: string,
 ): readonly string[] | undefined {
 	if (patterns === undefined) return undefined;
-	return Object.freeze(
-		patterns.map((pattern) => {
-			if (typeof pattern !== "string" || pattern.trim().length === 0) {
-				throw new KmcpError(
-					KMCP_ERROR_CODES.INVALID_DEFINITION,
-					`${label} must not contain an empty pattern.`,
-				);
-			}
-			const star = pattern.indexOf("*");
-			if (star !== -1 && star !== pattern.length - 1) {
-				throw new KmcpError(
-					KMCP_ERROR_CODES.INVALID_DEFINITION,
-					`${label} pattern '${pattern}' may only use '*' as its last character.`,
-				);
-			}
-			return pattern;
-		}),
-	);
+	const unique = new Set<string>();
+	for (const pattern of patterns) {
+		if (typeof pattern !== "string" || pattern.trim().length === 0) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`${label} must not contain an empty pattern.`,
+			);
+		}
+		const star = pattern.indexOf("*");
+		if (star !== -1 && star !== pattern.length - 1) {
+			throw new KmcpError(
+				KMCP_ERROR_CODES.INVALID_DEFINITION,
+				`${label} pattern '${pattern}' may only use '*' as its last character.`,
+			);
+		}
+		unique.add(pattern);
+	}
+	// Sorted and de-duplicated, so two definitions listing the same patterns share one fingerprint.
+	return Object.freeze([...unique].sort());
 }
 
 function normalizeRename(
@@ -1060,16 +1137,21 @@ function normalizeRename(
 	if (entries.length === 0) return undefined;
 	const targets = new Set<string>();
 	for (const [source, target] of entries) {
-		if (source.trim().length === 0) {
+		// The target carries the rule a projected name must satisfy downstream: one the gateway
+		// would drop is refused here instead of routing on the hub and vanishing at the seam. The
+		// source only has to name an upstream tool exactly: renaming is how an upstream name the
+		// gateway could never project is rescued.
+		if (source.length === 0 || source !== source.trim()) {
 			throw new KmcpError(
 				KMCP_ERROR_CODES.INVALID_DEFINITION,
-				`${label} must not rename an empty tool name.`,
+				`${label} source '${source}' must be a non-empty, unpadded upstream tool name.`,
 			);
 		}
-		if (typeof target !== "string" || target.trim().length === 0) {
+		assertExposedName(target, `${label} target for '${source}'`);
+		if (source === target) {
 			throw new KmcpError(
 				KMCP_ERROR_CODES.INVALID_DEFINITION,
-				`${label} must not map '${source}' to an empty name.`,
+				`${label} maps '${source}' to itself.`,
 			);
 		}
 		if (targets.has(target)) {
@@ -1082,6 +1164,15 @@ function normalizeRename(
 	}
 	// `fromEntries` keeps `__proto__` an own property; reads go through `Object.hasOwn`.
 	return Object.freeze(Object.fromEntries(entries));
+}
+
+function assertExposedName(value: string, label: string): void {
+	if (typeof value !== "string" || !EXPOSED_NAME_REGEX.test(value)) {
+		throw new KmcpError(
+			KMCP_ERROR_CODES.INVALID_DEFINITION,
+			`${label} '${String(value)}' must match ${EXPOSED_NAME_REGEX.source}.`,
+		);
+	}
 }
 
 function matchesAnyTemplate(templates: readonly ResourceTemplateType[], uri: string): boolean {

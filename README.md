@@ -669,9 +669,18 @@ no filter exposes everything, `allow: []` exposes nothing. Filtering runs on the
 applied. Renamed tools keep their schema, annotations and description and are still called upstream
 by their upstream name; a denied or renamed-away route fails with `HUB_ROUTE_UNKNOWN` exactly like a
 missing one and is not found downstream through the gateway. Two exposed names that collide drop
-both, as duplicate upstream names already do. The definition refuses an empty pattern, a `*`
-anywhere but last, an empty rename source or target, and two renames onto one target
-(`INVALID_DEFINITION`). The hub snapshot echoes each member's `tools` / `prompts` / `resources` /
+both, as duplicate upstream names already do. Patterns are de-duplicated and sorted and `deny: []`
+collapses like an absent filter (`allow: []` still exposes nothing), so equivalent definitions share
+one fingerprint. Allow-listing a template by its exact `uriTemplate` also admits the URIs it
+expands; `deny` is matched on the requested URI and still wins. The definition refuses an empty
+pattern, a `*` anywhere but last, a rename source that is empty or padded, a rename target that is
+not a projectable name (`^[A-Za-z0-9._-]{1,128}$`, the rule the gateway enforces, so nothing routes
+on the hub only to vanish downstream), a self-rename, and two renames onto one target
+(`INVALID_DEFINITION`); a rename may rescue an upstream tool whose own name the gateway could never
+project. `catalog.members[].catalog` is the exposed view (denied items absent, tools under their
+exposed names; `generation`, `fingerprint` and size metrics still describe the upstream snapshot),
+and the gateway's `dropped` records carry `exposedName` and the projected `name` next to the
+upstream `source`. The hub snapshot echoes each member's `tools` / `prompts` / `resources` /
 `rename` so a panel can render disabled items; denied items never appear in a catalog. Hub
 definitions carry a `fingerprint` over members, filters and renames, so `hubs.update` with a
 reshaped view rebuilds the gateway projection and pushes `list_changed`.

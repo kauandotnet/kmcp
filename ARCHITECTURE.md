@@ -181,8 +181,9 @@ allow/deny filters and a tool rename map; they are applied to the upstream item 
 `McpHubToolRoute` keeps `sourceName` (upstream, used for dispatch) apart from `exposedName` (what
 the route and passthrough gateway names are built from), and a denied route is indistinguishable
 from a missing one. The definition's `fingerprint` covers members, filters and renames, is mirrored
-on the hub and catalog snapshots, and is folded into the gateway's topology key so a reshaped view
-with unchanged upstream generations still rebuilds the projection and pushes `list_changed`.
+on the hub and catalog snapshots, and is folded into the gateway's topology key, and each section
+key digests the projected route identities, so a reshaped view with unchanged upstream generations
+and an unchanged route count still rebuilds the projection and pushes `list_changed`.
 Template-expanded reads are matched against the member's listed templates with the SDK
 `UriTemplate`.
 

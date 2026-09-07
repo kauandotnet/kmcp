@@ -40,16 +40,17 @@ import {
 	type McpServerRuntime,
 } from "../authoring/server-definition.ts";
 import { KMCP_ERROR_CODES, KmcpError } from "../errors.ts";
-import type {
-	McpHubCatalogSnapshot,
-	McpHubEvent,
-	McpHubManager,
-	McpHubPromptRoute,
-	McpHubResourceRoute,
-	McpHubResourceTemplateRoute,
-	McpHubToolRoute,
+import {
+	EXPOSED_NAME_REGEX,
+	type McpHubCatalogSnapshot,
+	type McpHubEvent,
+	type McpHubManager,
+	type McpHubPromptRoute,
+	type McpHubResourceRoute,
+	type McpHubResourceTemplateRoute,
+	type McpHubToolRoute,
 } from "../hub/hub.ts";
-import type { MaybePromise } from "../internal/value.ts";
+import { stableFingerprint, type MaybePromise } from "../internal/value.ts";
 
 /** One projected upstream capability, as seen by `policy.authorize`. */
 export type McpGatewayRoute<ConnectionId extends string = string> =
@@ -106,6 +107,10 @@ export interface McpGatewayDropped<ConnectionId extends string = string> {
 	readonly namespace: string;
 	/** The upstream name (tools, prompts) or URI / URI template (resources). */
 	readonly source: string;
+	/** What the hub exposes: `source` after the member's rename (tools), else `source` itself. */
+	readonly exposedName: string;
+	/** The name / URI this gateway projected, which is what the drop decision was made on. */
+	readonly name: string;
 	readonly reason:
 		| "invalid-name"
 		| "invalid-template"
@@ -149,7 +154,6 @@ export interface McpGatewayRuntime extends AsyncDisposable {
 	close(): Promise<void>;
 }
 
-const NAME_REGEX = /^[A-Za-z0-9._-]{1,128}$/;
 const URI_SCHEME_REGEX = /^[A-Za-z][A-Za-z0-9+.-]*$/;
 
 /** Per-instance state a shared handler closure can reach; empty for shared (modern) projections. */
@@ -560,16 +564,15 @@ export class McpGatewayDefinition<
 		let toolCount = 0;
 		for (const route of catalog.tools) {
 			const name = nameMode === "passthrough" ? route.exposedName : route.route;
-			if (!NAME_REGEX.test(name)) {
-				dropped.push(
-					drop("tool", route.connectionId, route.namespace, route.sourceName, "invalid-name"),
-				);
+			// The decision is made on the PROJECTED name, so the drop record carries it (and the
+			// exposed name it came from) next to the upstream `source`.
+			const names = { source: route.sourceName, exposedName: route.exposedName, name };
+			if (!EXPOSED_NAME_REGEX.test(name)) {
+				dropped.push(drop("tool", route, names, "invalid-name"));
 				continue;
 			}
 			if (toolNameCollisions.has(name)) {
-				dropped.push(
-					drop("tool", route.connectionId, route.namespace, route.sourceName, "name-collision"),
-				);
+				dropped.push(drop("tool", route, names, "name-collision"));
 				continue;
 			}
 			const tool = route.tool;
@@ -618,16 +621,13 @@ export class McpGatewayDefinition<
 		let promptCount = 0;
 		for (const route of catalog.prompts) {
 			const name = nameMode === "passthrough" ? route.sourceName : route.route;
-			if (!NAME_REGEX.test(name)) {
-				dropped.push(
-					drop("prompt", route.connectionId, route.namespace, route.sourceName, "invalid-name"),
-				);
+			const names = { source: route.sourceName, exposedName: route.sourceName, name };
+			if (!EXPOSED_NAME_REGEX.test(name)) {
+				dropped.push(drop("prompt", route, names, "invalid-name"));
 				continue;
 			}
 			if (promptNameCollisions.has(name)) {
-				dropped.push(
-					drop("prompt", route.connectionId, route.namespace, route.sourceName, "name-collision"),
-				);
+				dropped.push(drop("prompt", route, names, "name-collision"));
 				continue;
 			}
 			const prompt = route.prompt;
@@ -685,22 +685,17 @@ export class McpGatewayDefinition<
 		let resourceCount = 0;
 		for (const route of catalog.resources) {
 			const projected = projectUri(mode, route.namespace, route.sourceUri);
+			const names = {
+				source: route.sourceUri,
+				exposedName: route.sourceUri,
+				name: projected ?? `${route.namespace}:${route.sourceUri}`,
+			};
 			if (projected === undefined) {
-				dropped.push(
-					drop(
-						"resource",
-						route.connectionId,
-						route.namespace,
-						route.sourceUri,
-						"namespace-not-uri-scheme",
-					),
-				);
+				dropped.push(drop("resource", route, names, "namespace-not-uri-scheme"));
 				continue;
 			}
 			if (collisions.has(route.sourceUri)) {
-				dropped.push(
-					drop("resource", route.connectionId, route.namespace, route.sourceUri, "uri-collision"),
-				);
+				dropped.push(drop("resource", route, names, "uri-collision"));
 				continue;
 			}
 			const resource = route.resource;
@@ -744,28 +739,17 @@ export class McpGatewayDefinition<
 		let templateCount = 0;
 		for (const route of catalog.resourceTemplates) {
 			const projected = projectUri(mode, route.namespace, route.sourceUriTemplate);
+			const names = {
+				source: route.sourceUriTemplate,
+				exposedName: route.sourceUriTemplate,
+				name: projected ?? `${route.namespace}:${route.sourceUriTemplate}`,
+			};
 			if (projected === undefined) {
-				dropped.push(
-					drop(
-						"resourceTemplate",
-						route.connectionId,
-						route.namespace,
-						route.sourceUriTemplate,
-						"namespace-not-uri-scheme",
-					),
-				);
+				dropped.push(drop("resourceTemplate", route, names, "namespace-not-uri-scheme"));
 				continue;
 			}
 			if (collisions.has(route.sourceUriTemplate)) {
-				dropped.push(
-					drop(
-						"resourceTemplate",
-						route.connectionId,
-						route.namespace,
-						route.sourceUriTemplate,
-						"uri-collision",
-					),
-				);
+				dropped.push(drop("resourceTemplate", route, names, "uri-collision"));
 				continue;
 			}
 			let sourceTemplate: UriTemplate;
@@ -773,15 +757,7 @@ export class McpGatewayDefinition<
 				new UriTemplate(projected);
 				sourceTemplate = new UriTemplate(route.sourceUriTemplate);
 			} catch {
-				dropped.push(
-					drop(
-						"resourceTemplate",
-						route.connectionId,
-						route.namespace,
-						route.sourceUriTemplate,
-						"invalid-template",
-					),
-				);
+				dropped.push(drop("resourceTemplate", route, names, "invalid-template"));
 				continue;
 			}
 			const resourceTemplate = route.resourceTemplate;
@@ -907,12 +883,17 @@ function exact<Item extends object, Key extends keyof Item>(
 
 function drop<ConnectionId extends string>(
 	kind: McpGatewayRoute["kind"],
-	connectionId: ConnectionId,
-	namespace: string,
-	source: string,
+	route: { readonly connectionId: ConnectionId; readonly namespace: string },
+	names: { readonly source: string; readonly exposedName: string; readonly name: string },
 	reason: McpGatewayDropped["reason"],
 ): McpGatewayDropped<ConnectionId> {
-	return Object.freeze({ kind, connectionId, namespace, source, reason });
+	return Object.freeze({
+		kind,
+		connectionId: route.connectionId,
+		namespace: route.namespace,
+		...names,
+		reason,
+	});
 }
 
 function projectUri(
@@ -954,6 +935,11 @@ function uriCollisions<HubId extends string, ConnectionId extends string>(
 	return collisions;
 }
 
+/**
+ * Identity of one projected section: the upstream catalogs behind it AND the exact set of routes it
+ * exposes. Folding the routes in is what makes a hub update that changes WHICH names are exposed
+ * without changing the count — a flipped `deny`, a pure rename — report the section as changed.
+ */
 function sectionKey(
 	routes: readonly {
 		connectionId: string;
@@ -963,9 +949,12 @@ function sectionKey(
 	}[],
 ): string {
 	const parts = new Set<string>();
-	for (const route of routes)
+	const identities: string[] = [];
+	for (const route of routes) {
 		parts.add(`${route.connectionId}:${route.generation}:${route.catalogFingerprint}`);
-	return `${routes.length}/${[...parts].sort().join(",")}`;
+		identities.push(route.route);
+	}
+	return `${routes.length}/${[...parts].sort().join(",")}/${stableFingerprint(identities.sort())}`;
 }
 
 function topologyKey<HubId extends string, ConnectionId extends string>(
