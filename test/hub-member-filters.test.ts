@@ -308,6 +308,42 @@ forEachEra("resource filters match the URI and cover template expansions", async
 	);
 });
 
+forEachEra("an allow-listed template admits the URIs it expands", async (era, t) => {
+	const { hubs } = await fixture(t, era, { resources: { allow: ["status://items/{id}"] } });
+	const catalog = hubs.catalog("main");
+	// Nothing but the template itself matches the allow list, yet its expansions are readable.
+	assert.deepEqual(
+		catalog.resources.map((route) => route.route),
+		[],
+	);
+	assert.deepEqual(
+		catalog.resourceTemplates.map((route) => route.route),
+		["primary:status://items/{id}"],
+	);
+	assert.equal(
+		(await hubs.readResource("main", "primary", "status://items/7")).contents[0]?.uri,
+		"status://items/7",
+	);
+	// A LISTED static resource outside the allow list stays as unknown as before.
+	assert.throws(
+		() => void hubs.readResource("main", "primary", "status://current"),
+		hasCode(KMCP_ERROR_CODES.HUB_ROUTE_UNKNOWN),
+	);
+
+	// `deny` is still matched on the requested URI, so it beats the allow-listed template.
+	const denied = await fixture(t, era, {
+		resources: { allow: ["status://items/{id}"], deny: ["status://items/7"] },
+	});
+	assert.throws(
+		() => void denied.hubs.readResource("main", "primary", "status://items/7"),
+		hasCode(KMCP_ERROR_CODES.HUB_ROUTE_UNKNOWN),
+	);
+	assert.equal(
+		(await denied.hubs.readResource("main", "primary", "status://items/8")).contents[0]?.uri,
+		"status://items/8",
+	);
+});
+
 forEachEra("a member without filters behaves exactly as before", async (era, t) => {
 	const { hubs } = await fixture(t, era);
 	const catalog = hubs.catalog("main");
@@ -375,6 +411,48 @@ forEachEra(
 	},
 );
 
+forEachEra("the catalog snapshot's member catalog is the exposed view", async (era, t) => {
+	const { manager, hubs } = await fixture(t, era, {
+		tools: { allow: ["git_*"], deny: ["git_commit"] },
+		prompts: { deny: ["draft"] },
+		resources: { allow: ["status://*"] },
+		rename: { git_status: "status" },
+	});
+	const member = hubs.catalog("main").members[0];
+	assert.ok(member?.catalog);
+	// Denied items are gone and the renamed tool carries its EXPOSED name, so a consumer walking
+	// `members[].catalog` cannot recover a hidden prompt, resource or schema.
+	assert.deepEqual(
+		member.catalog.tools.items.map((item) => item.name),
+		["status"],
+	);
+	assert.deepEqual(
+		member.catalog.prompts.items.map((item) => item.name),
+		["review"],
+	);
+	assert.deepEqual(
+		member.catalog.resources.items.map((item) => item.uri),
+		["status://current"],
+	);
+	assert.deepEqual(
+		member.catalog.resourceTemplates.items.map((item) => item.uriTemplate),
+		["status://items/{id}"],
+	);
+	assert.equal(member.catalog.tools.items[0]?.description, "git status");
+
+	// The upstream snapshot is untouched, and the exposed view keeps its identity.
+	const upstream = manager.state("alpha").catalog;
+	assert.ok(upstream);
+	assert.equal(member.catalog.generation, upstream.generation);
+	assert.equal(member.catalog.fingerprint, upstream.fingerprint);
+	assert.deepEqual(upstream.tools.items.map((item) => item.name).sort(), [
+		"deploy",
+		"echo",
+		"git_commit",
+		"git_status",
+	]);
+});
+
 test("filters and renames are part of the hub fingerprint", () => {
 	const plain = new McpHubDefinition({
 		id: "main",
@@ -403,6 +481,26 @@ test("filters and renames are part of the hub fingerprint", () => {
 		}).fingerprint,
 		plain.fingerprint,
 	);
+});
+
+test("equivalent filters normalize to one fingerprint", () => {
+	const define = (member: Omit<McpHubMember, "connectionId" | "namespace">): string =>
+		new McpHubDefinition({
+			id: "main",
+			members: [{ connectionId: "alpha", namespace: "primary", ...member }],
+		}).fingerprint;
+
+	// An empty `deny` denies nothing, so it is exactly as inert as an absent one.
+	assert.equal(define({ tools: { allow: ["a"], deny: [] } }), define({ tools: { allow: ["a"] } }));
+	assert.equal(define({ tools: { deny: [] } }), define({}));
+	// Patterns are a set, not a sequence: order and repetition never move the fingerprint.
+	assert.equal(define({ tools: { allow: ["a", "b"] } }), define({ tools: { allow: ["b", "a"] } }));
+	assert.equal(
+		define({ prompts: { deny: ["a", "b", "a"] } }),
+		define({ prompts: { deny: ["b", "a"] } }),
+	);
+	// `allow: []` still means "expose nothing", so it stays distinct from having no filter.
+	assert.notEqual(define({ tools: { allow: [] } }), define({}));
 });
 
 test("definitions stay frozen and reject invalid filters and renames", () => {
@@ -435,6 +533,12 @@ test("definitions stay frozen and reject invalid filters and renames", () => {
 		{ rename: { git_status: "" } },
 		{ rename: { "": "status" } },
 		{ rename: { git_status: "same", git_commit: "same" } },
+		// A rename must produce a name the gateway can actually project, and must do something.
+		{ rename: { git_status: "bad name!" } },
+		{ rename: { git_status: " status " } },
+		{ rename: { " git_status ": "status" } },
+		{ rename: { git_status: "a".repeat(129) } },
+		{ rename: { git_status: "git_status" } },
 	];
 	for (const member of invalid) {
 		assert.throws(
@@ -494,6 +598,10 @@ forEachEra("a gateway serves the filtered, renamed view end to end", async (era,
 		serverInfo: { name: "filtered-gateway", version: "1.0.0" },
 	});
 	const runtime = gateway.start();
+	const changed: string[][] = [];
+	gateway.subscribe((event) => {
+		changed.push([...event.changed]);
+	});
 	const notified: string[] = [];
 	const { client, close } = await createTestClient(gateway, {
 		era,
@@ -566,6 +674,98 @@ forEachEra("a gateway serves the filtered, renamed view end to end", async (era,
 	]);
 	const commit = await client.callTool({ name: "gh.git_commit", arguments: { value: "y" } });
 	assert.equal(commit.content[0]?.type === "text" ? commit.content[0].text : "", "git_commit:y");
+
+	// A pure rename changes WHICH names are exposed without changing how many, and must still be
+	// reported as a `tools` change and pushed downstream.
+	const seen = notified.length;
+	changed.length = 0;
+	hubs.update(
+		new McpHubDefinition({
+			id: "main",
+			members: [
+				{
+					connectionId: "alpha",
+					namespace: "gh",
+					tools: { allow: ["git_*"] },
+					rename: { git_status: "state" },
+				},
+				{ connectionId: "beta", namespace: "jira", tools: { allow: ["deploy"] } },
+			],
+		}),
+	);
+	assert.deepEqual(changed, [["tools"]]);
+	const renameDeadline = Date.now() + 5_000;
+	while (notified.length === seen) {
+		if (Date.now() > renameDeadline) assert.fail("no tools/list_changed after the rename");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name).sort(), [
+		"gh.git_commit",
+		"gh.state",
+		"jira.deploy",
+	]);
+});
+
+forEachEra("a gateway drop reports the projected name it decided on", async (era, t) => {
+	const manager = new McpConnectionManager<"alpha" | "beta">();
+	manager.register(inProcessConnection({ id: "alpha", definition: upstreamDefinition(), era }));
+	manager.register(inProcessConnection({ id: "beta", definition: upstreamDefinition(), era }));
+	await manager.connectAll(["alpha", "beta"]);
+	const hubs = new McpHubManager<"main", "alpha" | "beta">(manager);
+	hubs.register(
+		new McpHubDefinition({
+			id: "main",
+			members: [
+				{
+					connectionId: "alpha",
+					namespace: "gh",
+					tools: { allow: ["git_status"] },
+					prompts: { allow: [] },
+					resources: { allow: [] },
+					rename: { git_status: "shared" },
+				},
+				{
+					connectionId: "beta",
+					namespace: "jira",
+					tools: { allow: ["deploy"] },
+					prompts: { allow: [] },
+					resources: { allow: [] },
+					rename: { deploy: "shared" },
+				},
+			],
+		}),
+	);
+	await hubs.refreshCatalog("main");
+	t.after(async () => {
+		hubs.close();
+		await manager.close().catch(() => undefined);
+	});
+	const gateway = defineGateway({
+		hubs,
+		hubId: "main",
+		serverInfo: { name: "collision-gateway", version: "1.0.0" },
+		policy: { names: "passthrough" },
+	});
+
+	// Two members rename different upstream tools onto one exposed name: the collision is decided
+	// on that name, so the drop carries it next to the upstream `source` it came from.
+	const snapshot = gateway.snapshot();
+	assert.equal(snapshot.projected.tools, 0);
+	assert.deepEqual(
+		snapshot.dropped
+			.map((entry) => [
+				entry.connectionId,
+				entry.source,
+				entry.exposedName,
+				entry.name,
+				entry.reason,
+			])
+			.sort(),
+		[
+			["alpha", "git_status", "shared", "shared", "name-collision"],
+			["beta", "deploy", "shared", "shared", "name-collision"],
+		],
+	);
 });
 
 forEachEra("passthrough gateway names project the renamed tool", async (era, t) => {
@@ -608,4 +808,16 @@ forEachEra("passthrough gateway names project the renamed tool", async (era, t) 
 	);
 	const called = await client.callTool({ name: "status", arguments: { value: "x" } });
 	assert.equal(called.content[0]?.type === "text" ? called.content[0].text : "", "git_status:x");
+});
+
+test("a rename may rescue an upstream tool name the gateway could never project", () => {
+	assert.doesNotThrow(
+		() =>
+			new McpHubDefinition({
+				id: "main",
+				members: [
+					{ connectionId: "alpha", namespace: "primary", rename: { "bad name!": "good_name" } },
+				],
+			}),
+	);
 });

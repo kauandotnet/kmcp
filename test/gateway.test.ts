@@ -174,6 +174,12 @@ forEachEra("gateway projects, forwards and relays MRTR rounds end to end", async
 			t.gateway.snapshot().dropped.map((d) => [d.kind, d.reason]),
 			[["tool", "invalid-name"]],
 		);
+		// The drop is decided on the PROJECTED name, which the record reports next to the upstream one.
+		const [invalid] = t.gateway.snapshot().dropped;
+		assert.deepEqual(
+			[invalid?.source, invalid?.exposedName, invalid?.name],
+			["search", "search", `${LONG_NAMESPACE}.search`],
+		);
 
 		const gh = await client.callTool({ name: "gh.search", arguments: { q: "x" } });
 		assert.equal(gh.content[0]?.type === "text" ? gh.content[0].text : "", "gh:x");
